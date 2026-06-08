@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BeetleAI Harness</title>
+  </head>
+
+  <body>
+    <div class="app-container">
+      
+      <!-- LEFT PANEL: Navigation, Modes & Project Explorer -->
+      <aside class="panel" id="left-panel">
+        <header class="panel-header">
+          <div class="brand">
+            <span class="brand-icon"></span>
+            <span>BeetleAI</span>
+          </div>
+        </header>
+        
+        <div class="panel-content">
+          <!-- Mode Switcher -->
+          <div class="mode-switcher">
+            <button class="mode-tab active" id="tab-plan" data-mode="plan">Plan</button>
+            <button class="mode-tab" id="tab-kanban" data-mode="kanban">Kanban</button>
+            <button class="mode-tab" id="tab-code" data-mode="code">Code</button>
+          </div>
+          
+          <!-- Project Explorer -->
+          <div class="project-section">
+            <div class="project-select-container">
+              <label for="project-select">Active Project</label>
+              <select id="project-select" class="custom-select">
+                <option value="">Select a repository...</option>
+              </select>
+            </div>
+            
+            <div class="project-select-container">
+              <label>Repository Workspace</label>
+              <div id="file-tree" class="tree-view">
+                <div class="empty-state">
+                  <span class="empty-state-icon">📁</span>
+                  <span>No project open</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- CENTER PANEL: Agent Chat & Run Controls -->
+      <section class="panel" id="center-panel">
+        <header class="panel-header">
+          <h2 id="active-card-title">Select a Card</h2>
+          <div id="run-status" class="run-status-badge status-queued" style="display: none;">
+            <span class="status-dot"></span>
+            <span id="run-status-text">queued</span>
+          </div>
+        </header>
+        
+        <div class="panel-content" style="padding: 0; display: flex; flex-direction: column;">
+          <!-- Messages -->
+          <div id="chat-messages" class="chat-messages" style="flex: 1; padding: 20px;">
+            <div class="empty-state">
+              <span class="empty-state-icon">🤖</span>
+              <span>Select a card from the Kanban board and start an autonomous run. The agent loop transcript will display here.</span>
+            </div>
+          </div>
+          
+          <!-- Controls -->
+          <footer class="controls-area">
+            <div class="run-controls" id="controls-run" style="display: none;">
+              <button class="btn btn-primary" id="btn-start-run">🚀 Start Run</button>
+            </div>
+            <div class="run-controls" id="controls-active" style="display: none;">
+              <button class="btn btn-danger" id="btn-cancel-run">🛑 Cancel Run</button>
+            </div>
+            <div class="run-controls" id="controls-review" style="display: none;">
+              <button class="btn btn-success" id="btn-accept-run">✓ Accept</button>
+              <button class="btn btn-danger" id="btn-reject-run">✗ Reject</button>
+            </div>
+            
+            <!-- Chat Input (Blocked state or manual interjection) -->
+            <div class="chat-input-container">
+              <input 
+                id="chat-input" 
+                class="chat-input" 
+                placeholder="Send input to the agent..." 
+                disabled 
+              />
+              <button class="btn btn-primary" id="btn-send-chat" style="flex: 0; width: 50px; padding: 0;" disabled>→</button>
+            </div>
+          </footer>
+        </div>
+      </section>
+
+      <!-- RIGHT PANEL: Polymorphic Viewer Stack -->
+      <main class="panel" id="right-panel">
+        <header class="panel-header">
+          <h2 id="viewer-title">Design Doc</h2>
+          <div class="viewer-header-actions">
+            <button class="btn btn-secondary" id="btn-viewer-back" style="padding: 4px 8px; font-size: 0.8rem; display: none;">← Back</button>
+          </div>
+        </header>
+        
+        <div class="viewer-content" id="viewer-container">
+          <!-- Content dynamically rendered here -->
+          <div class="empty-state">
+            <span class="empty-state-icon">📄</span>
+            <span>Opening design document...</span>
+          </div>
+        </div>
+      </main>
+
+    </div>
+    
+    <!-- Module bundle connection -->
+    <script type="module" src="/src/main.ts" defer></script>
+  </body>
+</html>

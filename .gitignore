@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# BeetleAI Harness temporary and SQLite storage
+.harness/worktrees/
+.harness/harness.db
+

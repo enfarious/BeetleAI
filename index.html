@@ -31,13 +31,22 @@
           <div class="project-section">
             <div class="project-select-container">
               <label for="project-select">Active Project</label>
-              <select id="project-select" class="custom-select">
-                <option value="">Select a repository...</option>
-              </select>
+              <div style="display: flex; gap: 8px;">
+                <select id="project-select" class="custom-select" style="flex: 1;">
+                  <option value="">Select a repository...</option>
+                </select>
+                <button class="btn btn-primary" id="btn-new-project-toggle" style="flex: 0; padding: 0 12px; font-size: 1.2rem; font-weight: bold;" title="Create or Import Project">+</button>
+              </div>
             </div>
             
-            <div class="project-select-container">
-              <label>Repository Workspace</label>
+            <div class="project-select-container" id="repo-workspace-section">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <label style="margin: 0;">Repository Workspace</label>
+                <div style="display: flex; gap: 6px;">
+                  <button class="btn btn-secondary" id="btn-root-add-file" style="padding: 2px 6px; font-size: 0.75rem;" title="Add File to Root">+ File</button>
+                  <button class="btn btn-secondary" id="btn-root-add-folder" style="padding: 2px 6px; font-size: 0.75rem;" title="Add Folder to Root">+ Folder</button>
+                </div>
+              </div>
               <div id="file-tree" class="tree-view">
                 <div class="empty-state">
                   <span class="empty-state-icon">📁</span>
@@ -45,17 +54,36 @@
                 </div>
               </div>
             </div>
+
+            <div class="project-select-container" id="design-docs-section" style="display: none;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <label style="margin: 0;">Design Documents</label>
+                <button class="btn btn-secondary" id="btn-add-design-doc" style="padding: 2px 6px; font-size: 0.75rem;" title="Create New Design Doc">+ Doc</button>
+              </div>
+              <div id="design-docs-list" class="tree-view">
+                <div class="empty-state">
+                  <span class="empty-state-icon">📄</span>
+                  <span>No design docs found</span>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
       </aside>
+      
+      <!-- LEFT-CENTER RESIZER -->
+      <div class="resizer" id="resizer-left"></div>
 
       <!-- CENTER PANEL: Agent Chat & Run Controls -->
       <section class="panel" id="center-panel">
         <header class="panel-header">
           <h2 id="active-card-title">Select a Card</h2>
-          <div id="run-status" class="run-status-badge status-queued" style="display: none;">
-            <span class="status-dot"></span>
-            <span id="run-status-text">queued</span>
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div id="run-status" class="run-status-badge status-queued" style="display: none;">
+              <span class="status-dot"></span>
+              <span id="run-status-text">queued</span>
+            </div>
+            <button class="btn btn-secondary" id="btn-settings-toggle" style="padding: 6px 10px; font-size: 1.1rem; line-height: 1;" title="LLM Service Settings">⚙</button>
           </div>
         </header>
         
@@ -95,12 +123,18 @@
         </div>
       </section>
 
+      <!-- CENTER-RIGHT RESIZER -->
+      <div class="resizer" id="resizer-right"></div>
+
       <!-- RIGHT PANEL: Polymorphic Viewer Stack -->
       <main class="panel" id="right-panel">
         <header class="panel-header">
           <h2 id="viewer-title">Design Doc</h2>
-          <div class="viewer-header-actions">
+          <div class="viewer-header-actions" style="display: flex; gap: 8px;">
             <button class="btn btn-secondary" id="btn-viewer-back" style="padding: 4px 8px; font-size: 0.8rem; display: none;">← Back</button>
+            <button class="btn btn-primary" id="btn-viewer-edit" style="padding: 4px 8px; font-size: 0.8rem; display: none;">✏️ Edit</button>
+            <button class="btn btn-success" id="btn-viewer-save" style="padding: 4px 8px; font-size: 0.8rem; display: none;">💾 Save</button>
+            <button class="btn btn-secondary" id="btn-viewer-cancel" style="padding: 4px 8px; font-size: 0.8rem; display: none;">Cancel</button>
           </div>
         </header>
         
@@ -114,7 +148,84 @@
       </main>
 
     </div>
-    
+
+    <!-- SETTINGS MODAL OVERLAY -->
+    <div class="modal-overlay" id="settings-modal" style="display: none;">
+      <div class="modal-container">
+        <header class="modal-header">
+          <h3>LLM Service Settings</h3>
+          <button class="modal-close" id="btn-settings-close">×</button>
+        </header>
+        <div class="modal-body">
+          <form id="settings-form" class="settings-form">
+            <div class="form-group">
+              <label for="settings-provider">LLM Provider</label>
+              <select id="settings-provider" class="custom-select">
+                <option value="openai">OpenAI (Official)</option>
+                <option value="anthropic">Anthropic (Claude)</option>
+                <option value="lmstudio">LM Studio (Local)</option>
+                <option value="custom">Custom (Ollama / Local API)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="settings-url">API Base URL</label>
+              <input type="text" id="settings-url" class="form-input" placeholder="https://api.openai.com/v1" />
+            </div>
+            <div class="form-group">
+              <label for="settings-key">API Key / Token</label>
+              <input type="password" id="settings-key" class="form-input" placeholder="Enter API Key..." />
+            </div>
+            <div class="form-group">
+              <div style="display: flex; justify-content: space-between; align-items: center;">
+                <label for="settings-model">Model Name</label>
+                <button type="button" class="btn btn-secondary" id="btn-toggle-model-input" style="padding: 2px 6px; font-size: 0.75rem; display: none;">Type manually</button>
+              </div>
+              <div style="display: flex; gap: 8px;">
+                <select id="settings-model-select" class="custom-select" style="display: none; flex: 1;">
+                  <option value="">Select a model...</option>
+                </select>
+                <input type="text" id="settings-model" class="form-input" placeholder="gpt-4o" style="flex: 1;" />
+                <button type="button" class="btn btn-secondary" id="btn-fetch-models" style="padding: 0 12px; flex: 0; font-size: 0.85rem;" title="Query models from server">Fetch</button>
+              </div>
+              <span id="model-context-info" style="font-size: 0.8rem; color: var(--text-muted); display: none; margin-top: 4px;"></span>
+            </div>
+            <div class="form-group">
+              <label for="settings-steps">Max Step Ceiling</label>
+              <input type="number" id="settings-steps" class="form-input" value="50" min="1" max="500" />
+            </div>
+            <div class="modal-actions">
+              <button type="button" class="btn btn-secondary" id="btn-settings-cancel">Cancel</button>
+              <button type="submit" class="btn btn-primary">Save Settings</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- FILE SYSTEM DIALOG MODAL -->
+    <div class="modal-overlay" id="fs-modal" style="display: none;">
+      <div class="modal-container" style="max-width: 400px;">
+        <header class="modal-header">
+          <h3 id="fs-modal-title">Create New File</h3>
+          <button class="modal-close" id="btn-fs-close">×</button>
+        </header>
+        <div class="modal-body">
+          <form id="fs-form">
+            <input type="hidden" id="fs-parent-path" />
+            <input type="hidden" id="fs-item-type" />
+            <div class="form-group">
+              <label for="fs-item-name" id="fs-label-name">File Name</label>
+              <input type="text" id="fs-item-name" class="form-input" placeholder="e.g. index.js" required autocomplete="off" />
+            </div>
+            <div class="modal-actions" style="margin-top: 20px;">
+              <button type="button" class="btn btn-secondary" id="btn-fs-cancel">Cancel</button>
+              <button type="submit" class="btn btn-primary" id="btn-fs-submit">Create</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
     <!-- Module bundle connection -->
     <script type="module" src="/src/main.ts" defer></script>
   </body>

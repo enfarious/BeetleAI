@@ -1,4 +1,305 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+
+// Detect if running in Tauri container environment
+const isTauri = typeof window !== "undefined" && (window as any).__TAURI_INTERNALS__ !== undefined;
+
+// Browser stateful mocks
+let mockCards: Card[] = [
+  {
+    id: "card_1",
+    project_path: ".",
+    title: "Bootstrapping & Three-Column UI Layout",
+    description: "Setup Tauri v2 template with TypeScript, and construct the basic grid UI and styles.",
+    status: "done",
+    run_id: "run_card_1",
+    assignee: "BeetleAI",
+    todo_list: [
+      { text: "Configure Tauri v2 project template", completed: true },
+      { text: "Build TypeScript sidebar navigation and panels", completed: true },
+      { text: "Construct CSS layouts and themes", completed: true }
+    ]
+  },
+  {
+    id: "card_2",
+    project_path: ".",
+    title: "Git Worktree Integration & Sandbox",
+    description: "Implement git worktree creation, merge, and discard actions. Ensure filesystem is sandboxed.",
+    status: "review",
+    run_id: "run_card_2",
+    assignee: "BeetleAI",
+    todo_list: [
+      { text: "Implement git worktree creation helpers", completed: true },
+      { text: "Integrate file deletion and modification boundaries", completed: true },
+      { text: "Verify sandbox path traversal checks", completed: false }
+    ]
+  },
+  {
+    id: "card_3",
+    project_path: ".",
+    title: "Card State Store & Persistency Layer",
+    description: "Integrate SQLite and persist project files, cards, and execution transcripts.",
+    status: "todo",
+    run_id: null,
+    assignee: null,
+    todo_list: [
+      { text: "Design database schema for cards and logs", completed: false },
+      { text: "Integrate SQLite driver and migrations", completed: false },
+      { text: "Implement state persistence interface", completed: false }
+    ]
+  },
+  {
+    id: "card_4",
+    project_path: ".",
+    title: "Autonomous Loop Run Engine",
+    description: "Build the tokio task worker loop that fetches model responses, executes tools, and sends events.",
+    status: "backlog",
+    run_id: null,
+    assignee: null,
+    todo_list: [
+      { text: "Construct Tokio worker thread loop", completed: false },
+      { text: "Implement model response stream parsing", completed: false },
+      { text: "Add recursive tool routing handlers", completed: false }
+    ]
+  }
+];
+
+let mockLogs: Record<string, RunEvent[]> = {
+  "run_card_2": [
+    {
+      run_id: "run_card_2",
+      event_type: "status",
+      payload: "running"
+    },
+    {
+      run_id: "run_card_2",
+      event_type: "message",
+      payload: JSON.stringify({ role: "agent", content: "Starting worktree preparation for card_2. Creating branch harness/run-card_2 from main." })
+    },
+    {
+      run_id: "run_card_2",
+      event_type: "status",
+      payload: "review"
+    },
+    {
+      run_id: "run_card_2",
+      event_type: "message",
+      payload: JSON.stringify({ role: "agent", content: "I have completed writing the git operations module in `src-tauri/src/git.rs`. Let me know if you would like me to merge it!" })
+    }
+  ]
+};
+
+// Mock implementation of invoke for browser mode
+const mockInvoke = async (cmd: string, args?: any): Promise<any> => {
+  console.log(`[Mock Invoke] command: ${cmd}`, args);
+  switch (cmd) {
+    case "list_projects":
+      return [
+        { id: "beetleai", name: "BeetleAI Harness", path: "f:\\Projects\\BeetleAI" }
+      ];
+    case "open_project":
+      return { id: "beetleai", name: "BeetleAI Harness", path: args.path };
+    case "create_project":
+      return { 
+        id: args.name.toLowerCase().replace(/ /g, "_"), 
+        name: args.name, 
+        path: args.path 
+      };
+    case "get_settings":
+      return {
+        provider: "custom",
+        api_url: "http://localhost:11434/v1",
+        api_key: "mock_api_key",
+        model: "llama3",
+        max_steps: 50
+      };
+    case "save_settings":
+      return {};
+    case "read_design_doc":
+      return `# Mock Design Document\n\nThis is a mock design document for testing in browser mode.`;
+    case "write_design_doc":
+      return {};
+    case "list_cards":
+      return mockCards;
+    case "start_run": {
+      const card = mockCards.find(c => c.id === args.cardId);
+      const runId = `run_${args.cardId}`;
+      if (card) {
+        card.status = "running";
+        card.run_id = runId;
+      }
+      mockLogs[runId] = [
+        {
+          run_id: runId,
+          event_type: "status",
+          payload: "running"
+        },
+        {
+          run_id: runId,
+          event_type: "message",
+          payload: JSON.stringify({ role: "agent", content: "Isolated sandbox initialized. Model connection established. Ready to execute code work." })
+        }
+      ];
+      return runId;
+    }
+    case "cancel_run": {
+      const card = mockCards.find(c => c.run_id === args.runId);
+      if (card) {
+        card.status = "failed";
+      }
+      if (!mockLogs[args.runId]) mockLogs[args.runId] = [];
+      mockLogs[args.runId].push(
+        {
+          run_id: args.runId,
+          event_type: "status",
+          payload: "failed"
+        },
+        {
+          run_id: args.runId,
+          event_type: "message",
+          payload: JSON.stringify({ role: "agent", content: "Run cancelled by developer. Discarded sandbox changes." })
+        }
+      );
+      return {};
+    }
+    case "unblock_run": {
+      const card = mockCards.find(c => c.run_id === args.runId);
+      if (card) {
+        card.status = "running";
+      }
+      if (!mockLogs[args.runId]) mockLogs[args.runId] = [];
+      mockLogs[args.runId].push(
+        {
+          run_id: args.runId,
+          event_type: "message",
+          payload: JSON.stringify({ role: "user", content: args.reply })
+        },
+        {
+          run_id: args.runId,
+          event_type: "status",
+          payload: "running"
+        },
+        {
+          run_id: args.runId,
+          event_type: "message",
+          payload: JSON.stringify({ role: "agent", content: "Feedback received. Proceeding with execution loop..." })
+        }
+      );
+      return {};
+    }
+    case "accept_run": {
+      const card = mockCards.find(c => c.run_id === args.runId);
+      if (card) {
+        card.status = "done";
+      }
+      if (!mockLogs[args.runId]) mockLogs[args.runId] = [];
+      mockLogs[args.runId].push(
+        {
+          run_id: args.runId,
+          event_type: "status",
+          payload: "done"
+        },
+        {
+          run_id: args.runId,
+          event_type: "message",
+          payload: JSON.stringify({ role: "agent", content: "Worktree successfully squashed and merged into main." })
+        }
+      );
+      return {};
+    }
+    case "reject_run": {
+      const card = mockCards.find(c => c.run_id === args.runId);
+      if (card) {
+        card.status = "failed";
+      }
+      if (!mockLogs[args.runId]) mockLogs[args.runId] = [];
+      mockLogs[args.runId].push(
+        {
+          run_id: args.runId,
+          event_type: "status",
+          payload: "failed"
+        },
+        {
+          run_id: args.runId,
+          event_type: "message",
+          payload: JSON.stringify({ role: "agent", content: "Worktree changes rejected and branch deleted." })
+        }
+      );
+      return {};
+    }
+    case "send_chat": {
+      if (!mockLogs[args.runId]) mockLogs[args.runId] = [];
+      mockLogs[args.runId].push({
+        run_id: args.runId,
+        event_type: "message",
+        payload: JSON.stringify({ role: "user", content: args.message })
+      });
+      
+      const reply = args.message.toLowerCase().includes("test")
+        ? "All unit tests compiled successfully inside `src-tauri/src/git.rs`."
+        : "Understood. Adjusting implementation path in sandbox.";
+        
+      mockLogs[args.runId].push({
+        run_id: args.runId,
+        event_type: "message",
+        payload: JSON.stringify({ role: "agent", content: reply })
+      });
+      return {};
+    }
+    case "get_run_log":
+      return mockLogs[args.runId] || [];
+    case "save_card": {
+      const idx = mockCards.findIndex(c => c.id === args.card.id);
+      if (idx !== -1) {
+        mockCards[idx] = { ...args.card };
+        return mockCards[idx];
+      }
+      return null;
+    }
+    case "delete_card": {
+      mockCards = mockCards.filter(c => c.id !== args.cardId);
+      return {};
+    }
+    case "list_design_docs":
+      return ["design.md", "architecture.md"];
+    case "create_file":
+      return {};
+    case "create_dir":
+      return {};
+    case "save_file":
+      return {};
+    case "delete_item":
+      return {};
+    case "list_dir":
+      return [
+        { name: "src", path: "src", is_dir: true },
+        { name: "src-tauri", path: "src-tauri", is_dir: true },
+        { name: "index.html", path: "index.html", is_dir: false },
+        { name: "package.json", path: "package.json", is_dir: false }
+      ];
+    case "read_file":
+      return `// Mock file content\nconsole.log("Hello from mock file!");`;
+    case "read_diff":
+      return `diff --git a/mock.txt b/mock.txt\n--- a/mock.txt\n+++ b/mock.txt\n@@ -1,1 +1,2 @@\n-Mock content\n+Mock content modified in browser\n+Additional line`;
+    case "fetch_local_models":
+      return [
+        { name: "llama3:latest", is_loaded: true, context_size: 8192 },
+        { name: "mistral:latest", is_loaded: false, context_size: 32768 },
+        { name: "phi3:latest", is_loaded: false, context_size: 4096 }
+      ];
+    default:
+      return {};
+  }
+};
+
+// Safe invoke wrapper delegating to backend or mock
+async function invoke<T>(cmd: string, args?: any): Promise<T> {
+  if (isTauri) {
+    return await tauriInvoke<T>(cmd, args);
+  } else {
+    return await mockInvoke(cmd, args) as T;
+  }
+}
 
 // Interfaces from Rust commands contract
 interface Project {
@@ -7,12 +308,20 @@ interface Project {
   path: string;
 }
 
+interface TodoItem {
+  text: string;
+  completed: boolean;
+}
+
 interface Card {
   id: string;
+  project_path: string;
   title: string;
   description: string;
   status: string; // "backlog", "todo", "running", "blocked", "review", "done", "failed"
   run_id: string | null;
+  assignee: string | null;
+  todo_list: TodoItem[];
 }
 
 interface RunEvent {
@@ -29,20 +338,44 @@ interface DirEntry {
 
 // Viewer panel polymorphic state
 type ViewerState =
-  | { kind: "doc" }
+  | { kind: "doc"; docName?: string }
   | { kind: "kanban" }
   | { kind: "file"; path: string; name: string }
-  | { kind: "diff"; runId: string };
+  | { kind: "diff"; runId: string }
+  | { kind: "new_project" }
+  | { kind: "card_detail"; cardId: string };
+
+interface LlmSettings {
+  provider: string;
+  api_url: string;
+  api_key: string;
+  model: string;
+  max_steps: number;
+}
 
 // App State
 let currentProject: Project | null = null;
 let cardsList: Card[] = [];
 let activeCard: Card | null = null;
-let viewerStack: ViewerState[] = [{ kind: "doc" }];
+let viewerStack: ViewerState[] = [{ kind: "doc", docName: "design.md" }];
 let currentMode: "plan" | "kanban" | "code" = "plan";
+let selectedDesignDoc: string = "design.md";
+let isEditingViewer = false;
+let viewerEditBuffer = "";
+let activeLlmRunId: string | null = null;
+
+let globalChunkListener: ((event: any) => void) | null = null;
+let activeStreams = new Map<string, {
+  text: string;
+  bubbleElement: HTMLDivElement | null;
+}>();
 
 // DOM References
 const projectSelect = document.getElementById("project-select") as HTMLSelectElement;
+const btnNewProjectToggle = document.getElementById("btn-new-project-toggle") as HTMLButtonElement;
+const repoWorkspaceSection = document.getElementById("repo-workspace-section") as HTMLDivElement;
+const designDocsSection = document.getElementById("design-docs-section") as HTMLDivElement;
+const designDocsList = document.getElementById("design-docs-list") as HTMLDivElement;
 const fileTreeContainer = document.getElementById("file-tree") as HTMLDivElement;
 const activeCardTitle = document.getElementById("active-card-title") as HTMLHeadingElement;
 const runStatusBadge = document.getElementById("run-status") as HTMLDivElement;
@@ -64,16 +397,268 @@ const viewerTitle = document.getElementById("viewer-title") as HTMLHeadingElemen
 const viewerContainer = document.getElementById("viewer-container") as HTMLDivElement;
 const btnViewerBack = document.getElementById("btn-viewer-back") as HTMLButtonElement;
 
+// Viewer Header Edit Actions
+const btnViewerEdit = document.getElementById("btn-viewer-edit") as HTMLButtonElement;
+const btnViewerSave = document.getElementById("btn-viewer-save") as HTMLButtonElement;
+const btnViewerCancel = document.getElementById("btn-viewer-cancel") as HTMLButtonElement;
+
+// File System Dialog Modal Elements
+const fsModal = document.getElementById("fs-modal") as HTMLDivElement;
+const fsModalTitle = document.getElementById("fs-modal-title") as HTMLHeadingElement;
+const btnFsClose = document.getElementById("btn-fs-close") as HTMLButtonElement;
+const fsForm = document.getElementById("fs-form") as HTMLFormElement;
+const fsParentPath = document.getElementById("fs-parent-path") as HTMLInputElement;
+const fsItemType = document.getElementById("fs-item-type") as HTMLInputElement;
+const fsItemName = document.getElementById("fs-item-name") as HTMLInputElement;
+const btnFsCancel = document.getElementById("btn-fs-cancel") as HTMLButtonElement;
+const fsLabelName = document.getElementById("fs-label-name") as HTMLLabelElement;
+const btnFsSubmit = document.getElementById("btn-fs-submit") as HTMLButtonElement;
+
+// Root Buttons
+const btnRootAddFile = document.getElementById("btn-root-add-file") as HTMLButtonElement;
+const btnRootAddFolder = document.getElementById("btn-root-add-folder") as HTMLButtonElement;
+const btnAddDesignDoc = document.getElementById("btn-add-design-doc") as HTMLButtonElement;
+
+// Settings Modal Selectors
+const btnSettingsToggle = document.getElementById("btn-settings-toggle") as HTMLButtonElement;
+const settingsModal = document.getElementById("settings-modal") as HTMLDivElement;
+const btnSettingsClose = document.getElementById("btn-settings-close") as HTMLButtonElement;
+const btnSettingsCancel = document.getElementById("btn-settings-cancel") as HTMLButtonElement;
+const settingsForm = document.getElementById("settings-form") as HTMLFormElement;
+const settingsProvider = document.getElementById("settings-provider") as HTMLSelectElement;
+const settingsUrl = document.getElementById("settings-url") as HTMLInputElement;
+const settingsKey = document.getElementById("settings-key") as HTMLInputElement;
+const settingsModel = document.getElementById("settings-model") as HTMLInputElement;
+const settingsModelSelect = document.getElementById("settings-model-select") as HTMLSelectElement;
+const btnFetchModels = document.getElementById("btn-fetch-models") as HTMLButtonElement;
+const btnToggleModelInput = document.getElementById("btn-toggle-model-input") as HTMLButtonElement;
+const modelContextInfo = document.getElementById("model-context-info") as HTMLSpanElement;
+const settingsSteps = document.getElementById("settings-steps") as HTMLInputElement;
+
 // Mode tabs
 const tabPlan = document.getElementById("tab-plan") as HTMLButtonElement;
 const tabKanban = document.getElementById("tab-kanban") as HTMLButtonElement;
 const tabCode = document.getElementById("tab-code") as HTMLButtonElement;
 
+// Resize panels via drag handles
+function setupResizablePanels() {
+  const container = document.querySelector(".app-container") as HTMLDivElement;
+  if (!container) return;
+
+  const resizerLeft = document.getElementById("resizer-left") as HTMLDivElement;
+  const resizerRight = document.getElementById("resizer-right") as HTMLDivElement;
+
+  if (!resizerLeft || !resizerRight) return;
+
+  let leftWidth = 280;
+  let centerWidth = 480;
+
+  const minLeft = 180;
+  const maxLeft = 500;
+  const minCenter = 300;
+  const maxCenter = 800;
+
+  resizerLeft.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    document.body.classList.add("resizing-active");
+    resizerLeft.classList.add("dragging");
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      leftWidth = Math.max(minLeft, Math.min(maxLeft, moveEvent.clientX));
+      container.style.gridTemplateColumns = `${leftWidth}px 4px ${centerWidth}px 4px 1fr`;
+    };
+
+    const onMouseUp = () => {
+      document.body.classList.remove("resizing-active");
+      resizerLeft.classList.remove("dragging");
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  });
+
+  resizerRight.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    document.body.classList.add("resizing-active");
+    resizerRight.classList.add("dragging");
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const centerStart = leftWidth + 4;
+      centerWidth = Math.max(minCenter, Math.min(maxCenter, moveEvent.clientX - centerStart));
+      container.style.gridTemplateColumns = `${leftWidth}px 4px ${centerWidth}px 4px 1fr`;
+    };
+
+    const onMouseUp = () => {
+      document.body.classList.remove("resizing-active");
+      resizerRight.classList.remove("dragging");
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  });
+}
+
 // Initialize App
 window.addEventListener("DOMContentLoaded", async () => {
   setupEventListeners();
+  setupResizablePanels();
+  
+  if (typeof Notification !== "undefined" && Notification.permission !== "granted" && Notification.permission !== "denied") {
+    Notification.requestPermission().catch((e) => console.error(e));
+  }
+
+  await setupTauriEventListeners();
   await loadProjects();
 });
+
+// Setup Tauri streaming event listeners
+async function setupTauriEventListeners() {
+  if (isTauri) {
+    try {
+      globalChunkListener = async (event: any) => {
+        const payload = event.payload;
+        const runId = payload.run_id;
+        
+        let stream = activeStreams.get(runId);
+        if (!stream) {
+          stream = { text: "", bubbleElement: null };
+          activeStreams.set(runId, stream);
+        }
+        
+        stream.text += payload.chunk;
+        
+        const activeKey = getCurrentLogKey();
+        if (activeKey === runId) {
+          if (!stream.bubbleElement) {
+            removeThinkingBubble();
+            
+            const wrapper = document.createElement("div");
+            wrapper.className = "chat-bubble agent";
+            
+            const meta = document.createElement("div");
+            meta.className = "bubble-meta";
+            meta.innerHTML = `<span>BeetleAI</span>`;
+            wrapper.appendChild(meta);
+            
+            const content = document.createElement("div");
+            content.className = "bubble-content-text";
+            wrapper.appendChild(content);
+            
+            chatMessages.appendChild(wrapper);
+            stream.bubbleElement = wrapper;
+          }
+          
+          const isAtBottom = chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight <= 50;
+          const contentDiv = stream.bubbleElement.querySelector(".bubble-content-text") as HTMLDivElement;
+          if (contentDiv) {
+            contentDiv.innerHTML = formatMarkdownInChat(stream.text);
+          }
+          if (isAtBottom) {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+          }
+        }
+        
+        if (payload.done) {
+          activeStreams.delete(runId);
+          if (activeKey === runId) {
+            removeThinkingBubble();
+            await updateActiveCardUI();
+            if (currentMode === "kanban") {
+              await refreshState();
+            }
+          }
+        }
+      };
+
+      await listen("chat-chunk", globalChunkListener);
+      
+      await listen("chat-finished", async (event: any) => {
+        const payload = event.payload;
+        const runId = payload.run_id;
+        if (activeLlmRunId === runId) {
+          activeLlmRunId = null;
+          updateSendButtonState();
+        }
+        const activeKey = getCurrentLogKey();
+        if (activeKey === runId) {
+          removeThinkingBubble();
+          chatInput.disabled = false;
+          chatInput.focus();
+          await refreshState();
+          renderRightPanel();
+        }
+      });
+      
+      await listen("run-updated", async () => {
+        await refreshState();
+        if (currentProject) {
+          await renderFileTreeRoot(currentProject.path).catch((err) => console.error(err));
+        }
+      });
+
+      await listen("notification", (event: any) => {
+        showSystemNotification(event.payload);
+      });
+    } catch (err) {
+      console.error("Failed to register Tauri event listener:", err);
+    }
+  } else {
+    globalChunkListener = (event: any) => {
+      const payload = event.payload;
+      const runId = payload.run_id;
+      
+      let stream = activeStreams.get(runId);
+      if (!stream) {
+        stream = { text: "", bubbleElement: null };
+        activeStreams.set(runId, stream);
+      }
+      
+      stream.text += payload.chunk;
+      
+      const activeKey = getCurrentLogKey();
+      if (activeKey === runId) {
+        if (!stream.bubbleElement) {
+          removeThinkingBubble();
+          
+          const wrapper = document.createElement("div");
+          wrapper.className = "chat-bubble agent";
+          
+          const meta = document.createElement("div");
+          meta.className = "bubble-meta";
+          meta.innerHTML = `<span>BeetleAI</span>`;
+          wrapper.appendChild(meta);
+          
+          const content = document.createElement("div");
+          content.className = "bubble-content-text";
+          wrapper.appendChild(content);
+          
+          chatMessages.appendChild(wrapper);
+          stream.bubbleElement = wrapper;
+        }
+        
+        const isAtBottom = chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight <= 50;
+        const contentDiv = stream.bubbleElement.querySelector(".bubble-content-text") as HTMLDivElement;
+        if (contentDiv) {
+          contentDiv.innerHTML = formatMarkdownInChat(stream.text);
+        }
+        if (isAtBottom) {
+          chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+      }
+      
+      if (payload.done) {
+        activeStreams.delete(runId);
+        if (activeKey === runId) {
+          removeThinkingBubble();
+        }
+      }
+    };
+  }
+}
 
 // Setup DOM event listeners
 function setupEventListeners() {
@@ -95,6 +680,48 @@ function setupEventListeners() {
     }
   });
 
+  // Project creation toggle
+  btnNewProjectToggle.addEventListener("click", () => {
+    pushView({ kind: "new_project" });
+  });
+
+  // Settings Modal actions
+  btnSettingsToggle.addEventListener("click", () => openSettingsModal());
+  btnSettingsClose.addEventListener("click", () => closeSettingsModal());
+  btnSettingsCancel.addEventListener("click", () => closeSettingsModal());
+  settingsForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    saveSettings();
+  });
+  btnFetchModels.addEventListener("click", () => fetchModels());
+  settingsModelSelect.addEventListener("change", () => onModelSelectChange());
+  btnToggleModelInput.addEventListener("click", () => toggleModelInput(true));
+
+  // Provider dropdown listener to auto-update url placeholder
+  settingsProvider.addEventListener("change", () => {
+    const provider = settingsProvider.value;
+    if (provider === "openai") {
+      settingsUrl.placeholder = "https://api.openai.com/v1";
+    } else if (provider === "anthropic") {
+      settingsUrl.placeholder = "https://api.anthropic.com/v1";
+    } else if (provider === "lmstudio") {
+      settingsUrl.placeholder = "http://localhost:1234/v1";
+    } else if (provider === "custom") {
+      settingsUrl.placeholder = "http://localhost:11434";
+    }
+  });
+
+  // URL input listeners to auto-fetch models when entering a URL
+  settingsUrl.addEventListener("change", () => {
+    fetchModels(true); // silent fetch on blur/change
+  });
+  settingsUrl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault(); // prevent form from submitting
+      fetchModels(false); // explicit fetch, alerts on error
+    }
+  });
+
   // Run controls listeners
   btnStartRun.addEventListener("click", async () => {
     if (!activeCard) return;
@@ -106,6 +733,7 @@ function setupEventListeners() {
       pushView({ kind: "diff", runId });
     } catch (err) {
       console.error(err);
+      alert("Failed to start run: " + err);
     }
   });
 
@@ -117,6 +745,7 @@ function setupEventListeners() {
       await refreshState();
     } catch (err) {
       console.error(err);
+      alert("Failed to cancel run: " + err);
     }
   });
 
@@ -129,6 +758,7 @@ function setupEventListeners() {
       switchMode("kanban");
     } catch (err) {
       console.error(err);
+      alert("Failed to accept changes: " + err);
     }
   });
 
@@ -141,11 +771,18 @@ function setupEventListeners() {
       switchMode("kanban");
     } catch (err) {
       console.error(err);
+      alert("Failed to reject changes: " + err);
     }
   });
 
   // Chat input listener
-  btnSendChat.addEventListener("click", () => submitChat());
+  btnSendChat.addEventListener("click", () => {
+    if (activeLlmRunId) {
+      abortActiveChat();
+    } else {
+      submitChat();
+    }
+  });
   chatInput.addEventListener("keypress", (e) => {
     if (e.key === "Enter") {
       submitChat();
@@ -154,6 +791,272 @@ function setupEventListeners() {
 
   // Viewer back button
   btnViewerBack.addEventListener("click", () => popView());
+
+  // File system modal close buttons
+  btnFsClose.addEventListener("click", () => closeFsDialog());
+  btnFsCancel.addEventListener("click", () => closeFsDialog());
+
+  // File system creation form submit
+  fsForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!currentProject) return;
+    const parentPath = fsParentPath.value;
+    const type = fsItemType.value;
+    let name = fsItemName.value.trim();
+    if (!name) return;
+
+    if (type === "doc" && !name.endsWith(".md")) {
+      name += ".md";
+    }
+
+    try {
+      if (type === "doc") {
+        const initialContent = `# ${name.replace(/\.md$/, "")}\n\nStart drafting your design here.\n`;
+        await invoke("write_design_doc", {
+          projectPath: currentProject.path,
+          docName: name,
+          content: initialContent
+        });
+        closeFsDialog();
+        await loadDesignDocs();
+        selectedDesignDoc = name;
+        pushView({ kind: "doc", docName: name });
+      } else {
+        const separator = parentPath.includes("\\") ? "\\" : "/";
+        const targetPath = parentPath ? `${parentPath}${separator}${name}` : `${currentProject.path}${separator}${name}`;
+        
+        if (type === "file") {
+          await invoke("create_file", { projectPath: currentProject.path, path: targetPath });
+        } else {
+          await invoke("create_dir", { projectPath: currentProject.path, path: targetPath });
+        }
+        closeFsDialog();
+        await renderFileTreeRoot(currentProject.path);
+      }
+    } catch (err) {
+      alert(`Error creating item: ${err}`);
+    }
+  });
+
+  // Sidebar creation triggers
+  btnRootAddFile.addEventListener("click", () => openFsDialog("", "file"));
+  btnRootAddFolder.addEventListener("click", () => openFsDialog("", "dir"));
+  btnAddDesignDoc.addEventListener("click", () => openFsDialog("", "doc"));
+
+  // Viewer Edit Mode Handlers
+  btnViewerEdit.addEventListener("click", async () => {
+    const currentView = viewerStack[viewerStack.length - 1];
+    if (!currentView) return;
+    
+    if (currentView.kind === "doc") {
+      const docName = currentView.docName || "design.md";
+      try {
+        const text = await invoke<string>("read_design_doc", { projectPath: currentProject ? currentProject.path : ".", docName });
+        viewerEditBuffer = text;
+        isEditingViewer = true;
+        renderRightPanel();
+      } catch (err) {
+        alert("Failed to read document for editing: " + err);
+      }
+    } else if (currentView.kind === "file") {
+      try {
+        const code = await invoke<string>("read_file", { path: currentView.path });
+        viewerEditBuffer = code;
+        isEditingViewer = true;
+        renderRightPanel();
+      } catch (err) {
+        alert("Failed to read file for editing: " + err);
+      }
+    } else if (currentView.kind === "card_detail") {
+      isEditingViewer = true;
+      renderRightPanel();
+    }
+  });
+
+  btnViewerCancel.addEventListener("click", () => {
+    isEditingViewer = false;
+    renderRightPanel();
+  });
+
+  btnViewerSave.addEventListener("click", async () => {
+    const currentView = viewerStack[viewerStack.length - 1];
+    if (!currentView) return;
+    
+    if (currentView.kind === "card_detail") {
+      const titleInput = document.getElementById("viewer-card-title-input") as HTMLInputElement;
+      const descTextarea = document.getElementById("viewer-card-desc-textarea") as HTMLTextAreaElement;
+      if (titleInput && descTextarea) {
+        const card = cardsList.find(c => c.id === currentView.cardId);
+        if (card) {
+          card.title = titleInput.value;
+          card.description = descTextarea.value;
+          try {
+            await saveCardObject(card);
+            isEditingViewer = false;
+            await refreshState();
+          } catch (err) {
+            alert("Failed to save card: " + err);
+          }
+        }
+      }
+      return;
+    }
+
+    const textarea = document.getElementById("viewer-editor-textarea") as HTMLTextAreaElement;
+    if (!textarea) return;
+    const newContent = textarea.value;
+    
+    if (currentView.kind === "doc") {
+      const docName = currentView.docName || "design.md";
+      try {
+        await invoke("write_design_doc", {
+          projectPath: currentProject ? currentProject.path : ".",
+          docName,
+          content: newContent
+        });
+        isEditingViewer = false;
+        renderRightPanel();
+      } catch (err) {
+        alert("Failed to save document: " + err);
+      }
+    } else if (currentView.kind === "file") {
+      try {
+        await invoke("save_file", {
+          projectPath: currentProject ? currentProject.path : ".",
+          path: currentView.path,
+          content: newContent
+        });
+        isEditingViewer = false;
+        renderRightPanel();
+      } catch (err) {
+        alert("Failed to save file: " + err);
+      }
+    }
+  });
+}
+
+let fetchedModels: { name: string; is_loaded: boolean; context_size: number | null }[] = [];
+
+async function openSettingsModal() {
+  try {
+    const settings = await invoke<LlmSettings>("get_settings");
+    settingsProvider.value = settings.provider;
+    settingsUrl.value = settings.api_url;
+    settingsKey.value = settings.api_key;
+    settingsModel.value = settings.model;
+    settingsSteps.value = settings.max_steps.toString();
+    
+    // Reset model selection view states
+    toggleModelInput(true);
+    settingsModal.style.display = "flex";
+
+    // Auto-fetch models in the background if a URL is already present
+    if (settingsUrl.value.trim()) {
+      fetchModels(true);
+    }
+  } catch (err) {
+    console.error("Failed to load settings:", err);
+  }
+}
+
+function closeSettingsModal() {
+  settingsModal.style.display = "none";
+}
+
+async function saveSettings() {
+  const settings: LlmSettings = {
+    provider: settingsProvider.value,
+    api_url: settingsUrl.value,
+    api_key: settingsKey.value,
+    model: settingsModel.value,
+    max_steps: parseInt(settingsSteps.value, 10) || 50
+  };
+
+  try {
+    await invoke("save_settings", { settings });
+    closeSettingsModal();
+    alert("LLM settings saved successfully!");
+  } catch (err) {
+    console.error("Failed to save settings:", err);
+    alert("Error saving settings: " + err);
+  }
+}
+
+async function fetchModels(silentOnFailure = false) {
+  const url = settingsUrl.value.trim();
+  if (!url) {
+    if (!silentOnFailure) {
+      alert("Please enter a valid API Base URL first.");
+    }
+    return;
+  }
+
+  btnFetchModels.disabled = true;
+  btnFetchModels.textContent = "Querying...";
+
+  try {
+    const models = await invoke<{ name: string; is_loaded: boolean; context_size: number | null }[]>("fetch_local_models", { url, provider: settingsProvider.value });
+    fetchedModels = models;
+    
+    settingsModelSelect.innerHTML = `<option value="">Select a model...</option>`;
+    models.forEach((m) => {
+      const option = document.createElement("option");
+      option.value = m.name;
+      const ctxLabel = m.context_size ? ` (${(m.context_size / 1024).toFixed(0)}k ctx)` : '';
+      option.textContent = `${m.name} ${m.is_loaded ? ' (Loaded)' : ' (Idle)'}${ctxLabel}`;
+      settingsModelSelect.appendChild(option);
+    });
+
+    const hasMatchingModel = settingsModel.value && models.some(m => m.name === settingsModel.value);
+    if (models.length > 0 && (!silentOnFailure || hasMatchingModel)) {
+      toggleModelInput(false);
+      if (hasMatchingModel) {
+        settingsModelSelect.value = settingsModel.value;
+        onModelSelectChange();
+      }
+    } else {
+      toggleModelInput(true);
+    }
+  } catch (err) {
+    console.error("Failed to retrieve models:", err);
+    if (!silentOnFailure) {
+      alert("Failed to retrieve models: " + err);
+    }
+  } finally {
+    btnFetchModels.disabled = false;
+    btnFetchModels.textContent = "Fetch";
+  }
+}
+
+function onModelSelectChange() {
+  const selected = settingsModelSelect.value;
+  if (!selected) {
+    modelContextInfo.style.display = "none";
+    return;
+  }
+
+  settingsModel.value = selected;
+  
+  const m = fetchedModels.find(item => item.name === selected);
+  if (m) {
+    modelContextInfo.textContent = `VRAM Status: ${m.is_loaded ? 'Loaded (Running)' : 'Idle'} | Context Window: ${m.context_size ? m.context_size.toLocaleString() + ' tokens' : 'Unknown'}`;
+    modelContextInfo.style.display = "block";
+  } else {
+    modelContextInfo.style.display = "none";
+  }
+}
+
+function toggleModelInput(manual: boolean) {
+  if (manual) {
+    settingsModel.style.display = "block";
+    settingsModelSelect.style.display = "none";
+    btnToggleModelInput.style.display = "none";
+    modelContextInfo.style.display = "none";
+  } else {
+    settingsModel.style.display = "none";
+    settingsModelSelect.style.display = "block";
+    btnToggleModelInput.style.display = "block";
+  }
 }
 
 // Switch navigation mode
@@ -164,17 +1067,77 @@ function switchMode(mode: "plan" | "kanban" | "code") {
   tabCode.classList.toggle("active", mode === "code");
 
   if (mode === "plan") {
-    pushView({ kind: "doc" });
+    designDocsSection.style.display = "block";
+    repoWorkspaceSection.style.display = "none";
+    activeCard = null;
+    loadDesignDocs();
   } else if (mode === "kanban") {
+    designDocsSection.style.display = "none";
+    repoWorkspaceSection.style.display = "none";
+    activeCard = null;
     pushView({ kind: "kanban" });
+    updateActiveCardUI();
   } else if (mode === "code") {
-    if (activeCard && activeCard.run_id) {
-      pushView({ kind: "diff", runId: activeCard.run_id });
+    designDocsSection.style.display = "none";
+    repoWorkspaceSection.style.display = "block";
+    const currentView = viewerStack[viewerStack.length - 1];
+    if (currentView && currentView.kind === "file") {
+      // Keep it
     } else {
-      // Find files if possible
-      pushView({ kind: "doc" });
+      pushView({ kind: "doc", docName: selectedDesignDoc });
     }
+    updateActiveCardUI();
   }
+}
+
+async function loadDesignDocs() {
+  if (!currentProject) return;
+  try {
+    const docs = await invoke<string[]>("list_design_docs", { projectPath: currentProject.path });
+    renderDesignDocs(docs);
+    
+    if (docs.length > 0) {
+      if (!selectedDesignDoc || !docs.includes(selectedDesignDoc)) {
+        selectedDesignDoc = docs[0];
+      }
+      pushView({ kind: "doc", docName: selectedDesignDoc });
+    }
+  } catch (err) {
+    console.error("Failed to load design docs:", err);
+    designDocsList.innerHTML = `<div class="empty-state">Failed to load design docs</div>`;
+  }
+}
+
+function renderDesignDocs(docs: string[]) {
+  designDocsList.innerHTML = "";
+  if (docs.length === 0) {
+    designDocsList.innerHTML = `
+      <div class="empty-state">
+        <span class="empty-state-icon">📄</span>
+        <span>No design docs found</span>
+      </div>
+    `;
+    return;
+  }
+  
+  docs.forEach((doc) => {
+    const item = document.createElement("div");
+    item.className = `tree-node file-node ${selectedDesignDoc === doc ? "active" : ""}`;
+    item.innerHTML = `
+      <span class="icon">📄</span>
+      <span>${doc}</span>
+    `;
+    
+    item.addEventListener("click", () => {
+      selectedDesignDoc = doc;
+      document.querySelectorAll("#design-docs-list .tree-node").forEach((el) => el.classList.remove("active"));
+      item.classList.add("active");
+      pushView({ kind: "doc", docName: doc });
+      updateActiveCardUI();
+    });
+    
+    designDocsList.appendChild(item);
+  });
 }
 
 // Fetch list of projects
@@ -192,9 +1155,22 @@ async function loadProjects() {
     if (projects.length > 0) {
       projectSelect.value = projects[0].path;
       await selectProject(projects[0]);
+    } else {
+      const fallbackProject = {
+        id: "beetleai",
+        name: "BeetleAI Harness",
+        path: "."
+      };
+      await selectProject(fallbackProject);
     }
   } catch (err) {
     console.error("Failed to load projects:", err);
+    const fallbackProject = {
+      id: "beetleai",
+      name: "BeetleAI Harness",
+      path: "."
+    };
+    await selectProject(fallbackProject);
   }
 }
 
@@ -205,32 +1181,100 @@ async function selectProject(project: Project) {
   
   // Load initial root directory tree
   if (currentProject) {
-    await renderFileTreeRoot(currentProject.path);
+    await renderFileTreeRoot(currentProject.path).catch((err) => console.error("Failed to render tree:", err));
   }
 
-  // Switch to Plan mode (Design doc view)
-  switchMode("plan");
+  // Switch to Kanban mode so cards are immediately visible!
+  switchMode("kanban");
 }
 
 // Reload cards, controls and chat transcript
 async function refreshState() {
-  if (!currentProject) return;
+  if (!currentProject) {
+    currentProject = {
+      id: "beetleai",
+      name: "BeetleAI Harness",
+      path: "."
+    };
+  }
   try {
-    cardsList = await invoke<Card[]>("list_cards");
+    cardsList = await invoke<Card[]>("list_cards", { projectPath: currentProject.path });
     
     // Refresh selected card if it is in progress
     if (activeCard) {
       const updated = cardsList.find((c) => c.id === activeCard!.id);
       if (updated) {
         activeCard = updated;
-        updateActiveCardUI();
       }
     }
     
-    // Render right-side panel
+    // Always update chat UI and right panel when refreshing state
+    await updateActiveCardUI();
     renderRightPanel();
   } catch (err) {
     console.error("Error refreshing state:", err);
+    // Safe client-side fallback if backend calls fail
+    if (cardsList.length === 0) {
+      cardsList = [
+        {
+          id: "card_1",
+          project_path: ".",
+          title: "Bootstrapping & Three-Column UI Layout",
+          description: "Setup Tauri v2 template with TypeScript, and construct the basic grid UI and styles.",
+          status: "done",
+          run_id: "run_card_1",
+          assignee: "BeetleAI",
+          todo_list: [
+            { text: "Configure Tauri v2 project template", completed: true },
+            { text: "Build TypeScript sidebar navigation and panels", completed: true },
+            { text: "Construct CSS layouts and themes", completed: true }
+          ]
+        },
+        {
+          id: "card_2",
+          project_path: ".",
+          title: "Git Worktree Integration & Sandbox",
+          description: "Implement git worktree creation, merge, and discard actions. Ensure filesystem is sandboxed.",
+          status: "review",
+          run_id: "run_card_2",
+          assignee: "BeetleAI",
+          todo_list: [
+            { text: "Implement git worktree creation helpers", completed: true },
+            { text: "Integrate file deletion and modification boundaries", completed: true },
+            { text: "Verify sandbox path traversal checks", completed: false }
+          ]
+        },
+        {
+          id: "card_3",
+          project_path: ".",
+          title: "Card State Store & Persistency Layer",
+          description: "Integrate SQLite and persist project files, cards, and execution transcripts.",
+          status: "todo",
+          run_id: null,
+          assignee: null,
+          todo_list: [
+            { text: "Design database schema for cards and logs", completed: false },
+            { text: "Integrate SQLite driver and migrations", completed: false },
+            { text: "Implement state persistence interface", completed: false }
+          ]
+        },
+        {
+          id: "card_4",
+          project_path: ".",
+          title: "Autonomous Loop Run Engine",
+          description: "Build the tokio task worker loop that fetches model responses, executes tools, and sends events.",
+          status: "backlog",
+          run_id: null,
+          assignee: null,
+          todo_list: [
+            { text: "Construct Tokio worker thread loop", completed: false },
+            { text: "Implement model response stream parsing", completed: false },
+            { text: "Add recursive tool routing handlers", completed: false }
+          ]
+        }
+      ];
+      renderRightPanel();
+    }
   }
 }
 
@@ -238,16 +1282,147 @@ async function refreshState() {
 async function selectCard(card: Card) {
   activeCard = card;
   updateActiveCardUI();
-  
-  if (card.run_id) {
-    pushView({ kind: "diff", runId: card.run_id });
+  pushView({ kind: "card_detail", cardId: card.id });
+}
+
+function updateSendButtonState() {
+  if (activeLlmRunId) {
+    btnSendChat.disabled = false;
+    btnSendChat.innerText = "⏹";
+    btnSendChat.classList.remove("btn-primary");
+    btnSendChat.classList.add("btn-danger");
+    btnSendChat.title = "Stop Generation";
   } else {
-    pushView({ kind: "kanban" });
+    btnSendChat.innerText = "→";
+    btnSendChat.classList.remove("btn-danger");
+    btnSendChat.classList.add("btn-primary");
+    btnSendChat.title = "Send Message";
+    
+    if (currentMode === "plan") {
+      btnSendChat.disabled = false;
+    } else if (currentMode === "code") {
+      const currentView = viewerStack[viewerStack.length - 1];
+      btnSendChat.disabled = !(currentView && currentView.kind === "file");
+    } else { // kanban
+      if (!activeCard) {
+        btnSendChat.disabled = true;
+      } else {
+        btnSendChat.disabled = !(activeCard.status === "running" || activeCard.status === "blocked");
+      }
+    }
   }
+}
+
+async function abortActiveChat() {
+  if (!activeLlmRunId) return;
+  const runId = activeLlmRunId;
+  btnSendChat.disabled = true;
+  if (isTauri) {
+    try {
+      await invoke("abort_chat", { runId });
+    } catch (err) {
+      console.error("Failed to abort chat:", err);
+    }
+  } else {
+    const stream = activeStreams.get(runId);
+    if (stream) {
+      if (globalChunkListener) {
+        globalChunkListener({
+          payload: {
+            run_id: runId,
+            chunk: "\n[Chat stopped by user]",
+            done: true,
+            error: null
+          }
+        });
+      }
+    }
+  }
+  activeLlmRunId = null;
+  updateSendButtonState();
 }
 
 // Render center column active card and run controls
 async function updateActiveCardUI() {
+  // 1. Plan Mode Chat UI
+  if (currentMode === "plan") {
+    activeCardTitle.textContent = `Design Document: ${selectedDesignDoc}`;
+    runStatusBadge.style.display = "none";
+    controlsRun.style.display = "none";
+    controlsActive.style.display = "none";
+    controlsReview.style.display = "none";
+    
+    chatInput.disabled = false;
+    btnSendChat.disabled = false;
+    chatInput.placeholder = "Suggest changes to design doc...";
+    
+    try {
+      const logs = await invoke<RunEvent[]>("get_design_log", {
+        projectPath: currentProject ? currentProject.path : ".",
+        docName: selectedDesignDoc
+      });
+      renderLogs(logs);
+    } catch (err) {
+      console.error(err);
+      chatMessages.innerHTML = `<div class="empty-state">Failed to load chat history</div>`;
+    }
+    return;
+  }
+
+  // 2. Code Mode Chat UI
+  if (currentMode === "code") {
+    runStatusBadge.style.display = "none";
+    controlsRun.style.display = "none";
+    controlsActive.style.display = "none";
+    controlsReview.style.display = "none";
+    
+    const currentView = viewerStack[viewerStack.length - 1];
+    if (currentView && currentView.kind === "file") {
+      activeCardTitle.textContent = `Edit File: ${currentView.name}`;
+      chatInput.disabled = false;
+      btnSendChat.disabled = false;
+      chatInput.placeholder = "Ask agent to edit this file...";
+      
+      try {
+        const logs = await invoke<RunEvent[]>("get_code_log", {
+          projectPath: currentProject ? currentProject.path : ".",
+          filePath: currentView.path
+        });
+        renderLogs(logs);
+      } catch (err) {
+        console.error(err);
+        chatMessages.innerHTML = `<div class="empty-state">Failed to load chat history</div>`;
+      }
+    } else {
+      activeCardTitle.textContent = "Code Workspace";
+      chatInput.disabled = false;
+      btnSendChat.disabled = false;
+      chatInput.placeholder = "Ask agent to write code or search files...";
+      
+      try {
+        const logs = await invoke<RunEvent[]>("get_code_log", {
+          projectPath: currentProject ? currentProject.path : ".",
+          filePath: ""
+        });
+        if (logs.length === 0) {
+          chatMessages.innerHTML = `
+            <div class="empty-state">
+              <span class="empty-state-icon">💻</span>
+              <span>Ask the agent to write new code, search files, or explain parts of the codebase.</span>
+            </div>
+          `;
+        } else {
+          renderLogs(logs);
+        }
+      } catch (err) {
+        console.error(err);
+        chatMessages.innerHTML = `<div class="empty-state">Failed to load chat history</div>`;
+      }
+    }
+    return;
+  }
+
+  // 3. Kanban Mode Chat UI
   if (!activeCard) {
     activeCardTitle.textContent = "Select a Card";
     runStatusBadge.style.display = "none";
@@ -271,7 +1446,6 @@ async function updateActiveCardUI() {
   runStatusText.textContent = activeCard.status;
   runStatusBadge.style.display = "flex";
 
-  // Toggle Controls based on state machine
   controlsRun.style.display = "none";
   controlsActive.style.display = "none";
   controlsReview.style.display = "none";
@@ -296,7 +1470,6 @@ async function updateActiveCardUI() {
     controlsReview.style.display = "flex";
   }
 
-  // Fetch and display transcript logs
   if (activeCard.run_id) {
     try {
       const logs = await invoke<RunEvent[]>("get_run_log", { runId: activeCard.run_id });
@@ -314,6 +1487,25 @@ async function updateActiveCardUI() {
       </div>
     `;
   }
+
+  const activeKey = getCurrentLogKey();
+  if (activeKey) {
+    try {
+      const active = await invoke<boolean>("is_run_active", { runId: activeKey });
+      if (active) {
+        activeLlmRunId = activeKey;
+      } else {
+        if (activeLlmRunId === activeKey) {
+          activeLlmRunId = null;
+        }
+      }
+    } catch (err) {
+      console.error("Failed to check run active state:", err);
+    }
+  } else {
+    activeLlmRunId = null;
+  }
+  updateSendButtonState();
 }
 
 // Render run execution transcript logs
@@ -324,7 +1516,41 @@ function renderLogs(logs: RunEvent[]) {
     return;
   }
 
+  // Preprocess events to pair tool_call and tool_result
+  const processedLogs: any[] = [];
+  let pendingToolCall: any = null;
+
   logs.forEach((log) => {
+    if (log.event_type === "tool_call") {
+      if (pendingToolCall) {
+        processedLogs.push(pendingToolCall);
+      }
+      pendingToolCall = {
+        event_type: "tool_call_paired",
+        call: log,
+        result: null
+      };
+    } else if (log.event_type === "tool_result") {
+      if (pendingToolCall) {
+        pendingToolCall.result = log;
+        processedLogs.push(pendingToolCall);
+        pendingToolCall = null;
+      } else {
+        processedLogs.push(log);
+      }
+    } else {
+      if (pendingToolCall) {
+        processedLogs.push(pendingToolCall);
+        pendingToolCall = null;
+      }
+      processedLogs.push(log);
+    }
+  });
+  if (pendingToolCall) {
+    processedLogs.push(pendingToolCall);
+  }
+
+  processedLogs.forEach((log) => {
     if (log.event_type === "status") {
       const div = document.createElement("div");
       div.className = "bubble-meta";
@@ -332,6 +1558,24 @@ function renderLogs(logs: RunEvent[]) {
       div.style.margin = "8px 0";
       div.textContent = `⚙ State transitioned: ${log.payload.toUpperCase()}`;
       chatMessages.appendChild(div);
+      return;
+    }
+
+    if (log.event_type === "reasoning") {
+      const wrapper = document.createElement("div");
+      wrapper.className = "chat-bubble agent reasoning-bubble";
+      wrapper.style.alignSelf = "flex-start";
+      wrapper.style.width = "95%";
+      wrapper.style.maxWidth = "95%";
+      wrapper.style.padding = "0";
+      wrapper.style.border = "none";
+      wrapper.style.backgroundColor = "transparent";
+      
+      const content = document.createElement("div");
+      content.innerHTML = formatMarkdownInChat(`<think>${log.payload}</think>`);
+      wrapper.appendChild(content);
+      
+      chatMessages.appendChild(wrapper);
       return;
     }
 
@@ -356,8 +1600,55 @@ function renderLogs(logs: RunEvent[]) {
       } catch (err) {
         console.error(err);
       }
+      return;
     }
 
+    if (log.event_type === "tool_call_paired") {
+      try {
+        const callDetails = JSON.parse(log.call.payload);
+        const resultDetails = log.result ? JSON.parse(log.result.payload) : null;
+        
+        const wrapper = document.createElement("div");
+        wrapper.className = "chat-bubble tool";
+        
+        const toolName = callDetails.tool || callDetails.name || "unknown";
+        const argsStr = escapeHtml(JSON.stringify(callDetails.args || callDetails.arguments, null, 2));
+        
+        let resultSection = "";
+        if (resultDetails) {
+          const resultStr = escapeHtml(resultDetails.result || "");
+          resultSection = `
+            <div class="tool-result-header" style="margin-top: 8px; font-weight: 600; font-size: 0.8rem; color: var(--text-secondary);">Result:</div>
+            <pre class="tool-details"><code>${resultStr}</code></pre>
+          `;
+        } else {
+          resultSection = `
+            <div class="tool-result-header" style="margin-top: 8px; font-weight: 600; font-size: 0.8rem; color: var(--text-muted); font-style: italic;">Executing...</div>
+          `;
+        }
+        
+        // Collapsed by default (no 'open' attribute)
+        wrapper.innerHTML = `
+          <details style="width: 100%;">
+            <summary class="tool-summary">
+              <span class="tool-status-icon">${resultDetails ? '✔️' : '⚙️'}</span>
+              <span>Tool: <strong>${toolName}</strong></span>
+            </summary>
+            <div class="tool-details-content" style="padding: 4px 8px 8px 8px;">
+              <div style="font-weight: 600; font-size: 0.8rem; color: var(--text-secondary);">Arguments:</div>
+              <pre class="tool-details"><code>${argsStr}</code></pre>
+              ${resultSection}
+            </div>
+          </details>
+        `;
+        chatMessages.appendChild(wrapper);
+      } catch (err) {
+        console.error(err);
+      }
+      return;
+    }
+
+    // Fallback for raw unpaired logs
     if (log.event_type === "tool_call" || log.event_type === "tool_result") {
       try {
         const details = JSON.parse(log.payload);
@@ -365,12 +1656,16 @@ function renderLogs(logs: RunEvent[]) {
         wrapper.className = "chat-bubble tool";
         
         const isCall = log.event_type === "tool_call";
+        const toolName = details.tool || details.name || "unknown";
+        
         wrapper.innerHTML = `
-          <div class="tool-header">
-            <span>${isCall ? '🛠 Executing Tool' : '⚙ Tool Output'}</span>
-            <code style="color: var(--accent-primary);">${details.tool}</code>
-          </div>
-          <pre class="tool-output"><code>${isCall ? JSON.stringify(details.args, null, 2) : details.result}</code></pre>
+          <details style="width: 100%;">
+            <summary class="tool-summary">
+              <span class="tool-status-icon">${isCall ? '⚙️' : '✔️'}</span>
+              <span>${isCall ? 'Calling tool:' : 'Response from:'} <strong>${toolName}</strong></span>
+            </summary>
+            <pre class="tool-details"><code>${isCall ? escapeHtml(JSON.stringify(details.args, null, 2)) : escapeHtml(details.result || '')}</code></pre>
+          </details>
         `;
         chatMessages.appendChild(wrapper);
       } catch (err) {
@@ -383,24 +1678,287 @@ function renderLogs(logs: RunEvent[]) {
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
+// JavaScript clean path helper to mirror backend logic
+function cleanProjectPathJS(path: string): string {
+  let p = path.replace(/\\/g, "/");
+  if (p.endsWith("/src-tauri")) {
+    p = p.substring(0, p.length - 10);
+  } else if (p === "src-tauri") {
+    p = ".";
+  }
+  return p;
+}
+
+// Get the unique identifier/run ID for the current chat channel
+function getCurrentLogKey(): string | null {
+  if (currentMode === "plan") {
+    const projPath = currentProject ? currentProject.path : ".";
+    const cleanProj = cleanProjectPathJS(projPath);
+    return `${cleanProj}/design/${selectedDesignDoc}`;
+  }
+  if (currentMode === "code") {
+    const currentView = viewerStack[viewerStack.length - 1];
+    const filePath = (currentView && currentView.kind === "file") ? currentView.path : "";
+    const projPath = currentProject ? currentProject.path : ".";
+    const cleanProj = cleanProjectPathJS(projPath);
+    return `${cleanProj}/code/${filePath}`;
+  }
+  if (currentMode === "kanban" && activeCard) {
+    return activeCard.run_id;
+  }
+  return null;
+}
+
+function showSystemNotification(message: string) {
+  if (typeof Notification !== "undefined") {
+    if (Notification.permission === "granted") {
+      new Notification("BeetleAI", { body: message });
+    } else if (Notification.permission !== "denied") {
+      Notification.requestPermission().then((permission) => {
+        if (permission === "granted") {
+          new Notification("BeetleAI", { body: message });
+        }
+      });
+    }
+  }
+}
+
+// Simulated stream generator for browser/mock mode
+function mockStreamPromise(runId: string, replyText: string): Promise<void> {
+  return new Promise((resolve) => {
+    const words = replyText.split(" ");
+    let wordIndex = 0;
+
+    // Persist mock reply inside browser session if in Kanban mode
+    if (currentMode === "kanban") {
+      if (!mockLogs[runId]) mockLogs[runId] = [];
+      mockLogs[runId].push({
+        run_id: runId,
+        event_type: "message",
+        payload: JSON.stringify({ role: "agent", content: replyText })
+      });
+    }
+
+    const timer = setInterval(() => {
+      if (wordIndex < words.length) {
+        const chunk = words[wordIndex] + " ";
+        wordIndex++;
+        if (globalChunkListener) {
+          globalChunkListener({
+            payload: {
+              run_id: runId,
+              chunk: chunk,
+              done: false,
+              error: null
+            }
+          });
+        }
+      } else {
+        clearInterval(timer);
+        if (globalChunkListener) {
+          globalChunkListener({
+            payload: {
+              run_id: runId,
+              chunk: "",
+              done: true,
+              error: null
+            }
+          });
+        }
+        resolve();
+      }
+    }, 40);
+  });
+}
+
 // Submit chat message to agent loop
 async function submitChat() {
   const text = chatInput.value.trim();
-  if (!text || !activeCard || !activeCard.run_id) return;
-  chatInput.value = "";
+  if (!text) return;
 
-  try {
-    if (activeCard.status === "blocked") {
-      // Call unblock_run
-      await invoke("unblock_run", { runId: activeCard.run_id, reply: text });
-      activeCard.status = "running";
-    } else {
-      // Mid-run interjection
-      await invoke("send_chat", { runId: activeCard.run_id, message: text });
+  // Disable input immediately to avoid overlapping requests
+  chatInput.disabled = true;
+  btnSendChat.disabled = true;
+
+  if (currentMode === "plan") {
+    chatInput.value = "";
+    renderOptimisticUserMessage(text);
+    renderThinkingBubble();
+
+    const logKey = getCurrentLogKey();
+    if (logKey) {
+      activeLlmRunId = logKey;
+      updateSendButtonState();
     }
-    await refreshState();
-  } catch (err) {
-    console.error(err);
+    if (isTauri) {
+      invoke("send_design_chat", {
+        projectPath: currentProject ? currentProject.path : ".",
+        docName: selectedDesignDoc,
+        message: text
+      }).then(() => {
+        // Run started asynchronously in background.
+      }).catch((err) => {
+        activeLlmRunId = null;
+        updateSendButtonState();
+        removeThinkingBubble();
+        chatInput.disabled = false;
+        chatInput.focus();
+        console.error(err);
+        alert("Failed to send design chat: " + err);
+      });
+    } else if (logKey) {
+      const mockReply = "I suggest adding validation checks and a database persistence layer to the design document. These requirements will align with our SQLite milestone.";
+      mockStreamPromise(logKey, mockReply).then(() => {
+        activeLlmRunId = null;
+        updateSendButtonState();
+        removeThinkingBubble();
+        chatInput.disabled = false;
+        chatInput.focus();
+        updateActiveCardUI();
+        renderRightPanel();
+      });
+    }
+    return;
+  }
+
+  if (currentMode === "code") {
+    const currentView = viewerStack[viewerStack.length - 1];
+    const filePath = (currentView && currentView.kind === "file") ? currentView.path : "";
+    
+    chatInput.value = "";
+    renderOptimisticUserMessage(text);
+    renderThinkingBubble();
+
+    const logKey = getCurrentLogKey();
+    if (logKey) {
+      activeLlmRunId = logKey;
+      updateSendButtonState();
+    }
+    if (isTauri) {
+      invoke("send_code_chat", {
+        projectPath: currentProject ? currentProject.path : ".",
+        filePath: filePath,
+        message: text
+      }).then(() => {
+        // Run started asynchronously in background.
+      }).catch((err) => {
+        activeLlmRunId = null;
+        updateSendButtonState();
+        removeThinkingBubble();
+        chatInput.disabled = false;
+        chatInput.focus();
+        console.error(err);
+        alert("Failed to request code edit: " + err);
+      });
+    } else if (logKey) {
+        const mockReply = "I have updated the file to include standard error logging and cleaner option checking in the command handlers.";
+        mockStreamPromise(logKey, mockReply).then(() => {
+          activeLlmRunId = null;
+          updateSendButtonState();
+          removeThinkingBubble();
+          chatInput.disabled = false;
+          chatInput.focus();
+          updateActiveCardUI();
+          renderRightPanel();
+        });
+    }
+    return;
+  }
+
+  // Kanban Mode
+  if (!activeCard || !activeCard.run_id) {
+    chatInput.disabled = false;
+    btnSendChat.disabled = false;
+    return;
+  }
+  
+  chatInput.value = "";
+  renderOptimisticUserMessage(text);
+  renderThinkingBubble();
+
+  const runId = activeCard.run_id;
+  const isBlocked = activeCard.status === "blocked";
+  
+  activeLlmRunId = runId;
+  updateSendButtonState();
+
+  if (isTauri) {
+    const promise = isBlocked
+      ? invoke("unblock_run", { runId, reply: text })
+      : invoke("send_chat", { runId, message: text });
+      
+    if (isBlocked) {
+      activeCard.status = "running";
+    }
+
+    promise.then(() => {
+      removeThinkingBubble();
+      chatInput.disabled = false;
+      chatInput.focus();
+      refreshState();
+    }).catch((err) => {
+      activeLlmRunId = null;
+      updateSendButtonState();
+      removeThinkingBubble();
+      chatInput.disabled = false;
+      chatInput.focus();
+      console.error(err);
+    });
+  } else {
+    if (isBlocked) {
+      activeCard.status = "running";
+    }
+    const mockReply = "I will proceed with running git worktree operations and checking dependencies inside the sandbox.";
+    mockStreamPromise(runId, mockReply).then(() => {
+      activeLlmRunId = null;
+      updateSendButtonState();
+      removeThinkingBubble();
+      chatInput.disabled = false;
+      chatInput.focus();
+      refreshState();
+    });
+  }
+}
+
+function renderOptimisticUserMessage(text: string) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "chat-bubble user";
+  
+  const meta = document.createElement("div");
+  meta.className = "bubble-meta";
+  meta.innerHTML = `<span>You</span>`;
+  wrapper.appendChild(meta);
+
+  const content = document.createElement("div");
+  content.innerHTML = formatMarkdownInChat(text);
+  wrapper.appendChild(content);
+
+  chatMessages.appendChild(wrapper);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function renderThinkingBubble() {
+  const wrapper = document.createElement("div");
+  wrapper.className = "chat-bubble agent thinking";
+  wrapper.id = "thinking-bubble";
+  
+  const meta = document.createElement("div");
+  meta.className = "bubble-meta";
+  meta.innerHTML = `<span>Agent</span>`;
+  wrapper.appendChild(meta);
+
+  const content = document.createElement("div");
+  content.innerHTML = `<span class="thinking-dots">Thinking...</span>`;
+  wrapper.appendChild(content);
+
+  chatMessages.appendChild(wrapper);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+function removeThinkingBubble() {
+  const bubble = document.getElementById("thinking-bubble");
+  if (bubble) {
+    bubble.remove();
   }
 }
 
@@ -426,9 +1984,28 @@ function createFileNode(entry: DirEntry): HTMLElement {
   
   const node = document.createElement("div");
   node.className = `tree-node ${entry.is_dir ? 'directory' : 'file'}`;
+  
+  let actionsHtml = "";
+  if (entry.is_dir) {
+    actionsHtml = `
+      <div class="tree-node-actions">
+        <button class="tree-action-btn add-file" title="Add File">📄+</button>
+        <button class="tree-action-btn add-folder" title="Add Folder">📁+</button>
+        <button class="tree-action-btn delete-item" title="Delete">🗑️</button>
+      </div>
+    `;
+  } else {
+    actionsHtml = `
+      <div class="tree-node-actions">
+        <button class="tree-action-btn delete-item" title="Delete">🗑️</button>
+      </div>
+    `;
+  }
+
   node.innerHTML = `
     <span class="icon">${entry.is_dir ? '📁' : '📄'}</span>
-    <span>${entry.name}</span>
+    <span class="tree-node-name">${entry.name}</span>
+    ${actionsHtml}
   `;
   
   wrapper.appendChild(node);
@@ -440,6 +2017,35 @@ function createFileNode(entry: DirEntry): HTMLElement {
     wrapper.appendChild(childrenContainer);
 
     let loaded = false;
+
+    // Actions click handlers
+    const btnAddFile = node.querySelector(".tree-action-btn.add-file") as HTMLButtonElement;
+    btnAddFile.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openFsDialog(entry.path, "file");
+    });
+
+    const btnAddFolder = node.querySelector(".tree-action-btn.add-folder") as HTMLButtonElement;
+    btnAddFolder.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openFsDialog(entry.path, "dir");
+    });
+
+    const btnDelete = node.querySelector(".tree-action-btn.delete-item") as HTMLButtonElement;
+    btnDelete.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!currentProject) return;
+      const confirmDelete = confirm(`Are you sure you want to delete the folder "${entry.name}" and all its contents?`);
+      if (confirmDelete) {
+        try {
+          await invoke("delete_item", { projectPath: currentProject.path, path: entry.path });
+          await renderFileTreeRoot(currentProject.path);
+        } catch (err) {
+          alert(`Failed to delete folder: ${err}`);
+        }
+      }
+    });
+
     node.addEventListener("click", async (e) => {
       e.stopPropagation();
       const isExpanded = childrenContainer.style.display !== "none";
@@ -449,6 +2055,7 @@ function createFileNode(entry: DirEntry): HTMLElement {
       if (!loaded && !isExpanded) {
         try {
           const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
+          childrenContainer.innerHTML = "";
           children.forEach((child) => {
             childrenContainer.appendChild(createFileNode(child));
           });
@@ -459,11 +2066,32 @@ function createFileNode(entry: DirEntry): HTMLElement {
       }
     });
   } else {
+    const btnDelete = node.querySelector(".tree-action-btn.delete-item") as HTMLButtonElement;
+    btnDelete.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!currentProject) return;
+      const confirmDelete = confirm(`Are you sure you want to delete the file "${entry.name}"?`);
+      if (confirmDelete) {
+        try {
+          await invoke("delete_item", { projectPath: currentProject.path, path: entry.path });
+          const currentView = viewerStack[viewerStack.length - 1];
+          if (currentView && currentView.kind === "file" && currentView.path === entry.path) {
+            popView();
+          } else {
+            await renderFileTreeRoot(currentProject.path);
+          }
+        } catch (err) {
+          alert(`Failed to delete file: ${err}`);
+        }
+      }
+    });
+
     node.addEventListener("click", (e) => {
       e.stopPropagation();
       document.querySelectorAll(".tree-node.file").forEach((n) => n.classList.remove("active"));
       node.classList.add("active");
       pushView({ kind: "file", path: entry.path, name: entry.name });
+      updateActiveCardUI();
     });
   }
 
@@ -472,6 +2100,7 @@ function createFileNode(entry: DirEntry): HTMLElement {
 
 // Viewer Stack navigation helpers
 function pushView(state: ViewerState) {
+  isEditingViewer = false;
   // If the view type is doc or kanban, don't duplicate on top of stack
   if (state.kind === "doc" || state.kind === "kanban") {
     viewerStack = [state];
@@ -482,6 +2111,7 @@ function pushView(state: ViewerState) {
 }
 
 function popView() {
+  isEditingViewer = false;
   if (viewerStack.length > 1) {
     viewerStack.pop();
     renderRightPanel();
@@ -495,18 +2125,68 @@ async function renderRightPanel() {
   // Show back button if we are nested
   btnViewerBack.style.display = viewerStack.length > 1 ? "inline-block" : "none";
 
+  // Hide edit actions by default
+  btnViewerEdit.style.display = "none";
+  btnViewerSave.style.display = "none";
+  btnViewerCancel.style.display = "none";
+
   if (!currentView) {
     viewerTitle.textContent = "Empty";
     viewerContainer.innerHTML = `<div class="empty-state">No view active</div>`;
+    viewerContainer.style.display = "";
+    viewerContainer.style.flexDirection = "";
     return;
+  }
+
+  // Set up flex layout on container if editing
+  if (isEditingViewer && (currentView.kind === "doc" || currentView.kind === "file")) {
+    viewerContainer.style.display = "flex";
+    viewerContainer.style.flexDirection = "column";
+    
+    // Configure buttons
+    btnViewerEdit.style.display = "none";
+    btnViewerSave.style.display = "inline-block";
+    btnViewerCancel.style.display = "inline-block";
+    
+    if (currentView.kind === "doc") {
+      const docName = currentView.docName || "design.md";
+      viewerTitle.textContent = docName;
+      viewerContainer.innerHTML = `
+        <textarea class="doc-editor-textarea" id="viewer-editor-textarea" style="width: 100%; height: 100%;">${escapeHtml(viewerEditBuffer)}</textarea>
+      `;
+    } else if (currentView.kind === "file") {
+      viewerTitle.textContent = currentView.name;
+      viewerContainer.innerHTML = `
+        <textarea class="code-editor-textarea" id="viewer-editor-textarea" style="width: 100%; height: 100%;">${escapeHtml(viewerEditBuffer)}</textarea>
+      `;
+    }
+    return;
+  }
+
+  // If not editing, restore container layout
+  viewerContainer.style.display = "";
+  viewerContainer.style.flexDirection = "";
+
+  // Show "Edit" button if editable type
+  if (currentView.kind === "doc" || currentView.kind === "file" || currentView.kind === "card_detail") {
+    if (isEditingViewer) {
+      btnViewerEdit.style.display = "none";
+      btnViewerSave.style.display = "inline-block";
+      btnViewerCancel.style.display = "inline-block";
+    } else {
+      btnViewerEdit.style.display = "inline-block";
+      btnViewerSave.style.display = "none";
+      btnViewerCancel.style.display = "none";
+    }
   }
 
   switch (currentView.kind) {
     case "doc":
-      viewerTitle.textContent = "Design Doc";
+      const docName = currentView.docName || "design.md";
+      viewerTitle.textContent = docName;
       viewerContainer.innerHTML = `<div class="empty-state">Loading design document...</div>`;
       try {
-        const text = await invoke<string>("read_design_doc");
+        const text = await invoke<string>("read_design_doc", { projectPath: currentProject ? currentProject.path : ".", docName });
         viewerContainer.innerHTML = `<div class="markdown-body">${parseMarkdown(text)}</div>`;
       } catch (err) {
         viewerContainer.innerHTML = `<div class="empty-state"><span style="color:var(--status-failed)">Error reading design doc: ${err}</span></div>`;
@@ -523,11 +2203,15 @@ async function renderRightPanel() {
       viewerContainer.innerHTML = `<div class="empty-state">Loading file...</div>`;
       try {
         const code = await invoke<string>("read_file", { path: currentView.path });
-        viewerContainer.innerHTML = `
-          <div class="code-viewer-container">
-            <pre class="code-viewer"><code>${escapeHtml(code)}</code></pre>
-          </div>
-        `;
+        if (currentView.path.endsWith(".md")) {
+          viewerContainer.innerHTML = `<div class="markdown-body">${parseMarkdown(code)}</div>`;
+        } else {
+          viewerContainer.innerHTML = `
+            <div class="code-viewer-container">
+              <pre class="code-viewer"><code>${escapeHtml(code)}</code></pre>
+            </div>
+          `;
+        }
       } catch (err) {
         viewerContainer.innerHTML = `<div class="empty-state"><span style="color:var(--status-failed)">Error loading file: ${err}</span></div>`;
       }
@@ -541,6 +2225,21 @@ async function renderRightPanel() {
         viewerContainer.innerHTML = renderDiffHtml(diffText);
       } catch (err) {
         viewerContainer.innerHTML = `<div class="empty-state"><span style="color:var(--status-failed)">Error generating diff: ${err}</span></div>`;
+      }
+      break;
+
+    case "new_project":
+      viewerTitle.textContent = "Create / Onboard Project";
+      renderNewProjectForm();
+      break;
+
+    case "card_detail":
+      viewerTitle.textContent = "Card Details";
+      const card = cardsList.find((c) => c.id === currentView.cardId);
+      if (card) {
+        renderCardDetail(card);
+      } else {
+        viewerContainer.innerHTML = `<div class="empty-state">Card not found</div>`;
       }
       break;
   }
@@ -574,6 +2273,9 @@ function renderKanbanBoard() {
         <span class="card-count">${filtered.length}</span>
       </div>
       <div class="kanban-cards-list" id="column-${col.key}"></div>
+      <div class="kanban-column-footer">
+        <button class="add-card-btn">+ Add card</button>
+      </div>
     `;
 
     const listDiv = colDiv.querySelector(".kanban-cards-list") as HTMLDivElement;
@@ -582,8 +2284,8 @@ function renderKanbanBoard() {
       const cardDiv = document.createElement("div");
       cardDiv.className = `kanban-card ${activeCard?.id === card.id ? 'selected' : ''}`;
       cardDiv.innerHTML = `
-        <div class="kanban-card-title">${card.title}</div>
-        <div class="kanban-card-description">${card.description}</div>
+        <div class="kanban-card-title">${formatPlainMarkdown(card.title)}</div>
+        <div class="kanban-card-description">${formatPlainMarkdown(card.description)}</div>
         <div class="kanban-card-meta">
           <span>ID: ${card.id}</span>
           ${card.run_id ? `<span style="color: var(--accent-primary); font-weight: 500;">Run Active</span>` : ''}
@@ -598,6 +2300,71 @@ function renderKanbanBoard() {
       });
 
       listDiv.appendChild(cardDiv);
+    });
+
+    const addCardBtn = colDiv.querySelector(".add-card-btn") as HTMLButtonElement;
+    addCardBtn.addEventListener("click", () => {
+      // Check if there is already an active composer in this column
+      if (listDiv.querySelector(".inline-card-composer")) return;
+      
+      const composer = document.createElement("div");
+      composer.className = "inline-card-composer";
+      composer.innerHTML = `
+        <textarea class="inline-card-textarea" placeholder="Enter card title..." rows="2" style="width: 100%; background: var(--bg-tertiary); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-primary); padding: 6px; font-size: 0.85rem; resize: none; margin-bottom: 6px; outline: none;"></textarea>
+        <div class="inline-card-controls" style="display: flex; gap: 6px; justify-content: flex-end;">
+          <button class="btn btn-secondary cancel-inline-card" style="font-size: 0.75rem; padding: 4px 8px; cursor: pointer;">Cancel</button>
+          <button class="btn btn-primary save-inline-card" style="font-size: 0.75rem; padding: 4px 8px; cursor: pointer;">Add Card</button>
+        </div>
+      `;
+      
+      listDiv.appendChild(composer);
+      listDiv.scrollTop = listDiv.scrollHeight; // Scroll to bottom
+      
+      const textarea = composer.querySelector(".inline-card-textarea") as HTMLTextAreaElement;
+      textarea.focus();
+      
+      const cancelBtn = composer.querySelector(".cancel-inline-card") as HTMLButtonElement;
+      cancelBtn.addEventListener("click", () => {
+        composer.remove();
+      });
+      
+      const saveBtn = composer.querySelector(".save-inline-card") as HTMLButtonElement;
+      const saveCard = async () => {
+        const title = textarea.value.trim();
+        if (title) {
+          try {
+            if (isTauri) {
+              await invoke("create_card", { projectPath: currentProject ? currentProject.path : ".", title, description: "Description here...", status: col.key });
+            } else {
+              const newCard: Card = {
+                id: `card_${cardsList.length + 1}`,
+                project_path: currentProject ? currentProject.path : ".",
+                title,
+                description: "Description here...",
+                status: col.key,
+                run_id: null,
+                assignee: null,
+                todo_list: []
+              };
+              cardsList.push(newCard);
+            }
+            await refreshState();
+          } catch (err) {
+            alert("Failed to create card: " + err);
+          }
+        }
+        composer.remove();
+      };
+      
+      saveBtn.addEventListener("click", saveCard);
+      textarea.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          saveCard();
+        } else if (e.key === "Escape") {
+          composer.remove();
+        }
+      });
     });
 
     board.appendChild(colDiv);
@@ -637,9 +2404,6 @@ function renderDiffHtml(diff: string): string {
         </div>
         <div class="diff-lines">
     `;
-
-    let leftLine = 0;
-    let rightLine = 0;
 
     for (let i = 1; i < lines.length; i++) {
       const line = lines[i];
@@ -692,55 +2456,237 @@ function renderDiffHtml(diff: string): string {
   return html;
 }
 
-// Markdown parser utilities
 function parseMarkdown(md: string): string {
   let html = md;
   // Escapes html tag markers
   html = escapeHtml(html);
 
-  // Headers
-  html = html.replace(/^# (.*?)$/gm, "<h1>$1</h1>");
-  html = html.replace(/^## (.*?)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^### (.*?)$/gm, "<h3>$1</h3>");
-
-  // Blockquotes/Alerts
-  html = html.replace(/^> \[\!IMPORTANT\](.*?)$/gm, '<div style="border-left: 4px solid var(--accent-primary); background-color: var(--bg-secondary); padding: 10px; margin: 12px 0; border-radius: 4px;"><strong>IMPORTANT</strong>');
-  html = html.replace(/^> (.*?)$/gm, "<blockquote>$1</blockquote>");
-
-  // Bold
+  // Inline formatting rules
+  // Bold: **text**
   html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-
+  // Italic: *text* or _text_
+  html = html.replace(/\*(.*?)\*/g, "<em>$1</em>");
+  html = html.replace(/_(.*?)_/g, "<em>$1</em>");
+  // Strikethrough: ~~text~~
+  html = html.replace(/~~(.*?)~~/g, "<del>$1</del>");
   // Inline Code
   html = html.replace(/`(.*?)`/g, "<code>$1</code>");
+  // Markdown links: [text](url)
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
 
-  // Code blocks
-  html = html.replace(/```(.*?)\n([\s\S]*?)```/gm, "<pre><code>$2</code></pre>");
+  // Code blocks: match ```lang ... ```
+  html = html.replace(/```([a-zA-Z0-9_]*)\n([\s\S]*?)```/gm, (_match, lang, code) => {
+    return `<pre class="chat-code-block"><code class="${lang}">${code}</code></pre>`;
+  });
 
-  // Lists
-  html = html.replace(/^\- (.*?)$/gm, "<li>$1</li>");
+  // Split into lines to process block elements (headers, lists, blockquotes)
+  const lines = html.split("\n");
+  const processedLines = lines.map(line => {
+    let trimmed = line.trim();
+    
+    // Headers: # Header to ###### Header
+    if (trimmed.startsWith("###### ")) {
+      return `<h6>${trimmed.slice(7)}</h6>`;
+    }
+    if (trimmed.startsWith("##### ")) {
+      return `<h5>${trimmed.slice(6)}</h5>`;
+    }
+    if (trimmed.startsWith("#### ")) {
+      return `<h4>${trimmed.slice(5)}</h4>`;
+    }
+    if (trimmed.startsWith("### ")) {
+      return `<h3>${trimmed.slice(4)}</h3>`;
+    }
+    if (trimmed.startsWith("## ")) {
+      return `<h2>${trimmed.slice(3)}</h2>`;
+    }
+    if (trimmed.startsWith("# ")) {
+      return `<h1>${trimmed.slice(2)}</h1>`;
+    }
+    
+    // Alerts and Blockquotes: > [!IMPORTANT], > text, etc.
+    if (trimmed.startsWith("&gt; ")) {
+      let content = trimmed.slice(5).trim();
+      if (content.startsWith("[!IMPORTANT]")) {
+        return `<div style="border-left: 4px solid var(--status-failed); background-color: var(--bg-secondary); padding: 10px; margin: 12px 0; border-radius: 4px;"><strong>IMPORTANT:</strong> ${content.slice(12)}</div>`;
+      }
+      if (content.startsWith("[!NOTE]")) {
+        return `<div style="border-left: 4px solid var(--accent-primary); background-color: var(--bg-secondary); padding: 10px; margin: 12px 0; border-radius: 4px;"><strong>NOTE:</strong> ${content.slice(7)}</div>`;
+      }
+      if (content.startsWith("[!WARNING]")) {
+        return `<div style="border-left: 4px solid var(--status-blocked); background-color: var(--bg-secondary); padding: 10px; margin: 12px 0; border-radius: 4px;"><strong>WARNING:</strong> ${content.slice(10)}</div>`;
+      }
+      return `<blockquote>${content}</blockquote>`;
+    }
+    
+    // Unordered lists: - item, * item
+    if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      return `<li style="margin-left: 20px; list-style-type: disc;">${trimmed.slice(2)}</li>`;
+    }
+    
+    // Ordered lists: 1. item, etc.
+    const olMatch = trimmed.match(/^(\d+)\.\s+(.*)$/);
+    if (olMatch) {
+      return `<li style="margin-left: 20px; list-style-type: decimal;">${olMatch[2]}</li>`;
+    }
+    
+    // Normal paragraph (if not inside block tags)
+    if (trimmed !== "") {
+      return `<p>${line}</p>`;
+    }
+    
+    return line;
+  });
   
-  // Wrap list items in ul
-  html = html.replace(/(<li>.*?<\/li>)+/gs, "<ul>$&</ul>");
-
-  // Paragraphs
-  html = html.replace(/^(?!(?:<h|<ul|<li|<blockquote|<pre|<\/pre|<\/ul|<\/li|<\/blockquote))(.*?)$/gm, "<p>$1</p>");
-  
-  // Clean empty paragraphs
-  html = html.replace(/<p><\/p>/g, "");
-
-  return html;
+  return processedLines.join("");
 }
 
 // Inline Markdown formatter inside chat bubbles
 function formatMarkdownInChat(text: string): string {
-  let formatted = escapeHtml(text);
-  // Bold
-  formatted = formatted.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-  // Code block
-  formatted = formatted.replace(/`([^`]+)`/g, "<code>$1</code>");
-  // Linebreaks
-  formatted = formatted.replace(/\n/g, "<br>");
-  return formatted;
+  let result = "";
+  let index = 0;
+  
+  while (index < text.length) {
+    const thinkStart = text.indexOf("<think>", index);
+    if (thinkStart === -1) {
+      result += formatBlocks(text.slice(index));
+      break;
+    }
+    
+    result += formatBlocks(text.slice(index, thinkStart));
+    
+    const thinkEnd = text.indexOf("</think>", thinkStart + 7);
+    if (thinkEnd === -1) {
+      const thinkContent = text.slice(thinkStart + 7);
+      result += `
+        <details class="reasoning-details" open>
+          <summary class="reasoning-summary">💡 Thinking Process...</summary>
+          <div class="reasoning-content">${formatPlainMarkdown(thinkContent)}</div>
+        </details>
+      `;
+      break;
+    } else {
+      const thinkContent = text.slice(thinkStart + 7, thinkEnd);
+      result += `
+        <details class="reasoning-details">
+          <summary class="reasoning-summary">💡 Thinking Process</summary>
+          <div class="reasoning-content">${formatPlainMarkdown(thinkContent)}</div>
+        </details>
+      `;
+      index = thinkEnd + 8;
+    }
+  }
+  
+  return result;
+}
+
+function formatBlocks(text: string): string {
+  let result = "";
+  let index = 0;
+  
+  while (index < text.length) {
+    const btMatch = text.slice(index).match(/(?:^|\n)(`{2,5})([a-zA-Z0-9_]*)/);
+    if (!btMatch) {
+      result += formatPlainMarkdown(text.slice(index));
+      break;
+    }
+    
+    const matchStart = index + btMatch.index!;
+    const leadingNewline = text[matchStart] === '\n';
+    const startOfBt = leadingNewline ? matchStart + 1 : matchStart;
+    
+    result += formatPlainMarkdown(text.slice(index, startOfBt));
+    
+    const btLen = btMatch[1].length;
+    const bt = "`".repeat(btLen);
+    const lang = btMatch[2];
+    
+    const contentStart = startOfBt + btLen + lang.length;
+    const startOfContent = text[contentStart] === '\n' ? contentStart + 1 : contentStart;
+    
+    const nextBtIdx = text.slice(startOfContent).indexOf(bt);
+    
+    if (nextBtIdx === -1) {
+      const codeContent = text.slice(startOfContent);
+      result += `<pre class="chat-code-block"><code class="${lang}">${escapeHtml(codeContent)}</code></pre>`;
+      break;
+    } else {
+      const codeContent = text.slice(startOfContent, startOfContent + nextBtIdx);
+      let endOfBlock = startOfContent + nextBtIdx + btLen;
+      if (text.slice(endOfBlock).startsWith("<tool_call|>")) {
+        endOfBlock += "<tool_call|>".length;
+      }
+      
+      result += `<pre class="chat-code-block"><code class="${lang}">${escapeHtml(codeContent)}</code></pre>`;
+      index = endOfBlock;
+    }
+  }
+  
+  return result;
+}
+
+function formatPlainMarkdown(text: string): string {
+  // First escape the entire text
+  let escaped = escapeHtml(text);
+  
+  // Inline formatting rules
+  // Bold: **text**
+  escaped = escaped.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+  // Italic: *text* or _text_
+  escaped = escaped.replace(/\*(.*?)\*/g, "<em>$1</em>");
+  escaped = escaped.replace(/_(.*?)_/g, "<em>$1</em>");
+  // Strikethrough: ~~text~~
+  escaped = escaped.replace(/~~(.*?)~~/g, "<del>$1</del>");
+  // Inline code: `code`
+  escaped = escaped.replace(/`([^`]+)`/g, "<code>$1</code>");
+  // Markdown links: [text](url)
+  escaped = escaped.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  
+  // Split into lines to process block elements (headers, lists)
+  const lines = escaped.split("\n");
+  const processedLines = lines.map(line => {
+    let trimmed = line.trim();
+    
+    // Headers: # Header, ## Header, etc.
+    if (trimmed.startsWith("###### ")) {
+      return `<h6>${trimmed.slice(7)}</h6>`;
+    }
+    if (trimmed.startsWith("##### ")) {
+      return `<h5>${trimmed.slice(6)}</h5>`;
+    }
+    if (trimmed.startsWith("#### ")) {
+      return `<h4>${trimmed.slice(5)}</h4>`;
+    }
+    if (trimmed.startsWith("### ")) {
+      return `<h3>${trimmed.slice(4)}</h3>`;
+    }
+    if (trimmed.startsWith("## ")) {
+      return `<h2>${trimmed.slice(3)}</h2>`;
+    }
+    if (trimmed.startsWith("# ")) {
+      return `<h1>${trimmed.slice(2)}</h1>`;
+    }
+    
+    // Unordered lists: - item, * item
+    if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      return `<li style="margin-left: 20px; list-style-type: disc;">${trimmed.slice(2)}</li>`;
+    }
+    
+    // Ordered lists: 1. item, 2. item, etc.
+    const olMatch = trimmed.match(/^(\d+)\.\s+(.*)$/);
+    if (olMatch) {
+      return `<li style="margin-left: 20px; list-style-type: decimal;">${olMatch[2]}</li>`;
+    }
+    
+    // Blockquote: > text
+    if (trimmed.startsWith("&gt; ")) {
+      return `<blockquote style="border-left: 3px solid var(--border-color); padding-left: 10px; color: var(--text-secondary); margin: 5px 0;">${trimmed.slice(5)}</blockquote>`;
+    }
+    
+    return line;
+  });
+  
+  return processedLines.join("<br>");
 }
 
 // Escape HTML utility
@@ -751,4 +2697,367 @@ function escapeHtml(str: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+// File system dialog helper functions
+function openFsDialog(parentPath: string, type: "file" | "dir" | "doc") {
+  if (!currentProject) {
+    alert("Please select a project first.");
+    return;
+  }
+  fsParentPath.value = parentPath;
+  fsItemType.value = type;
+  fsItemName.value = "";
+  
+  if (type === "file") {
+    fsModalTitle.textContent = parentPath ? `Create File inside ${parentPath.split(/[\\/]/).pop()}` : "Create File at Root";
+    fsLabelName.textContent = "File Name";
+    fsItemName.placeholder = "e.g. index.js";
+    btnFsSubmit.textContent = "Create File";
+  } else if (type === "dir") {
+    fsModalTitle.textContent = parentPath ? `Create Folder inside ${parentPath.split(/[\\/]/).pop()}` : "Create Folder at Root";
+    fsLabelName.textContent = "Folder Name";
+    fsItemName.placeholder = "e.g. components";
+    btnFsSubmit.textContent = "Create Folder";
+  } else if (type === "doc") {
+    fsModalTitle.textContent = "Create New Design Doc";
+    fsLabelName.textContent = "Document Name";
+    fsItemName.placeholder = "e.g. requirements.md";
+    btnFsSubmit.textContent = "Create Doc";
+  }
+  
+  fsModal.style.display = "flex";
+  fsItemName.focus();
+}
+
+function closeFsDialog() {
+  fsModal.style.display = "none";
+}
+
+function renderNewProjectForm() {
+  viewerContainer.innerHTML = `
+    <div class="new-project-view">
+      <form id="new-project-form">
+        <div class="form-group">
+          <label for="proj-name">Project Name</label>
+          <input type="text" id="proj-name" class="form-input" placeholder="e.g. My Awesome App" required />
+        </div>
+        <div class="form-group">
+          <label for="proj-path">Local Directory Path</label>
+          <input type="text" id="proj-path" class="form-input" placeholder="e.g. F:\\Projects\\MyApp" required />
+          <span style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">Must be a local directory path. We will auto-initialize git and seed requirements if not already present.</span>
+        </div>
+        <div style="margin-top: 24px; display: flex; gap: 12px; justify-content: flex-end;">
+          <button type="button" class="btn btn-secondary" id="btn-new-project-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary">Create & Onboard Project</button>
+        </div>
+      </form>
+    </div>
+  `;
+
+  const form = document.getElementById("new-project-form") as HTMLFormElement;
+  const cancelBtn = document.getElementById("btn-new-project-cancel") as HTMLButtonElement;
+
+  cancelBtn.addEventListener("click", () => {
+    switchMode("kanban");
+  });
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const nameInput = document.getElementById("proj-name") as HTMLInputElement;
+    const pathInput = document.getElementById("proj-path") as HTMLInputElement;
+
+    const name = nameInput.value.trim();
+    const path = pathInput.value.trim();
+
+    if (!name || !path) return;
+
+    try {
+      const newProj = await invoke<Project>("create_project", { name, path });
+      alert("Project created and onboarded successfully!");
+      await loadProjects();
+      projectSelect.value = newProj.path;
+      await selectProject(newProj);
+    } catch (err) {
+      alert("Failed to create project: " + err);
+    }
+  });
+}
+
+function renderCardDetail(card: Card) {
+  const todoAddHadFocus = (document.activeElement && document.activeElement.id === "todo-item-add-input-el");
+  const assigneeHadFocus = (document.activeElement && document.activeElement.id === "card-detail-assignee-el");
+  
+  viewerContainer.innerHTML = "";
+  
+  const detailDiv = document.createElement("div");
+  detailDiv.className = "card-detail-view";
+  
+  // Collect history of unique assignees
+  const uniqueAssignees = new Set<string>();
+  for (const c of cardsList) {
+    if (c.assignee) {
+      const names = c.assignee.split(",").map(name => name.trim()).filter(Boolean);
+      for (const name of names) {
+        uniqueAssignees.add(name);
+      }
+    }
+  }
+  
+  // Title rendering
+  let titleHtml = "";
+  if (isEditingViewer) {
+    titleHtml = `<input type="text" id="viewer-card-title-input" class="card-detail-title-input" value="${escapeHtml(card.title)}">`;
+  } else {
+    titleHtml = `<h2 class="card-detail-title">${formatPlainMarkdown(card.title)}</h2>`;
+  }
+
+  // Description rendering
+  let descHtml = "";
+  if (isEditingViewer) {
+    descHtml = `<textarea id="viewer-card-desc-textarea" class="card-detail-desc-textarea" placeholder="Enter card description...">${escapeHtml(card.description)}</textarea>`;
+  } else {
+    descHtml = `<div class="card-detail-desc markdown-body">${parseMarkdown(card.description || "*No description provided.*")}</div>`;
+  }
+
+  // Options for status select
+  const statusOptions = [
+    { key: "backlog", label: "Backlog" },
+    { key: "todo", label: "Todo" },
+    { key: "running", label: "In Progress" },
+    { key: "blocked", label: "Blocked" },
+    { key: "review", label: "Review" },
+    { key: "done", label: "Done" },
+    { key: "failed", label: "Failed" }
+  ];
+
+  const statusSelectHtml = `
+    <select class="card-detail-status-select" id="card-detail-status-select-el">
+      ${statusOptions.map(opt => `<option value="${opt.key}" ${card.status === opt.key ? 'selected' : ''}>${opt.label}</option>`).join("")}
+    </select>
+  `;
+
+  // Checklist items rendering
+  const checklistHtml = `
+    <div class="card-detail-checklist">
+      <h3 class="todo-list-title">📋 Checklist</h3>
+      <div class="todo-items-list">
+        ${(card.todo_list || []).map((item, idx) => `
+          <div class="todo-item" data-idx="${idx}">
+            <input type="checkbox" class="todo-item-checkbox" ${item.completed ? 'checked' : ''}>
+            <span class="todo-item-text ${item.completed ? 'completed' : ''}">${escapeHtml(item.text)}</span>
+            <button class="todo-item-delete-btn" title="Delete task">🗑️</button>
+          </div>
+        `).join("")}
+      </div>
+      <div class="todo-item-add-container">
+        <input type="text" class="todo-item-add-input" placeholder="+ Add a task..." id="todo-item-add-input-el">
+      </div>
+    </div>
+  `;
+
+  detailDiv.innerHTML = `
+    ${titleHtml}
+    ${descHtml}
+    
+    <div class="card-detail-meta">
+      <div class="card-detail-meta-item">
+        <span class="card-detail-meta-label">Assigned To</span>
+        <div class="assignee-chips-container" id="assignee-chips-container-el">
+          ${(card.assignee || "").split(",").map(name => name.trim()).filter(Boolean).map(name => `
+            <div class="assignee-chip" data-name="${escapeHtml(name)}">
+              <span>${escapeHtml(name)}</span>
+              <button type="button" class="remove-chip-btn">&times;</button>
+            </div>
+          `).join("")}
+          <input type="text" class="assignee-chip-input" id="card-detail-assignee-el" placeholder="${(card.assignee || "").trim() ? "" : "Add assignee..."}" list="assignee-history-list">
+        </div>
+        <datalist id="assignee-history-list">
+          ${Array.from(uniqueAssignees).map(name => `<option value="${escapeHtml(name)}">`).join("")}
+        </datalist>
+      </div>
+      <div class="card-detail-meta-item">
+        <span class="card-detail-meta-label">Status</span>
+        ${statusSelectHtml}
+      </div>
+    </div>
+
+    ${checklistHtml}
+
+    <div class="card-detail-actions">
+      <button class="btn btn-danger card-detail-delete-btn" id="card-detail-delete-btn-el">Delete Card</button>
+    </div>
+  `;
+
+  // Event listener: Checklist checkbox change
+  detailDiv.querySelectorAll(".todo-item-checkbox").forEach(chk => {
+    chk.addEventListener("change", async (e) => {
+      const idxStr = (chk.closest(".todo-item") as HTMLElement).dataset.idx;
+      if (idxStr !== undefined) {
+        const idx = parseInt(idxStr, 10);
+        card.todo_list[idx].completed = (e.target as HTMLInputElement).checked;
+        await saveCardObject(card);
+      }
+    });
+  });
+
+  // Event listener: Checklist item delete
+  detailDiv.querySelectorAll(".todo-item-delete-btn").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const idxStr = (btn.closest(".todo-item") as HTMLElement).dataset.idx;
+      if (idxStr !== undefined) {
+        const idx = parseInt(idxStr, 10);
+        card.todo_list.splice(idx, 1);
+        await saveCardObject(card);
+      }
+    });
+  });
+
+  // Event listener: Checklist add item (Enter key)
+  const addInput = detailDiv.querySelector("#todo-item-add-input-el") as HTMLInputElement;
+  if (addInput) {
+    addInput.addEventListener("keydown", async (e) => {
+      if (e.key === "Enter") {
+        const text = addInput.value.trim();
+        if (text) {
+          if (!card.todo_list) card.todo_list = [];
+          card.todo_list.push({ text, completed: false });
+          await saveCardObject(card);
+        }
+      }
+    });
+  }
+
+  // Event listener: Assignee chip remove clicks
+  detailDiv.querySelectorAll(".remove-chip-btn").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const chip = btn.closest(".assignee-chip") as HTMLElement;
+      const nameToRemove = chip.dataset.name;
+      if (nameToRemove) {
+        const existing = (card.assignee || "").split(",").map(name => name.trim()).filter(Boolean);
+        const updated = existing.filter(name => name !== nameToRemove);
+        card.assignee = updated.length > 0 ? updated.join(", ") : null;
+        await saveCardObject(card);
+      }
+    });
+  });
+
+  // Event listener: Assignee input change / keydown / blur
+  const assigneeInput = detailDiv.querySelector("#card-detail-assignee-el") as HTMLInputElement;
+  if (assigneeInput) {
+    const handleAssigneeAdd = async () => {
+      const val = assigneeInput.value.replace(/,$/, "").trim();
+      if (val) {
+        const existing = (card.assignee || "").split(",").map(name => name.trim()).filter(Boolean);
+        if (!existing.includes(val)) {
+          existing.push(val);
+          card.assignee = existing.join(", ");
+          assigneeInput.value = "";
+          await saveCardObject(card);
+        } else {
+          assigneeInput.value = "";
+        }
+      }
+    };
+
+    assigneeInput.addEventListener("blur", handleAssigneeAdd);
+    assigneeInput.addEventListener("change", handleAssigneeAdd);
+    assigneeInput.addEventListener("keydown", async (e) => {
+      if (e.key === "," || e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault();
+        await handleAssigneeAdd();
+      } else if (e.key === "Backspace" && assigneeInput.value === "") {
+        const existing = (card.assignee || "").split(",").map(name => name.trim()).filter(Boolean);
+        if (existing.length > 0) {
+          existing.pop();
+          card.assignee = existing.length > 0 ? existing.join(", ") : null;
+          await saveCardObject(card);
+        }
+      }
+    });
+  }
+
+  // Event listener: Status dropdown change
+  const statusSelect = detailDiv.querySelector("#card-detail-status-select-el") as HTMLSelectElement;
+  if (statusSelect) {
+    statusSelect.addEventListener("change", async () => {
+      card.status = statusSelect.value;
+      await saveCardObject(card);
+    });
+  }
+
+  // Event listener: Delete Card
+  const deleteBtn = detailDiv.querySelector("#card-detail-delete-btn-el") as HTMLButtonElement;
+  if (deleteBtn) {
+    deleteBtn.addEventListener("click", async () => {
+      if (confirm(`Are you sure you want to delete card "${card.title}"?`)) {
+        try {
+          if (isTauri) {
+            await invoke("delete_card", { cardId: card.id });
+          } else {
+            await mockInvoke("delete_card", { cardId: card.id });
+          }
+          // Remove from local list
+          cardsList = cardsList.filter(c => c.id !== card.id);
+          if (activeCard && activeCard.id === card.id) {
+            activeCard = null;
+          }
+          popView();
+          await refreshState();
+        } catch (err) {
+          alert("Failed to delete card: " + err);
+        }
+      }
+    });
+  }
+
+  viewerContainer.appendChild(detailDiv);
+
+  if (todoAddHadFocus) {
+    const newAddInput = detailDiv.querySelector("#todo-item-add-input-el") as HTMLInputElement;
+    if (newAddInput) {
+      newAddInput.focus();
+    }
+  }
+  if (assigneeHadFocus) {
+    const newAssigneeInput = detailDiv.querySelector("#card-detail-assignee-el") as HTMLInputElement;
+    if (newAssigneeInput) {
+      newAssigneeInput.focus();
+      newAssigneeInput.selectionStart = newAssigneeInput.selectionEnd = newAssigneeInput.value.length;
+    }
+  }
+}
+
+function syncCardEditInputs(card: Card) {
+  if (isEditingViewer) {
+    const titleInput = document.getElementById("viewer-card-title-input") as HTMLInputElement;
+    const descTextarea = document.getElementById("viewer-card-desc-textarea") as HTMLTextAreaElement;
+    if (titleInput) {
+      card.title = titleInput.value;
+    }
+    if (descTextarea) {
+      card.description = descTextarea.value;
+    }
+  }
+}
+
+async function saveCardObject(card: Card) {
+  syncCardEditInputs(card);
+  try {
+    if (isTauri) {
+      await invoke("save_card", { card });
+    } else {
+      await mockInvoke("save_card", { card });
+    }
+    // Update active card if it's the current one
+    if (activeCard && activeCard.id === card.id) {
+      activeCard = card;
+      await updateActiveCardUI();
+    }
+    // Refresh states and boards
+    await refreshState();
+  } catch (err) {
+    console.error("Failed to save card:", err);
+  }
 }

@@ -203,6 +203,16 @@ fn get_repo_path() -> PathBuf {
     clean_project_path(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+/// Resolve the repo path for a run from the owning card's project_path, rather than
+/// the app's own working directory. This is what scopes the run engine to the
+/// SELECTED project instead of BeetleAI's own repo.
+fn repo_path_for_run(state: &AppState, run_id: &str) -> Option<PathBuf> {
+    let cards = state.cards.lock().unwrap();
+    cards.iter()
+        .find(|c| c.run_id.as_deref() == Some(run_id))
+        .map(|c| clean_project_path(&c.project_path))
+}
+
 use rusqlite::OptionalExtension;
 
 fn get_db_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -2110,7 +2120,7 @@ pub fn start_run(
             cancelled.remove(&run_id);
         }
 
-        let repo_path = get_repo_path();
+        let repo_path = clean_project_path(&card.project_path);
         // Refuse to run unsandboxed. The whole safety model depends on the agent
         // working inside an isolated worktree; if this isn't a git repo there is
         // no sandbox to create, so we stop rather than letting tools write the live tree.
@@ -2178,7 +2188,7 @@ pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
     cancelled.insert(run_id.clone());
     drop(cancelled);
     
-    let card_id_opt = {
+    let card_info_opt = {
         let mut cards = state.cards.lock().unwrap();
         if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
             card.status = "failed".to_string();
@@ -2188,14 +2198,14 @@ pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
                     [&card.id],
                 );
             }
-            Some(card.id.clone())
+            Some((card.id.clone(), card.project_path.clone()))
         } else {
             None
         }
     };
     
-    if let Some(card_id) = &card_id_opt {
-        let repo_path = get_repo_path();
+    if let Some((card_id, project_path)) = &card_info_opt {
+        let repo_path = clean_project_path(project_path);
         if git::is_git_repo(&repo_path) {
             let _ = git::remove_worktree(&repo_path, &run_id);
         }
@@ -2256,7 +2266,7 @@ pub fn unblock_run(
         }
 
         // Guard against resuming a run whose sandbox no longer exists.
-        let repo_path = get_repo_path();
+        let repo_path = clean_project_path(&card.project_path);
         let worktree_path = repo_path.join(".harness").join("worktrees").join(&run_id);
         if !worktree_path.exists() {
             return Err("The worktree for this run no longer exists, so it can't be resumed. Start a fresh run instead.".to_string());
@@ -2322,7 +2332,7 @@ pub fn accept_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
             );
         }
 
-        let repo_path = get_repo_path();
+        let repo_path = clean_project_path(&card.project_path);
         if git::is_git_repo(&repo_path) {
             let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
             git::merge_worktree(&repo_path, &run_id, &base_branch)?;
@@ -2369,7 +2379,7 @@ pub fn reject_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
             );
         }
 
-        let repo_path = get_repo_path();
+        let repo_path = clean_project_path(&card.project_path);
         if git::is_git_repo(&repo_path) {
             git::remove_worktree(&repo_path, &run_id)?;
         }
@@ -2444,8 +2454,8 @@ pub fn send_chat(
 }
 
 #[tauri::command]
-pub fn read_diff(run_id: String) -> Result<String, String> {
-    let repo_path = get_repo_path();
+pub fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Result<String, String> {
+    let repo_path = repo_path_for_run(&state, &run_id).unwrap_or_else(get_repo_path);
     if git::is_git_repo(&repo_path) {
         let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
         match git::get_diff(&repo_path, &run_id, &base_branch) {
@@ -3544,21 +3554,22 @@ pub fn run_agent_loop(
             run_id: run_id_clone.clone(),
         };
 
-        let repo_path = get_repo_path();
-        let worktree_path = repo_path.join(".harness").join("worktrees").join(&run_id_clone);
-        
         let config = load_config(&app_handle_clone);
         let max_steps = config.settings.max_steps as usize;
         
         let card_meta = {
             let cards = state.cards.lock().unwrap();
-            cards.iter().find(|c| c.id == card_id).map(|c| (c.title.clone(), c.description.clone()))
+            cards.iter().find(|c| c.id == card_id).map(|c| (c.title.clone(), c.description.clone(), c.project_path.clone()))
         };
         
-        let (card_title, card_desc) = match card_meta {
+        let (card_title, card_desc, card_project_path) = match card_meta {
             Some(meta) => meta,
             None => return,
         };
+
+        // Scope the run to the card's project, not BeetleAI's own working dir.
+        let repo_path = clean_project_path(&card_project_path);
+        let worktree_path = repo_path.join(".harness").join("worktrees").join(&run_id_clone);
         
         let mut step = 0;
         

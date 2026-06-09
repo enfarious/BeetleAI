@@ -2039,13 +2039,17 @@ pub fn start_run(
 ) -> Result<String, String> {
     let mut cards = state.cards.lock().unwrap();
     if let Some(card) = cards.iter_mut().find(|c| c.id == card_id) {
-        let run_id = format!("run_{}", card_id);
+        let run_id = format!("run_{}_{}", card_id, chrono::Local::now().format("%Y%m%d%H%M%S"));
 
         let repo_path = get_repo_path();
-        if git::is_git_repo(&repo_path) {
-            let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
-            git::create_worktree(&repo_path, &run_id, &base_branch)?;
+        // Refuse to run unsandboxed. The whole safety model depends on the agent
+        // working inside an isolated worktree; if this isn't a git repo there is
+        // no sandbox to create, so we stop rather than letting tools write the live tree.
+        if !git::is_git_repo(&repo_path) {
+            return Err("This project is not a git repository. BeetleAI requires git so each run is isolated in a worktree. Run `git init` in the project root and try again.".to_string());
         }
+        let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
+        git::create_worktree(&repo_path, &run_id, &base_branch)?;
 
         card.run_id = Some(run_id.clone());
         card.status = "running".to_string();
@@ -2172,6 +2176,23 @@ pub fn unblock_run(
 ) -> Result<(), String> {
     let mut cards = state.cards.lock().unwrap();
     if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
+        // Only paused-but-recoverable runs can be resumed. `blocked` (question, error,
+        // or step ceiling) and `review` (reopen for more work) are resumable;
+        // `done`/`failed` are terminal and their worktrees may already be gone.
+        if card.status != "blocked" && card.status != "review" {
+            return Err(format!(
+                "Run is '{}', which can't be resumed. Only blocked or in-review runs can be reopened.",
+                card.status
+            ));
+        }
+
+        // Guard against resuming a run whose sandbox no longer exists.
+        let repo_path = get_repo_path();
+        let worktree_path = repo_path.join(".harness").join("worktrees").join(&run_id);
+        if !worktree_path.exists() {
+            return Err("The worktree for this run no longer exists, so it can't be resumed. Start a fresh run instead.".to_string());
+        }
+
         card.status = "running".to_string();
         let card_id = card.id.clone();
         drop(cards);
@@ -2619,12 +2640,67 @@ fn verify_sandbox<P1: AsRef<Path>, P2: AsRef<Path>>(project_path: P1, target_pat
     } else {
         proj.join(t_ref)
     };
+    // Lexical normalization first (resolves `..`/`.` without touching disk).
     let target = clean_project_path(target_abs);
-    if target.starts_with(&proj) {
+
+    // Resolve symlinks where the path (or its nearest existing ancestor) exists,
+    // so a symlink inside the sandbox that points outside is rejected. For paths
+    // that don't exist yet (e.g. write_file creating a new file), canonicalize the
+    // deepest existing ancestor and re-attach the remaining components.
+    let canon_proj = std::fs::canonicalize(&proj).unwrap_or_else(|_| proj.clone());
+    let canon_target = canonicalize_lenient(&target);
+
+    // Component-boundary containment: canon_target must be the project dir itself
+    // or a descendant. Comparing component iterators avoids the sibling-prefix
+    // escape that `starts_with` on raw paths/strings is vulnerable to
+    // (e.g. `/repo/run_x_evil` is NOT inside `/repo/run_x`).
+    if path_is_within(&canon_target, &canon_proj) {
         Ok(target)
     } else {
         Err("Access denied: Path is outside project sandbox".to_string())
     }
+}
+
+/// Canonicalize as much of `path` as exists on disk, re-attaching any trailing
+/// not-yet-created components. This lets us resolve symlinks for the existing
+/// portion while still validating paths that point at files we're about to write.
+fn canonicalize_lenient(path: &Path) -> PathBuf {
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c;
+    }
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        match current.parent() {
+            Some(parent) => {
+                if let Some(name) = current.file_name() {
+                    remainder.push(name.to_os_string());
+                }
+                if let Ok(c) = std::fs::canonicalize(parent) {
+                    let mut resolved = c;
+                    for comp in remainder.iter().rev() {
+                        resolved.push(comp);
+                    }
+                    return resolved;
+                }
+                current = parent.to_path_buf();
+            }
+            None => return path.to_path_buf(),
+        }
+    }
+}
+
+/// True if `target` is `base` or a descendant of it, compared component-by-component
+/// (not by raw string prefix, which would let `base_evil` pass for `base`).
+fn path_is_within(target: &Path, base: &Path) -> bool {
+    let mut t = target.components();
+    for b in base.components() {
+        match t.next() {
+            Some(tc) if tc == b => continue,
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[tauri::command]
@@ -3330,8 +3406,11 @@ pub fn run_agent_loop(
                 log_error(&format!("Max step ceiling reached ({}) for run {}", max_steps, run_id_clone));
                 append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
                     run_id: run_id_clone.clone(),
-                    event_type: "error".to_string(),
-                    payload: "Max step ceiling reached. Pausing execution.".to_string(),
+                    event_type: "blocked".to_string(),
+                    payload: serde_json::json!({
+                        "reason": "step_ceiling",
+                        "message": format!("Step limit reached ({} steps). Reply in chat to continue the run.", max_steps)
+                    }).to_string(),
                 });
                 set_card_status(&app_handle_clone, &state, &card_id, "blocked");
                 let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
@@ -3362,10 +3441,15 @@ pub fn run_agent_loop(
                         false
                     };
                     if !is_cancelled {
+                        // Transient/LLM error: pause as `blocked` (resumable via unblock_run),
+                        // keep the worktree intact so the partial work can be inspected or retried.
                         append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
                             run_id: run_id_clone.clone(),
-                            event_type: "error".to_string(),
-                            payload: format!("Error calling LLM: {}", e),
+                            event_type: "blocked".to_string(),
+                            payload: serde_json::json!({
+                                "reason": "error",
+                                "message": format!("Run paused after an error calling the model: {}. Retry from chat to resume.", e)
+                            }).to_string(),
                         });
                         set_card_status(&app_handle_clone, &state, &card_id, "blocked");
                         let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
@@ -3409,14 +3493,33 @@ pub fn run_agent_loop(
                 
                 let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
                 
+                // task_complete moves the card to `review` (done inside execute_tool).
+                // Break the loop immediately so the next iteration can't overwrite that
+                // status with a `blocked`/`running` transition.
+                if tool_name == "task_complete" {
+                    let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                    break;
+                }
+                
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             } else {
+                // No tool call and not complete: the agent is asking a question or
+                // reporting it's stuck. Genuine "needs input" — pause as `blocked`,
+                // resumable via unblock_run/send_chat.
                 append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
                     run_id: run_id_clone.clone(),
                     event_type: "message".to_string(),
                     payload: serde_json::json!({
                         "role": "agent",
                         "content": remaining
+                    }).to_string(),
+                });
+                append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
+                    run_id: run_id_clone.clone(),
+                    event_type: "blocked".to_string(),
+                    payload: serde_json::json!({
+                        "reason": "question",
+                        "message": "The agent is waiting for your input."
                     }).to_string(),
                 });
                 

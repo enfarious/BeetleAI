@@ -2099,7 +2099,7 @@ function createFileNode(entry: DirEntry): HTMLElement {
 }
 
 // Viewer Stack navigation helpers
-function pushView(state: ViewerState) {
+async function pushView(state: ViewerState) {
   isEditingViewer = false;
   // If the view type is doc or kanban, don't duplicate on top of stack
   if (state.kind === "doc" || state.kind === "kanban") {
@@ -2107,14 +2107,16 @@ function pushView(state: ViewerState) {
   } else {
     viewerStack.push(state);
   }
-  renderRightPanel();
+  await renderRightPanel();
+  await updateActiveCardUI();
 }
 
-function popView() {
+async function popView() {
   isEditingViewer = false;
   if (viewerStack.length > 1) {
     viewerStack.pop();
-    renderRightPanel();
+    await renderRightPanel();
+    await updateActiveCardUI();
   }
 }
 

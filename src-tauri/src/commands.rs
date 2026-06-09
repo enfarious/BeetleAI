@@ -1526,6 +1526,7 @@ fn call_llm(
                 if let Some(state_val) = app_handle.try_state::<AppState>() {
                     let cancelled = state_val.cancelled_runs.lock().unwrap();
                     if cancelled.contains(run_id) {
+                        log_error(&format!("[DEBUG] call_llm detected cancellation mid-stream for run_id={} | set contents: {:?}", run_id, *cancelled));
                         return Err("Cancelled by user".to_string());
                     }
                 }
@@ -2041,6 +2042,13 @@ pub fn start_run(
     if let Some(card) = cards.iter_mut().find(|c| c.id == card_id) {
         let run_id = format!("run_{}_{}", card_id, chrono::Local::now().format("%Y%m%d%H%M%S"));
 
+        // Clear any stale cancellation flag so a fresh run can never begin life
+        // already-cancelled (the cancelled set is never otherwise pruned).
+        {
+            let mut cancelled = state.cancelled_runs.lock().unwrap();
+            cancelled.remove(&run_id);
+        }
+
         let repo_path = get_repo_path();
         // Refuse to run unsandboxed. The whole safety model depends on the agent
         // working inside an isolated worktree; if this isn't a git repo there is
@@ -2105,6 +2113,7 @@ pub fn cancel_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
 
 #[tauri::command]
 pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+    log_error(&format!("[DEBUG] abort_chat called for run_id={} | backtrace:\n{:?}", run_id, std::backtrace::Backtrace::force_capture()));
     let mut cancelled = state.cancelled_runs.lock().unwrap();
     cancelled.insert(run_id.clone());
     drop(cancelled);
@@ -3358,10 +3367,12 @@ pub fn run_agent_loop(
     
     tauri::async_runtime::spawn(async move {
         let state = app_handle_clone.state::<AppState>();
+        log_error(&format!("[DEBUG] run_agent_loop spawned with run_id={}", run_id_clone));
         
         {
             let mut active = state.active_runs.lock().unwrap();
             if active.contains(&run_id_clone) {
+                log_error(&format!("[DEBUG] run_agent_loop EARLY RETURN, run_id already active: {}", run_id_clone));
                 return;
             }
             active.insert(run_id_clone.clone());

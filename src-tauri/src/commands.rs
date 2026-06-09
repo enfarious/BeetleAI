@@ -913,13 +913,39 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Reads file content relative to project root.",
+                    "description": "Reads file content relative to project root. For large files, prefer outline_file first, then pass start_line/end_line to read only the section you need. Output is line-numbered and capped; very large reads are truncated.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
                                 "description": "Relative path to the file"
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "Optional 1-indexed first line to read. Omit to read from the top."
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "Optional 1-indexed last line to read. Omit to read to the end."
+                            }
+                        },
+                        "required": ["path"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "outline_file" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "outline_file",
+                    "description": "Returns a structural outline of a file (markdown headings, or code declarations like functions/structs/classes) with line numbers, instead of full contents. Use this to survey a large file cheaply before deciding which lines to read with read_file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path to the file to outline"
                             }
                         },
                         "required": ["path"],
@@ -1118,7 +1144,32 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
     serde_json::Value::Array(schemas)
 }
 
+/// Truncate a tool result for history replay. Keeps the head (where the useful
+/// signal usually is) and notes how much was dropped, so a single large read
+/// (e.g. a 10k-token file) can't pin the prompt size for the rest of the run.
+fn truncate_tool_result(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    let dropped = text.chars().count().saturating_sub(max_chars);
+    format!(
+        "{}\n\n[... {} characters truncated from this earlier tool result to conserve context. Re-read with a line range if you still need this content. ...]",
+        head, dropped
+    )
+}
+
 fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
+    // Index tool_results so we can budget by recency: the last couple of results
+    // stay generous, older ones get trimmed hard. This bounds prompt growth over
+    // a long run, which is what was driving local-model prompt-ingestion timeouts.
+    let total_tool_results = events.iter().filter(|e| e.event_type == "tool_result").count();
+    let mut tool_result_seen = 0usize;
+    // The most recent N results are kept fuller; everything older is trimmed hard.
+    const RECENT_KEEP: usize = 2;
+    const RECENT_MAX_CHARS: usize = 6000;
+    const OLD_MAX_CHARS: usize = 800;
+
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for event in events {
         let (role, new_content) = if event.event_type == "message" {
@@ -1142,7 +1193,12 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
             if let Ok(result_json) = serde_json::from_str::<serde_json::Value>(&event.payload) {
                 let name = result_json.get("name").and_then(|n| n.as_str()).unwrap_or("");
                 let result = result_json.get("result").and_then(|r| r.as_str()).unwrap_or("");
-                let text_content = format!("Tool '{}' returned:\n{}", name, result);
+                // Is this one of the most recent RECENT_KEEP results?
+                let is_recent = tool_result_seen + RECENT_KEEP >= total_tool_results;
+                tool_result_seen += 1;
+                let budget = if is_recent { RECENT_MAX_CHARS } else { OLD_MAX_CHARS };
+                let trimmed = truncate_tool_result(result, budget);
+                let text_content = format!("Tool '{}' returned:\n{}", name, trimmed);
                 (Some("user".to_string()), Some(text_content))
             } else { (None, None) }
         } else { (None, None) };
@@ -1374,11 +1430,14 @@ fn call_llm(
             }
         }
 
-        let resp = ureq::post(&url)
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(300))
+            .build();
+        let resp = agent.post(&url)
             .set("Content-Type", "application/json")
             .set("x-api-key", &settings.api_key)
             .set("anthropic-version", "2023-06-01")
-            .timeout(std::time::Duration::from_secs(120))
             .send_json(payload)
             .map_err(|e| {
                 let err_msg = format!("Anthropic network request failed: {}", e);
@@ -1501,9 +1560,12 @@ fn call_llm(
             }
         }
 
-        let mut req = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .timeout(std::time::Duration::from_secs(120));
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(300))
+            .build();
+        let mut req = agent.post(&url)
+            .set("Content-Type", "application/json");
 
         if !settings.api_key.trim().is_empty() {
             req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
@@ -1526,7 +1588,6 @@ fn call_llm(
                 if let Some(state_val) = app_handle.try_state::<AppState>() {
                     let cancelled = state_val.cancelled_runs.lock().unwrap();
                     if cancelled.contains(run_id) {
-                        log_error(&format!("[DEBUG] call_llm detected cancellation mid-stream for run_id={} | set contents: {:?}", run_id, *cancelled));
                         return Err("Cancelled by user".to_string());
                     }
                 }
@@ -1669,7 +1730,7 @@ pub fn send_design_chat(
             };
             
             let system_prompt = construct_architect_system_prompt(&cleaned_path_clone, &doc_name_clone);
-            let tools_schema = get_openai_tools_schema(&["read_file", "write_file", "list_dir", "web_search", "send_notification", "search_grep", "patch_file"]);
+            let tools_schema = get_openai_tools_schema(&["read_file", "outline_file", "write_file", "list_dir", "web_search", "send_notification", "search_grep", "patch_file"]);
             
             let response = match call_llm(&app_handle_clone, &log_key_clone, &system_prompt, history, Some(tools_schema)) {
                 Ok(reply) => reply,
@@ -1827,7 +1888,7 @@ pub fn send_code_chat(
             };
             
             let system_prompt = construct_copilot_system_prompt(&cleaned_path_clone, &file_path_clone);
-            let tools_schema = get_openai_tools_schema(&["read_file", "write_file", "list_dir", "git_status", "git_diff", "run_command", "web_search", "search_grep", "patch_file"]);
+            let tools_schema = get_openai_tools_schema(&["read_file", "outline_file", "write_file", "list_dir", "git_status", "git_diff", "run_command", "web_search", "search_grep", "patch_file"]);
             
             let response = match call_llm(&app_handle_clone, &log_key_clone, &system_prompt, history, Some(tools_schema)) {
                 Ok(reply) => reply,
@@ -2113,7 +2174,6 @@ pub fn cancel_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
 
 #[tauri::command]
 pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
-    log_error(&format!("[DEBUG] abort_chat called for run_id={} | backtrace:\n{:?}", run_id, std::backtrace::Backtrace::force_capture()));
     let mut cancelled = state.cancelled_runs.lock().unwrap();
     cancelled.insert(run_id.clone());
     drop(cancelled);
@@ -2841,16 +2901,17 @@ fn construct_agent_system_prompt(worktree_path: &Path, card_title: &str, card_de
          ```\n\n\
          No other text should be inside the code block. Once you call a tool, the system will execute it and append the result. You can then analyze the output and make further tool calls.\n\n\
          Tools available:\n\
-         1. `read_file(path: String)`: Reads file content relative to workspace root.\n\
-         2. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed).\n\
-         3. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
-         4. `git_status()`: Runs `git status` in the sandbox.\n\
-         5. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
-         6. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests!\n\
-         7. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
-         8. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
-         9. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
-         If you need feedback or are unsure of how to proceed, simply output a normal message explaining your thoughts, and the loop will pause to wait for the user to respond in chat.",
+         1. `read_file(path: String, start_line?: Int, end_line?: Int)`: Reads file content. For large files, call outline_file first, then read only the line range you need. Output is line-numbered and capped — don't read whole large files when a range will do.\n\
+         2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
+         3. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed).\n\
+         4. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
+         5. `git_status()`: Runs `git status` in the sandbox.\n\
+         6. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
+         7. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests!\n\
+         8. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
+         9. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
+         10. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
+         Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     )
 }
@@ -3100,6 +3161,104 @@ fn perform_web_search(query: &str) -> String {
         }
 }
 
+/// Produce a structural outline of a file instead of its full contents: markdown
+/// headings, or code declarations (fn/struct/enum/trait/impl/class/def/type/const),
+/// each with its line number. Lets the agent survey a large file cheaply and then
+/// range-read only the parts it needs, instead of pulling 10k tokens up front.
+fn outline_file_impl(worktree_path: &Path, path: &str) -> String {
+    let target = match verify_sandbox(worktree_path, path) {
+        Ok(p) => p,
+        Err(e) => return format!("Error: {}", e),
+    };
+    let content = match fs::read_to_string(&target) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading file: {}", e),
+    };
+
+    let is_md = path.ends_with(".md") || path.ends_with(".markdown");
+    let mut out: Vec<String> = Vec::new();
+    let total_lines = content.lines().count();
+
+    for (idx, line) in content.lines().enumerate() {
+        let ln = idx + 1;
+        let trimmed = line.trim_start();
+        if is_md {
+            if trimmed.starts_with('#') {
+                out.push(format!("{}: {}", ln, trimmed));
+            }
+        } else {
+            // Match common declaration keywords across languages. We check the
+            // leading token after optional visibility/qualifier words.
+            let starters = [
+                "fn ", "pub fn ", "async fn ", "pub async fn ",
+                "struct ", "pub struct ", "enum ", "pub enum ",
+                "trait ", "pub trait ", "impl ", "type ", "pub type ",
+                "const ", "pub const ", "static ", "pub static ",
+                "class ", "def ", "function ", "export function ",
+                "export default ", "interface ", "export interface ",
+                "export class ", "export const ", "mod ", "pub mod ",
+            ];
+            if starters.iter().any(|s| trimmed.starts_with(s)) {
+                // Trim trailing body opener for readability.
+                let sig = trimmed.split(|c| c == '{' || c == ';').next().unwrap_or(trimmed).trim_end();
+                out.push(format!("{}: {}", ln, sig));
+            }
+        }
+    }
+
+    if out.is_empty() {
+        format!("({} lines, no headings/declarations detected. Use read_file with a line range to inspect.)", total_lines)
+    } else {
+        format!("File outline ({} lines total). Line numbers shown; use read_file with start_line/end_line to read a section:\n{}", total_lines, out.join("\n"))
+    }
+}
+
+/// Read a file, optionally limited to a line range, with a hard character cap so a
+/// single read can never blow the context budget. Returns 1-indexed line content.
+fn read_file_range_impl(worktree_path: &Path, path: &str, start_line: Option<usize>, end_line: Option<usize>, max_chars: usize) -> String {
+    let target = match verify_sandbox(worktree_path, path) {
+        Ok(p) => p,
+        Err(e) => return format!("Error: {}", e),
+    };
+    let content = match fs::read_to_string(&target) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading file: {}", e),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+
+    let (lo, hi) = match (start_line, end_line) {
+        (None, None) => (1, total),
+        (Some(s), None) => (s.max(1), total),
+        (None, Some(e)) => (1, e.min(total)),
+        (Some(s), Some(e)) => (s.max(1), e.min(total)),
+    };
+    if lo > total {
+        return format!("Error: start_line {} is past end of file ({} lines)", lo, total);
+    }
+    if hi < lo {
+        return format!("Error: end_line {} is before start_line {}", hi, lo);
+    }
+
+    let selected: String = lines[(lo - 1)..hi]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{}: {}", lo + i, l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if selected.len() > max_chars {
+        let head: String = selected.chars().take(max_chars).collect();
+        format!(
+            "{}\n\n[... output truncated at {} chars. Narrow the range with start_line/end_line, or use outline_file first to find the section you need. File is {} lines total. ...]",
+            head, max_chars, total
+        )
+    } else {
+        selected
+    }
+}
+
 fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String {
     let worktree_abs = clean_project_path(worktree_path);
     let target = match verify_sandbox(&worktree_abs, path_opt) {
@@ -3226,14 +3385,18 @@ fn execute_tool(
                 Some(p) => p,
                 None => return "Error: Missing path argument".to_string(),
             };
-            let target = match verify_sandbox(worktree_path, path) {
-                Ok(p) => p,
-                Err(e) => return format!("Error: {}", e),
+            let start_line = args.get("start_line").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let end_line = args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize);
+            // Hard cap on a single read so it can't blow the context budget. A full
+            // read past this is truncated with guidance to range-read or outline first.
+            read_file_range_impl(worktree_path, path, start_line, end_line, 8000)
+        }
+        "outline_file" => {
+            let path = match args.get("path").and_then(|p| p.as_str()) {
+                Some(p) => p,
+                None => return "Error: Missing path argument".to_string(),
             };
-            match fs::read_to_string(target) {
-                Ok(content) => content,
-                Err(e) => format!("Error reading file: {}", e),
-            }
+            outline_file_impl(worktree_path, path)
         }
         "write_file" => {
             let path = match args.get("path").and_then(|p| p.as_str()) {
@@ -3367,12 +3530,10 @@ pub fn run_agent_loop(
     
     tauri::async_runtime::spawn(async move {
         let state = app_handle_clone.state::<AppState>();
-        log_error(&format!("[DEBUG] run_agent_loop spawned with run_id={}", run_id_clone));
         
         {
             let mut active = state.active_runs.lock().unwrap();
             if active.contains(&run_id_clone) {
-                log_error(&format!("[DEBUG] run_agent_loop EARLY RETURN, run_id already active: {}", run_id_clone));
                 return;
             }
             active.insert(run_id_clone.clone());
@@ -3440,7 +3601,7 @@ pub fn run_agent_loop(
             };
             
             let system_prompt = construct_agent_system_prompt(&worktree_path, &card_title, &card_desc);
-            let tools_schema = get_openai_tools_schema(&["read_file", "write_file", "list_dir", "git_status", "git_diff", "run_command", "web_search", "send_notification", "task_complete", "search_grep", "patch_file"]);
+            let tools_schema = get_openai_tools_schema(&["read_file", "outline_file", "write_file", "list_dir", "git_status", "git_diff", "run_command", "web_search", "send_notification", "task_complete", "search_grep", "patch_file"]);
             let response = match call_llm(&app_handle_clone, &run_id_clone, &system_prompt, history, Some(tools_schema)) {
                 Ok(reply) => reply,
                 Err(e) => {

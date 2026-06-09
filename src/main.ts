@@ -1561,6 +1561,40 @@ function renderLogs(logs: RunEvent[]) {
       return;
     }
 
+    if (log.event_type === "blocked") {
+      // Surface why the run paused. New payloads are JSON {reason, message};
+      // older ones may be a plain string.
+      let reason = "";
+      let message = "";
+      try {
+        const parsed = JSON.parse(log.payload);
+        reason = parsed.reason || "";
+        message = parsed.message || "";
+      } catch {
+        message = log.payload;
+      }
+      const reasonLabels: Record<string, string> = {
+        question: "Awaiting your input",
+        error: "Paused after an error",
+        step_ceiling: "Step limit reached"
+      };
+      const heading = reasonLabels[reason] || "Run paused";
+      const wrapper = document.createElement("div");
+      wrapper.className = "chat-bubble blocked-notice";
+      wrapper.style.alignSelf = "center";
+      wrapper.style.width = "95%";
+      wrapper.style.maxWidth = "95%";
+      wrapper.style.margin = "8px 0";
+      wrapper.style.borderLeft = "4px solid var(--status-blocked, #d6a417)";
+      wrapper.style.background = "var(--bg-secondary)";
+      wrapper.style.padding = "10px 12px";
+      wrapper.style.borderRadius = "4px";
+      wrapper.innerHTML = `<div style="font-weight:600;font-size:0.85rem;margin-bottom:4px;">⏸ ${escapeHtml(heading)}</div>` +
+        (message ? `<div style="font-size:0.85rem;color:var(--text-secondary);">${escapeHtml(message)}</div>` : "");
+      chatMessages.appendChild(wrapper);
+      return;
+    }
+
     if (log.event_type === "reasoning") {
       const wrapper = document.createElement("div");
       wrapper.className = "chat-bubble agent reasoning-bubble";

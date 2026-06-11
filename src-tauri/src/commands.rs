@@ -4797,6 +4797,9 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
         // a slow local model all the way to the step ceiling.
         let mut last_tool_signature: Option<String> = None;
         let mut repeat_count: u32 = 0;
+        // Consecutive responses with no tool call and no visible content — a
+        // truncated or all-reasoning response is a stall, not a user question.
+        let mut empty_response_streak: u32 = 0;
 
         loop {
             {
@@ -4931,6 +4934,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
 
                 // Loop-guard: track consecutive identical calls.
+                empty_response_streak = 0;
                 let signature = format!("{}:{}", tool_name, args);
                 if last_tool_signature.as_deref() == Some(signature.as_str()) {
                     repeat_count += 1;
@@ -5005,9 +5009,47 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             } else {
-                // No tool call and not complete: the agent is asking a question or
-                // reporting it's stuck. Genuine "needs input" — pause as `blocked`,
-                // resumable via unblock_run/send_chat.
+                let visible = remaining.trim();
+
+                // A response with no tool call AND no visible content is not a
+                // question — the reasoning consumed the whole output budget, or
+                // generation was truncated mid-think. Blocking on it shows the
+                // user an empty "awaiting input" with nothing to answer. Nudge
+                // the model and continue; only a persistent stall blocks.
+                if visible.is_empty() && empty_response_streak < 2 {
+                    empty_response_streak += 1;
+                    append_run_event(
+                        &app_handle_clone,
+                        &state,
+                        &run_id_clone,
+                        RunEvent {
+                            run_id: run_id_clone.clone(),
+                            event_type: "message".to_string(),
+                            payload: serde_json::json!({
+                                "role": "user",
+                                "content": "[harness note: your previous response had no visible output and no tool call — it may have been cut off mid-reasoning. Keep reasoning brief and emit exactly one tool_call block now.]"
+                            })
+                            .to_string(),
+                        },
+                    );
+                    let _ = app_handle_clone
+                        .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+
+                // Genuine question — or a persistent stall after repeated nudges.
+                let (agent_msg, blocked_msg) = if visible.is_empty() {
+                    (
+                        "(the agent produced no visible output)".to_string(),
+                        "The agent stalled: several responses in a row ended without output or a tool call. Reply in chat to redirect it, or try lowering reasoning effort (sampler settings / non-thinking model).".to_string(),
+                    )
+                } else {
+                    (
+                        remaining.clone(),
+                        "The agent is waiting for your input.".to_string(),
+                    )
+                };
                 append_run_event(
                     &app_handle_clone,
                     &state,
@@ -5017,7 +5059,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                         event_type: "message".to_string(),
                         payload: serde_json::json!({
                             "role": "agent",
-                            "content": remaining
+                            "content": agent_msg
                         })
                         .to_string(),
                     },
@@ -5031,7 +5073,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                         event_type: "blocked".to_string(),
                         payload: serde_json::json!({
                             "reason": "question",
-                            "message": "The agent is waiting for your input."
+                            "message": blocked_msg
                         })
                         .to_string(),
                     },

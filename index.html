@@ -111,12 +111,13 @@
             
             <!-- Chat Input (Blocked state or manual interjection) -->
             <div class="chat-input-container">
-              <input 
-                id="chat-input" 
-                class="chat-input" 
-                placeholder="Send input to the agent..." 
-                disabled 
-              />
+              <textarea
+                id="chat-input"
+                class="chat-input"
+                placeholder="Send input to the agent..."
+                rows="1"
+                disabled
+              ></textarea>
               <button class="btn btn-primary" id="btn-send-chat" style="flex: 0; width: 50px; padding: 0;" disabled>→</button>
             </div>
           </footer>
@@ -164,7 +165,8 @@
                 <option value="openai">OpenAI (Official)</option>
                 <option value="anthropic">Anthropic (Claude)</option>
                 <option value="lmstudio">LM Studio (Local)</option>
-                <option value="custom">Custom (Ollama / Local API)</option>
+                <option value="ollama">Ollama (Local)</option>
+                <option value="custom">Custom (OpenAI-compatible API)</option>
               </select>
             </div>
             <div class="form-group">
@@ -225,6 +227,25 @@
         </div>
       </div>
     </div>
+
+    <!-- CONFIRM DIALOG MODAL (replaces blocking window.confirm) -->
+    <div class="modal-overlay" id="confirm-modal" style="display: none;">
+      <div class="modal-container" style="max-width: 420px;">
+        <header class="modal-header">
+          <h3 id="confirm-modal-title">Confirm</h3>
+        </header>
+        <div class="modal-body">
+          <p id="confirm-modal-message" style="margin: 0 0 20px 0; line-height: 1.5;"></p>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" id="btn-confirm-cancel">Cancel</button>
+            <button type="button" class="btn btn-danger" id="btn-confirm-ok">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TOAST NOTIFICATIONS -->
+    <div id="toast-container" class="toast-container"></div>
 
     <!-- Module bundle connection -->
     <script type="module" src="/src/main.ts" defer></script>

@@ -1,5 +1,61 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+
+// ─── Toast notifications & styled confirm (replaces blocking alert/confirm) ───
+type ToastKind = "success" | "error" | "info";
+
+function showToast(message: string, kind: ToastKind = "info", durationMs = 4000) {
+  const container = document.getElementById("toast-container");
+  if (!container) return;
+  const toast = document.createElement("div");
+  toast.className = `toast toast-${kind}`;
+  toast.textContent = message;
+  container.appendChild(toast);
+  const remove = () => {
+    toast.classList.add("toast-leaving");
+    toast.addEventListener("animationend", () => toast.remove(), { once: true });
+  };
+  // Errors stick around longer; click any toast to dismiss immediately.
+  const timer = setTimeout(remove, kind === "error" ? Math.max(durationMs, 7000) : durationMs);
+  toast.addEventListener("click", () => {
+    clearTimeout(timer);
+    remove();
+  });
+}
+
+function showConfirm(message: string, okLabel = "Delete"): Promise<boolean> {
+  return new Promise((resolve) => {
+    const modal = document.getElementById("confirm-modal") as HTMLDivElement;
+    const msgEl = document.getElementById("confirm-modal-message") as HTMLParagraphElement;
+    const okBtn = document.getElementById("btn-confirm-ok") as HTMLButtonElement;
+    const cancelBtn = document.getElementById("btn-confirm-cancel") as HTMLButtonElement;
+    if (!modal || !msgEl || !okBtn || !cancelBtn) {
+      resolve(window.confirm(message));
+      return;
+    }
+    msgEl.textContent = message;
+    okBtn.textContent = okLabel;
+    modal.style.display = "flex";
+    const cleanup = (result: boolean) => {
+      modal.style.display = "none";
+      okBtn.removeEventListener("click", onOk);
+      cancelBtn.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKey);
+      resolve(result);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") cleanup(false);
+    };
+    okBtn.addEventListener("click", onOk);
+    cancelBtn.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKey);
+    // Focus the safe option for destructive confirms.
+    cancelBtn.focus();
+  });
+}
 
 // Detect if running in Tauri container environment
 const isTauri = typeof window !== "undefined" && (window as any).__TAURI_INTERNALS__ !== undefined;
@@ -381,7 +437,7 @@ const activeCardTitle = document.getElementById("active-card-title") as HTMLHead
 const runStatusBadge = document.getElementById("run-status") as HTMLDivElement;
 const runStatusText = document.getElementById("run-status-text") as HTMLSpanElement;
 const chatMessages = document.getElementById("chat-messages") as HTMLDivElement;
-const chatInput = document.getElementById("chat-input") as HTMLInputElement;
+const chatInput = document.getElementById("chat-input") as HTMLTextAreaElement;
 const btnSendChat = document.getElementById("btn-send-chat") as HTMLButtonElement;
 
 const controlsRun = document.getElementById("controls-run") as HTMLDivElement;
@@ -705,9 +761,11 @@ function setupEventListeners() {
     } else if (provider === "anthropic") {
       settingsUrl.placeholder = "https://api.anthropic.com/v1";
     } else if (provider === "lmstudio") {
-      settingsUrl.placeholder = "http://localhost:1234/v1";
-    } else if (provider === "custom") {
+      settingsUrl.placeholder = "http://localhost:1234";
+    } else if (provider === "ollama") {
       settingsUrl.placeholder = "http://localhost:11434";
+    } else if (provider === "custom") {
+      settingsUrl.placeholder = "http://localhost:8080/v1";
     }
   });
 
@@ -733,7 +791,7 @@ function setupEventListeners() {
       pushView({ kind: "diff", runId });
     } catch (err) {
       console.error(err);
-      alert("Failed to start run: " + err);
+      showToast("Failed to start run: " + err, "error");
     }
   });
 
@@ -745,7 +803,7 @@ function setupEventListeners() {
       await refreshState();
     } catch (err) {
       console.error(err);
-      alert("Failed to cancel run: " + err);
+      showToast("Failed to cancel run: " + err, "error");
     }
   });
 
@@ -758,7 +816,7 @@ function setupEventListeners() {
       switchMode("kanban");
     } catch (err) {
       console.error(err);
-      alert("Failed to accept changes: " + err);
+      showToast("Failed to accept changes: " + err, "error");
     }
   });
 
@@ -771,7 +829,7 @@ function setupEventListeners() {
       switchMode("kanban");
     } catch (err) {
       console.error(err);
-      alert("Failed to reject changes: " + err);
+      showToast("Failed to reject changes: " + err, "error");
     }
   });
 
@@ -783,11 +841,14 @@ function setupEventListeners() {
       submitChat();
     }
   });
-  chatInput.addEventListener("keypress", (e) => {
-    if (e.key === "Enter") {
+  chatInput.addEventListener("keydown", (e) => {
+    // Enter sends; Shift+Enter inserts a newline.
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
       submitChat();
     }
   });
+  chatInput.addEventListener("input", () => autosizeChatInput());
 
   // Viewer back button
   btnViewerBack.addEventListener("click", () => popView());
@@ -834,7 +895,7 @@ function setupEventListeners() {
         await renderFileTreeRoot(currentProject.path);
       }
     } catch (err) {
-      alert(`Error creating item: ${err}`);
+      showToast(`Error creating item: ${err}`, "error");
     }
   });
 
@@ -856,7 +917,7 @@ function setupEventListeners() {
         isEditingViewer = true;
         renderRightPanel();
       } catch (err) {
-        alert("Failed to read document for editing: " + err);
+        showToast("Failed to read document for editing: " + err, "error");
       }
     } else if (currentView.kind === "file") {
       try {
@@ -865,7 +926,7 @@ function setupEventListeners() {
         isEditingViewer = true;
         renderRightPanel();
       } catch (err) {
-        alert("Failed to read file for editing: " + err);
+        showToast("Failed to read file for editing: " + err, "error");
       }
     } else if (currentView.kind === "card_detail") {
       isEditingViewer = true;
@@ -895,7 +956,7 @@ function setupEventListeners() {
             isEditingViewer = false;
             await refreshState();
           } catch (err) {
-            alert("Failed to save card: " + err);
+            showToast("Failed to save card: " + err, "error");
           }
         }
       }
@@ -917,7 +978,7 @@ function setupEventListeners() {
         isEditingViewer = false;
         renderRightPanel();
       } catch (err) {
-        alert("Failed to save document: " + err);
+        showToast("Failed to save document: " + err, "error");
       }
     } else if (currentView.kind === "file") {
       try {
@@ -929,7 +990,7 @@ function setupEventListeners() {
         isEditingViewer = false;
         renderRightPanel();
       } catch (err) {
-        alert("Failed to save file: " + err);
+        showToast("Failed to save file: " + err, "error");
       }
     }
   });
@@ -975,10 +1036,10 @@ async function saveSettings() {
   try {
     await invoke("save_settings", { settings });
     closeSettingsModal();
-    alert("LLM settings saved successfully!");
+    showToast("LLM settings saved", "success");
   } catch (err) {
     console.error("Failed to save settings:", err);
-    alert("Error saving settings: " + err);
+    showToast("Error saving settings: " + err, "error");
   }
 }
 
@@ -986,7 +1047,7 @@ async function fetchModels(silentOnFailure = false) {
   const url = settingsUrl.value.trim();
   if (!url) {
     if (!silentOnFailure) {
-      alert("Please enter a valid API Base URL first.");
+      showToast("Please enter a valid API Base URL first.", "info");
     }
     return;
   }
@@ -1020,7 +1081,7 @@ async function fetchModels(silentOnFailure = false) {
   } catch (err) {
     console.error("Failed to retrieve models:", err);
     if (!silentOnFailure) {
-      alert("Failed to retrieve models: " + err);
+      showToast("Failed to retrieve models: " + err, "error");
     }
   } finally {
     btnFetchModels.disabled = false;
@@ -1805,6 +1866,12 @@ function mockStreamPromise(runId: string, replyText: string): Promise<void> {
   });
 }
 
+// Grow the chat textarea with its content, capped by the CSS max-height.
+function autosizeChatInput() {
+  chatInput.style.height = "auto";
+  chatInput.style.height = `${Math.min(chatInput.scrollHeight, 160)}px`;
+}
+
 // Submit chat message to agent loop
 async function submitChat() {
   const text = chatInput.value.trim();
@@ -1816,6 +1883,7 @@ async function submitChat() {
 
   if (currentMode === "plan") {
     chatInput.value = "";
+    autosizeChatInput();
     renderOptimisticUserMessage(text);
     renderThinkingBubble();
 
@@ -1838,7 +1906,7 @@ async function submitChat() {
         chatInput.disabled = false;
         chatInput.focus();
         console.error(err);
-        alert("Failed to send design chat: " + err);
+        showToast("Failed to send design chat: " + err, "error");
       });
     } else if (logKey) {
       const mockReply = "I suggest adding validation checks and a database persistence layer to the design document. These requirements will align with our SQLite milestone.";
@@ -1860,6 +1928,7 @@ async function submitChat() {
     const filePath = (currentView && currentView.kind === "file") ? currentView.path : "";
     
     chatInput.value = "";
+    autosizeChatInput();
     renderOptimisticUserMessage(text);
     renderThinkingBubble();
 
@@ -1882,7 +1951,7 @@ async function submitChat() {
         chatInput.disabled = false;
         chatInput.focus();
         console.error(err);
-        alert("Failed to request code edit: " + err);
+        showToast("Failed to request code edit: " + err, "error");
       });
     } else if (logKey) {
         const mockReply = "I have updated the file to include standard error logging and cleaner option checking in the command handlers.";
@@ -1907,6 +1976,7 @@ async function submitChat() {
   }
   
   chatInput.value = "";
+  autosizeChatInput();
   renderOptimisticUserMessage(text);
   renderThinkingBubble();
 
@@ -2069,13 +2139,13 @@ function createFileNode(entry: DirEntry): HTMLElement {
     btnDelete.addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!currentProject) return;
-      const confirmDelete = confirm(`Are you sure you want to delete the folder "${entry.name}" and all its contents?`);
+      const confirmDelete = await showConfirm(`Delete the folder "${entry.name}" and all its contents?`, "Delete Folder");
       if (confirmDelete) {
         try {
           await invoke("delete_item", { projectPath: currentProject.path, path: entry.path });
           await renderFileTreeRoot(currentProject.path);
         } catch (err) {
-          alert(`Failed to delete folder: ${err}`);
+          showToast(`Failed to delete folder: ${err}`, "error");
         }
       }
     });
@@ -2104,7 +2174,7 @@ function createFileNode(entry: DirEntry): HTMLElement {
     btnDelete.addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!currentProject) return;
-      const confirmDelete = confirm(`Are you sure you want to delete the file "${entry.name}"?`);
+      const confirmDelete = await showConfirm(`Delete the file "${entry.name}"?`, "Delete File");
       if (confirmDelete) {
         try {
           await invoke("delete_item", { projectPath: currentProject.path, path: entry.path });
@@ -2115,7 +2185,7 @@ function createFileNode(entry: DirEntry): HTMLElement {
             await renderFileTreeRoot(currentProject.path);
           }
         } catch (err) {
-          alert(`Failed to delete file: ${err}`);
+          showToast(`Failed to delete file: ${err}`, "error");
         }
       }
     });
@@ -2386,7 +2456,7 @@ function renderKanbanBoard() {
             }
             await refreshState();
           } catch (err) {
-            alert("Failed to create card: " + err);
+            showToast("Failed to create card: " + err, "error");
           }
         }
         composer.remove();
@@ -2492,33 +2562,89 @@ function renderDiffHtml(diff: string): string {
   return html;
 }
 
+// ─── Shared inline markdown machinery ────────────────────────────────────────
+// Local models love emitting LaTeX inline math like `$\rightarrow$`. We don't
+// render math, but we can translate the common symbol commands to unicode.
+// The map is a strict allowlist, so dollar amounts ("$5 and $10") and Windows
+// paths ("F:\\Projects") are never touched — unknown commands pass through.
+const LATEX_TOKEN_MAP: Record<string, string> = {
+  rightarrow: "→",
+  to: "→",
+  longrightarrow: "⟶",
+  leftarrow: "←",
+  gets: "←",
+  Rightarrow: "⇒",
+  Leftarrow: "⇐",
+  leftrightarrow: "↔",
+  Leftrightarrow: "⇔",
+  uparrow: "↑",
+  downarrow: "↓",
+  le: "≤",
+  leq: "≤",
+  ge: "≥",
+  geq: "≥",
+  ne: "≠",
+  neq: "≠",
+  times: "×",
+  cdot: "·",
+  approx: "≈",
+  pm: "±",
+  infty: "∞",
+  checkmark: "✓",
+};
+
+function normalizeLatexTokens(s: string): string {
+  // Handles `$\rightarrow$` (with optional inner spaces) and bare `\rightarrow`.
+  return s.replace(/\$\s*\\([a-zA-Z]+)\s*\$|\\([a-zA-Z]+)/g, (match, inDollars, bare) => {
+    const name = inDollars || bare;
+    return LATEX_TOKEN_MAP[name] !== undefined ? LATEX_TOKEN_MAP[name] : match;
+  });
+}
+
+// Shared inline markdown rules for already-HTML-escaped text. Inline code is
+// stashed behind placeholders first so emphasis and LaTeX normalization can
+// never mangle code spans, and underscores only toggle emphasis at word
+// boundaries (CommonMark behavior) so snake_case identifiers survive intact.
+function applyInlineMd(escaped: string): string {
+  const codeSpans: string[] = [];
+  let out = escaped.replace(/`([^`\n]+)`/g, (_m, code) => {
+    codeSpans.push(`<code>${code}</code>`);
+    return `\u0000IC${codeSpans.length - 1}\u0000`;
+  });
+  out = normalizeLatexTokens(out);
+  out = out.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/\*(.*?)\*/g, "<em>$1</em>");
+  out = out.replace(/(?<![\w\\])_([^_\n]+)_(?![\w])/g, "<em>$1</em>");
+  out = out.replace(/~~(.*?)~~/g, "<del>$1</del>");
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  return out.replace(/\u0000IC(\d+)\u0000/g, (_m, i) => codeSpans[Number(i)]);
+}
+
 function parseMarkdown(md: string): string {
-  let html = md;
+  // Extract fenced code blocks FIRST so inline rules can't mangle their
+  // contents. (Previously the single-backtick inline rule ran before fenced
+  // handling and ate the ``` fences themselves.)
+  const fencedBlocks: string[] = [];
+  let html = md.replace(/```([a-zA-Z0-9_]*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    fencedBlocks.push(`<pre class="chat-code-block"><code class="${lang}">${escapeHtml(code)}</code></pre>`);
+    return `\u0000FB${fencedBlocks.length - 1}\u0000`;
+  });
+
   // Escapes html tag markers
   html = escapeHtml(html);
 
-  // Inline formatting rules
-  // Bold: **text**
-  html = html.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-  // Italic: *text* or _text_
-  html = html.replace(/\*(.*?)\*/g, "<em>$1</em>");
-  html = html.replace(/_(.*?)_/g, "<em>$1</em>");
-  // Strikethrough: ~~text~~
-  html = html.replace(/~~(.*?)~~/g, "<del>$1</del>");
-  // Inline Code
-  html = html.replace(/`(.*?)`/g, "<code>$1</code>");
-  // Markdown links: [text](url)
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
-
-  // Code blocks: match ```lang ... ```
-  html = html.replace(/```([a-zA-Z0-9_]*)\n([\s\S]*?)```/gm, (_match, lang, code) => {
-    return `<pre class="chat-code-block"><code class="${lang}">${code}</code></pre>`;
-  });
+  // Inline formatting rules (shared with chat rendering)
+  html = applyInlineMd(html);
 
   // Split into lines to process block elements (headers, lists, blockquotes)
   const lines = html.split("\n");
   const processedLines = lines.map(line => {
     let trimmed = line.trim();
+    
+    // Fenced code block placeholder: pass through untouched.
+    if (/^\u0000FB\d+\u0000$/.test(trimmed)) {
+      return trimmed;
+    }
     
     // Headers: # Header to ###### Header
     if (trimmed.startsWith("###### ")) {
@@ -2574,7 +2700,9 @@ function parseMarkdown(md: string): string {
     return line;
   });
   
-  return processedLines.join("");
+  return processedLines
+    .join("")
+    .replace(/\u0000FB(\d+)\u0000/g, (_m, i) => fencedBlocks[Number(i)]);
 }
 
 // Inline Markdown formatter inside chat bubbles
@@ -2665,18 +2793,8 @@ function formatPlainMarkdown(text: string): string {
   // First escape the entire text
   let escaped = escapeHtml(text);
   
-  // Inline formatting rules
-  // Bold: **text**
-  escaped = escaped.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
-  // Italic: *text* or _text_
-  escaped = escaped.replace(/\*(.*?)\*/g, "<em>$1</em>");
-  escaped = escaped.replace(/_(.*?)_/g, "<em>$1</em>");
-  // Strikethrough: ~~text~~
-  escaped = escaped.replace(/~~(.*?)~~/g, "<del>$1</del>");
-  // Inline code: `code`
-  escaped = escaped.replace(/`([^`]+)`/g, "<code>$1</code>");
-  // Markdown links: [text](url)
-  escaped = escaped.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  // Inline formatting rules (shared with doc/card rendering)
+  escaped = applyInlineMd(escaped);
   
   // Split into lines to process block elements (headers, lists)
   const lines = escaped.split("\n");
@@ -2738,7 +2856,7 @@ function escapeHtml(str: string): string {
 // File system dialog helper functions
 function openFsDialog(parentPath: string, type: "file" | "dir" | "doc") {
   if (!currentProject) {
-    alert("Please select a project first.");
+    showToast("Please select a project first.", "info");
     return;
   }
   fsParentPath.value = parentPath;
@@ -2780,7 +2898,10 @@ function renderNewProjectForm() {
         </div>
         <div class="form-group">
           <label for="proj-path">Local Directory Path</label>
-          <input type="text" id="proj-path" class="form-input" placeholder="e.g. F:\\Projects\\MyApp" required />
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="proj-path" class="form-input" placeholder="e.g. F:\\Projects\\MyApp" required style="flex: 1;" />
+            <button type="button" class="btn btn-secondary" id="btn-proj-path-browse" style="flex: 0; white-space: nowrap;">Browse…</button>
+          </div>
           <span style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">Must be a local directory path. We will auto-initialize git and seed requirements if not already present.</span>
         </div>
         <div style="margin-top: 24px; display: flex; gap: 12px; justify-content: flex-end;">
@@ -2793,6 +2914,25 @@ function renderNewProjectForm() {
 
   const form = document.getElementById("new-project-form") as HTMLFormElement;
   const cancelBtn = document.getElementById("btn-new-project-cancel") as HTMLButtonElement;
+  const browseBtn = document.getElementById("btn-proj-path-browse") as HTMLButtonElement;
+
+  browseBtn.addEventListener("click", async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Select Project Directory",
+    });
+    if (typeof selected === "string" && selected) {
+      const pathInput = document.getElementById("proj-path") as HTMLInputElement;
+      const nameInput = document.getElementById("proj-name") as HTMLInputElement;
+      pathInput.value = selected;
+      // Convenience: seed the project name from the folder name if empty.
+      if (!nameInput.value.trim()) {
+        const folder = selected.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "";
+        nameInput.value = folder;
+      }
+    }
+  });
 
   cancelBtn.addEventListener("click", () => {
     switchMode("kanban");
@@ -2810,12 +2950,12 @@ function renderNewProjectForm() {
 
     try {
       const newProj = await invoke<Project>("create_project", { name, path });
-      alert("Project created and onboarded successfully!");
+      showToast(`Project "${name}" created and onboarded`, "success");
       await loadProjects();
       projectSelect.value = newProj.path;
       await selectProject(newProj);
     } catch (err) {
-      alert("Failed to create project: " + err);
+      showToast("Failed to create project: " + err, "error");
     }
   });
 }
@@ -3027,7 +3167,7 @@ function renderCardDetail(card: Card) {
   const deleteBtn = detailDiv.querySelector("#card-detail-delete-btn-el") as HTMLButtonElement;
   if (deleteBtn) {
     deleteBtn.addEventListener("click", async () => {
-      if (confirm(`Are you sure you want to delete card "${card.title}"?`)) {
+      if (await showConfirm(`Delete card "${card.title}"?`, "Delete Card")) {
         try {
           if (isTauri) {
             await invoke("delete_card", { cardId: card.id });
@@ -3042,7 +3182,7 @@ function renderCardDetail(card: Card) {
           popView();
           await refreshState();
         } catch (err) {
-          alert("Failed to delete card: " + err);
+          showToast("Failed to delete card: " + err, "error");
         }
       }
     });

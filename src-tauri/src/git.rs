@@ -1,6 +1,6 @@
-use std::process::Command;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Run a git command with args in a specific directory
 fn run_git_cmd<P: AsRef<Path>>(cwd: P, args: &[&str]) -> Result<String, String> {
@@ -35,7 +35,7 @@ pub fn create_worktree<P: AsRef<Path>>(
     base_branch: &str,
 ) -> Result<PathBuf, String> {
     let repo_path = repo_path.as_ref();
-    
+
     // Check if dirty
     if !is_working_tree_clean(repo_path)? {
         return Err("The parent repository has uncommitted changes. Please stash or commit them before starting a run.".to_string());
@@ -112,7 +112,10 @@ pub fn merge_worktree<P: AsRef<Path>>(
     if let Err(e) = merge_res {
         // If merge fails (conflicts), abort the merge and return the conflict details
         let _ = run_git_cmd(repo_path, &["merge", "--abort"]);
-        return Err(format!("Merge failed due to conflicts: {}. Merge aborted.", e));
+        return Err(format!(
+            "Merge failed due to conflicts: {}. Merge aborted.",
+            e
+        ));
     }
 
     // 3. Remove the worktree
@@ -122,7 +125,11 @@ pub fn merge_worktree<P: AsRef<Path>>(
 }
 
 /// Computes the unified diff between base branch and isolation branch
-pub fn get_diff<P: AsRef<Path>>(repo_path: P, run_id: &str, base_branch: &str) -> Result<String, String> {
+pub fn get_diff<P: AsRef<Path>>(
+    repo_path: P,
+    run_id: &str,
+    base_branch: &str,
+) -> Result<String, String> {
     let repo_path = repo_path.as_ref();
     let branch_name = format!("harness/run-{}", run_id);
 
@@ -180,7 +187,11 @@ mod tests {
         // 1. Create worktree
         let wt_path = create_worktree(&repo_path, run_id, base).unwrap();
         assert!(wt_path.exists());
-        assert!(repo_path.join(".harness").join("worktrees").join(run_id).exists());
+        assert!(repo_path
+            .join(".harness")
+            .join("worktrees")
+            .join(run_id)
+            .exists());
 
         // 2. Modify file in worktree
         let wt_file = wt_path.join("new_file.txt");
@@ -204,6 +215,9 @@ mod tests {
         // Verify changes are in base repo
         let base_file = repo_path.join("new_file.txt");
         assert!(base_file.exists());
-        assert_eq!(fs::read_to_string(base_file).unwrap(), "Hello from worktree sandbox!");
+        assert_eq!(
+            fs::read_to_string(base_file).unwrap(),
+            "Hello from worktree sandbox!"
+        );
     }
 }

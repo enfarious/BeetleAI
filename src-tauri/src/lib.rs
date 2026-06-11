@@ -32,12 +32,12 @@ pub fn clean_project_path<P: AsRef<Path>>(path: P) -> PathBuf {
             }
         }
     }
-    
+
     let mut normalized = PathBuf::new();
     for c in stack {
         normalized.push(c);
     }
-    
+
     normalized
 }
 
@@ -53,10 +53,11 @@ pub fn run() {
         } else {
             "Unknown panic payload"
         };
-        let location = panic_info.location()
+        let location = panic_info
+            .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "Unknown location".to_string());
-            
+
         let log_content = format!(
             "--- PANIC DETECTED ---\nTimestamp: {}\nLocation: {}\nMessage: {}\n\nBacktrace:\n{:?}\n",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -64,7 +65,7 @@ pub fn run() {
             message,
             backtrace
         );
-        
+
         let logs_dir = clean_project_path(".").join("logs");
         let _ = std::fs::create_dir_all(&logs_dir);
         let _ = std::fs::write(logs_dir.join("error.log"), &log_content);
@@ -72,6 +73,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::new())
         .setup(|app| {
             let app_handle = app.handle().clone();

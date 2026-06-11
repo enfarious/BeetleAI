@@ -1,12 +1,12 @@
-use serde::{Serialize, Deserialize};
-use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::collections::HashMap;
+use std::sync::Mutex;
 
-use tauri::{Manager, Emitter};
 use crate::git;
+use tauri::{Emitter, Manager};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Project {
@@ -37,7 +37,7 @@ pub struct Card {
 pub struct RunEvent {
     pub run_id: String,
     pub event_type: String, // "status", "message", "tool_call", "tool_result", "file_touched", "blocked", "error"
-    pub payload: String, // JSON payload or text
+    pub payload: String,    // JSON payload or text
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -62,6 +62,10 @@ pub struct AppState {
     pub code_logs: Mutex<HashMap<String, Vec<RunEvent>>>,
     pub active_runs: Mutex<std::collections::HashSet<String>>,
     pub cancelled_runs: Mutex<std::collections::HashSet<String>>,
+    /// Last LM Studio stateful `response_id` per run/chat key. The /api/v1/chat
+    /// endpoint keeps history server-side; chaining `previous_response_id` is
+    /// what makes a thread continue instead of starting fresh every call.
+    pub lmstudio_response_ids: Mutex<HashMap<String, String>>,
 }
 
 impl AppState {
@@ -192,6 +196,7 @@ impl AppState {
             code_logs: Mutex::new(HashMap::new()),
             active_runs: Mutex::new(std::collections::HashSet::new()),
             cancelled_runs: Mutex::new(std::collections::HashSet::new()),
+            lmstudio_response_ids: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -208,7 +213,8 @@ fn get_repo_path() -> PathBuf {
 /// SELECTED project instead of BeetleAI's own repo.
 fn repo_path_for_run(state: &AppState, run_id: &str) -> Option<PathBuf> {
     let cards = state.cards.lock().unwrap();
-    cards.iter()
+    cards
+        .iter()
         .find(|c| c.run_id.as_deref() == Some(run_id))
         .map(|c| clean_project_path(&c.project_path))
 }
@@ -230,13 +236,18 @@ fn get_db_conn(app_handle: &tauri::AppHandle) -> Result<rusqlite::Connection, St
     rusqlite::Connection::open(db_path).map_err(|e| e.to_string())
 }
 
-fn seed_default_cards_for_project(conn: &rusqlite::Connection, project_path: &str) -> Result<Vec<Card>, String> {
+fn seed_default_cards_for_project(
+    conn: &rusqlite::Connection,
+    project_path: &str,
+) -> Result<Vec<Card>, String> {
     let project_name = std::path::Path::new(project_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("project");
-    let project_slug = project_name.to_lowercase().replace(|c: char| !c.is_alphanumeric(), "_");
-    
+    let project_slug = project_name
+        .to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric(), "_");
+
     let initial_cards = vec![
         Card {
             id: format!("{}_card_1", project_slug),
@@ -375,8 +386,9 @@ fn seed_default_cards_for_project(conn: &rusqlite::Connection, project_path: &st
 
 pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
     let conn = get_db_conn(app_handle)?;
-    
-    conn.execute("PRAGMA foreign_keys = ON;", []).map_err(|e| e.to_string())?;
+
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .map_err(|e| e.to_string())?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS settings (
@@ -387,7 +399,8 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             max_steps INTEGER NOT NULL
         );",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS projects (
@@ -396,7 +409,8 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             path TEXT NOT NULL
         );",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS cards (
@@ -409,10 +423,14 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             assignee TEXT
         );",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     // Attempt migration to add project_path column to existing databases
-    let _ = conn.execute("ALTER TABLE cards ADD COLUMN project_path TEXT NOT NULL DEFAULT '';", []);
+    let _ = conn.execute(
+        "ALTER TABLE cards ADD COLUMN project_path TEXT NOT NULL DEFAULT '';",
+        [],
+    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS todo_items (
@@ -424,7 +442,8 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             FOREIGN KEY (card_id) REFERENCES cards (id) ON DELETE CASCADE
         );",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS logs (
@@ -436,9 +455,12 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             payload TEXT NOT NULL
         );",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |row| row.get(0)).unwrap_or(0);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cards", [], |row| row.get(0))
+        .unwrap_or(0);
     if count == 0 {
         let mut p = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         if p.ends_with("src-tauri") {
@@ -448,7 +470,9 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
         let _ = seed_default_cards_for_project(&conn, &default_project_path);
     }
 
-    let settings_count: i64 = conn.query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0)).unwrap_or(0);
+    let settings_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
+        .unwrap_or(0);
     if settings_count == 0 {
         let _ = conn.execute(
             "INSERT INTO settings (provider, api_url, api_key, model, max_steps) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -462,7 +486,9 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
         );
     }
 
-    let projects_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0)).unwrap_or(0);
+    let projects_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
+        .unwrap_or(0);
     if projects_count == 0 {
         let mut p = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         if p.ends_with("src-tauri") {
@@ -471,11 +497,7 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
         let project_path = p.to_string_lossy().into_owned();
         let _ = conn.execute(
             "INSERT INTO projects (id, name, path) VALUES (?1, ?2, ?3)",
-            (
-                "beetleai",
-                "BeetleAI Harness",
-                &project_path,
-            ),
+            ("beetleai", "BeetleAI Harness", &project_path),
         );
     }
 
@@ -483,25 +505,34 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
 }
 
 fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> {
-    let mut stmt = conn.prepare("SELECT provider, api_url, api_key, model, max_steps FROM settings LIMIT 1").map_err(|e| e.to_string())?;
-    let settings_opt = stmt.query_row([], |row| {
-        Ok(LlmSettings {
-            provider: row.get(0)?,
-            api_url: row.get(1)?,
-            api_key: row.get(2)?,
-            model: row.get(3)?,
-            max_steps: row.get(4)?,
+    let mut stmt = conn
+        .prepare("SELECT provider, api_url, api_key, model, max_steps FROM settings LIMIT 1")
+        .map_err(|e| e.to_string())?;
+    let settings_opt = stmt
+        .query_row([], |row| {
+            Ok(LlmSettings {
+                provider: row.get(0)?,
+                api_url: row.get(1)?,
+                api_key: row.get(2)?,
+                model: row.get(3)?,
+                max_steps: row.get(4)?,
+            })
         })
-    }).optional().map_err(|e| e.to_string())?;
+        .optional()
+        .map_err(|e| e.to_string())?;
 
-    let mut stmt = conn.prepare("SELECT id, name, path FROM projects").map_err(|e| e.to_string())?;
-    let projects_rows = stmt.query_map([], |row| {
-        Ok(Project {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            path: row.get(2)?,
+    let mut stmt = conn
+        .prepare("SELECT id, name, path FROM projects")
+        .map_err(|e| e.to_string())?;
+    let projects_rows = stmt
+        .query_map([], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                path: row.get(2)?,
+            })
         })
-    }).map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
 
     let mut projects = Vec::new();
     for proj_res in projects_rows {
@@ -533,7 +564,8 @@ fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result
         conn.execute(
             "INSERT INTO projects (id, name, path) VALUES (?1, ?2, ?3)",
             (&proj.id, &proj.name, &proj.path),
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -542,30 +574,39 @@ fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result
 pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
     let conn = get_db_conn(app_handle)?;
 
-    let mut stmt = conn.prepare("SELECT id, project_path, title, description, status, run_id, assignee FROM cards").map_err(|e| e.to_string())?;
-    let card_rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-        ))
-    }).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id, project_path, title, description, status, run_id, assignee FROM cards")
+        .map_err(|e| e.to_string())?;
+    let card_rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
 
     let mut cards = Vec::new();
     for card_res in card_rows {
-        let (id, project_path, title, description, status, run_id, assignee) = card_res.map_err(|e| e.to_string())?;
-        
-        let mut todo_stmt = conn.prepare("SELECT text, completed FROM todo_items WHERE card_id = ?1 ORDER BY idx ASC").map_err(|e| e.to_string())?;
-        let todo_rows = todo_stmt.query_map([&id], |row| {
-            Ok(TodoItem {
-                text: row.get(0)?,
-                completed: row.get::<_, i32>(1)? != 0,
+        let (id, project_path, title, description, status, run_id, assignee) =
+            card_res.map_err(|e| e.to_string())?;
+
+        let mut todo_stmt = conn
+            .prepare("SELECT text, completed FROM todo_items WHERE card_id = ?1 ORDER BY idx ASC")
+            .map_err(|e| e.to_string())?;
+        let todo_rows = todo_stmt
+            .query_map([&id], |row| {
+                Ok(TodoItem {
+                    text: row.get(0)?,
+                    completed: row.get::<_, i32>(1)? != 0,
+                })
             })
-        }).map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
 
         let mut todo_list = Vec::new();
         for todo_res in todo_rows {
@@ -589,16 +630,20 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
         *app_cards = cards;
     }
 
-    let mut stmt = conn.prepare("SELECT log_type, key, run_id, event_type, payload FROM logs ORDER BY id ASC").map_err(|e| e.to_string())?;
-    let log_rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-        ))
-    }).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT log_type, key, run_id, event_type, payload FROM logs ORDER BY id ASC")
+        .map_err(|e| e.to_string())?;
+    let log_rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
 
     let mut run_logs = HashMap::new();
     let mut design_logs = HashMap::new();
@@ -726,10 +771,12 @@ pub fn open_project(path: String) -> Result<Project, String> {
     let p = Path::new(&path);
     if p.exists() {
         Ok(Project {
-            id: p.file_name()
+            id: p
+                .file_name()
                 .map(|s| s.to_string_lossy().to_lowercase().replace(' ', "_"))
                 .unwrap_or_else(|| "project".to_string()),
-            name: p.file_name()
+            name: p
+                .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "Repository".to_string()),
             path,
@@ -740,7 +787,11 @@ pub fn open_project(path: String) -> Result<Project, String> {
 }
 
 #[tauri::command]
-pub fn create_project(app_handle: tauri::AppHandle, name: String, path: String) -> Result<Project, String> {
+pub fn create_project(
+    app_handle: tauri::AppHandle,
+    name: String,
+    path: String,
+) -> Result<Project, String> {
     let p = Path::new(&path);
     if !p.exists() {
         fs::create_dir_all(p).map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -766,7 +817,7 @@ pub fn create_project(app_handle: tauri::AppHandle, name: String, path: String) 
             .current_dir(p)
             .args(&["init", "-b", "main"])
             .output();
-        
+
         let gitignore = p.join(".gitignore");
         if !gitignore.exists() {
             let _ = fs::write(&gitignore, "\n# BeetleAI Harness temporary storage\n.harness/worktrees/\n.harness/harness.db\n");
@@ -781,7 +832,11 @@ pub fn create_project(app_handle: tauri::AppHandle, name: String, path: String) 
     };
 
     let mut config = load_config(&app_handle);
-    if config.projects.iter().any(|proj| proj.path == new_project.path) {
+    if config
+        .projects
+        .iter()
+        .any(|proj| proj.path == new_project.path)
+    {
         return Err("Project already registered at this path.".to_string());
     }
 
@@ -811,7 +866,7 @@ pub fn list_design_docs(project_path: String) -> Result<Vec<String>, String> {
     if !design_dir.exists() {
         fs::create_dir_all(&design_dir).map_err(|e| e.to_string())?;
     }
-    
+
     // Seed default design.md if design dir is empty
     let mut entries = fs::read_dir(&design_dir).map_err(|e| e.to_string())?;
     if entries.next().is_none() {
@@ -825,7 +880,7 @@ pub fn list_design_docs(project_path: String) -> Result<Vec<String>, String> {
         };
         fs::write(&default_doc, seed).map_err(|e| e.to_string())?;
     }
-    
+
     // Read all md files
     let mut docs = Vec::new();
     for entry in fs::read_dir(&design_dir).map_err(|e| e.to_string())? {
@@ -843,7 +898,9 @@ pub fn list_design_docs(project_path: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 pub fn read_design_doc(project_path: String, doc_name: String) -> Result<String, String> {
-    let p = clean_project_path(&project_path).join("design").join(&doc_name);
+    let p = clean_project_path(&project_path)
+        .join("design")
+        .join(&doc_name);
     if p.exists() {
         fs::read_to_string(p).map_err(|e| e.to_string())
     } else {
@@ -852,7 +909,11 @@ pub fn read_design_doc(project_path: String, doc_name: String) -> Result<String,
 }
 
 #[tauri::command]
-pub fn write_design_doc(project_path: String, doc_name: String, content: String) -> Result<(), String> {
+pub fn write_design_doc(
+    project_path: String,
+    doc_name: String,
+    content: String,
+) -> Result<(), String> {
     let design_dir = clean_project_path(&project_path).join("design");
     if !design_dir.exists() {
         fs::create_dir_all(&design_dir).map_err(|e| e.to_string())?;
@@ -872,9 +933,12 @@ fn accumulate_sse_tool_calls(line: &str, accumulated: &mut Vec<ToolCallAccumulat
     if line_trimmed.is_empty() {
         return;
     }
-    
+
     let json_str = if line_trimmed.starts_with("data: ") {
-        let content = line_trimmed.strip_prefix("data: ").unwrap_or(line_trimmed).trim();
+        let content = line_trimmed
+            .strip_prefix("data: ")
+            .unwrap_or(line_trimmed)
+            .trim();
         if content == "[DONE]" {
             return;
         }
@@ -882,7 +946,7 @@ fn accumulate_sse_tool_calls(line: &str, accumulated: &mut Vec<ToolCallAccumulat
     } else {
         line_trimmed
     };
-    
+
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
             if let Some(first) = choices.first() {
@@ -894,15 +958,19 @@ fn accumulate_sse_tool_calls(line: &str, accumulated: &mut Vec<ToolCallAccumulat
                                 while accumulated.len() <= idx {
                                     accumulated.push(ToolCallAccumulator::default());
                                 }
-                                
+
                                 if let Some(id_str) = tc.get("id").and_then(|i| i.as_str()) {
                                     accumulated[idx].id = Some(id_str.to_string());
                                 }
                                 if let Some(func) = tc.get("function") {
-                                    if let Some(name_str) = func.get("name").and_then(|n| n.as_str()) {
+                                    if let Some(name_str) =
+                                        func.get("name").and_then(|n| n.as_str())
+                                    {
                                         accumulated[idx].name = Some(name_str.to_string());
                                     }
-                                    if let Some(args_str) = func.get("arguments").and_then(|a| a.as_str()) {
+                                    if let Some(args_str) =
+                                        func.get("arguments").and_then(|a| a.as_str())
+                                    {
                                         accumulated[idx].arguments.push_str(args_str);
                                     }
                                 }
@@ -1173,7 +1241,10 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
     // Index tool_results so we can budget by recency: the last couple of results
     // stay generous, older ones get trimmed hard. This bounds prompt growth over
     // a long run, which is what was driving local-model prompt-ingestion timeouts.
-    let total_tool_results = events.iter().filter(|e| e.event_type == "tool_result").count();
+    let total_tool_results = events
+        .iter()
+        .filter(|e| e.event_type == "tool_result")
+        .count();
     let mut tool_result_seen = 0usize;
     // The most recent N results are kept fuller; everything older is trimmed hard.
     const RECENT_KEEP: usize = 2;
@@ -1184,34 +1255,71 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
     for event in events {
         let (role, new_content) = if event.event_type == "message" {
             if let Ok(msg_json) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                if let (Some(role), Some(content)) = (msg_json.get("role"), msg_json.get("content")) {
+                if let (Some(role), Some(content)) = (msg_json.get("role"), msg_json.get("content"))
+                {
                     let role_str = role.as_str().unwrap_or("user");
-                    let role_normalized = if role_str == "agent" { "assistant" } else { role_str };
-                    (Some(role_normalized.to_string()), Some(content.as_str().unwrap_or("").to_string()))
-                } else { (None, None) }
-            } else { (None, None) }
+                    let role_normalized = if role_str == "agent" {
+                        "assistant"
+                    } else {
+                        role_str
+                    };
+                    (
+                        Some(role_normalized.to_string()),
+                        Some(content.as_str().unwrap_or("").to_string()),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
         } else if event.event_type == "reasoning" {
-            (Some("assistant".to_string()), Some(format!("<think>\n{}\n</think>", event.payload)))
+            (
+                Some("assistant".to_string()),
+                Some(format!("<think>\n{}\n</think>", event.payload)),
+            )
         } else if event.event_type == "tool_call" {
             if let Ok(call_json) = serde_json::from_str::<serde_json::Value>(&event.payload) {
                 let name = call_json.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let args = call_json.get("args").cloned().unwrap_or(serde_json::json!({}));
-                let text_content = format!("```tool_call\n{{\n  \"name\": \"{}\",\n  \"args\": {}\n}}\n```", name, args);
+                let args = call_json
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let text_content = format!(
+                    "```tool_call\n{{\n  \"name\": \"{}\",\n  \"args\": {}\n}}\n```",
+                    name, args
+                );
                 (Some("assistant".to_string()), Some(text_content))
-            } else { (None, None) }
+            } else {
+                (None, None)
+            }
         } else if event.event_type == "tool_result" {
             if let Ok(result_json) = serde_json::from_str::<serde_json::Value>(&event.payload) {
-                let name = result_json.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let result = result_json.get("result").and_then(|r| r.as_str()).unwrap_or("");
+                let name = result_json
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("");
+                let result = result_json
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("");
                 // Is this one of the most recent RECENT_KEEP results?
                 let is_recent = tool_result_seen + RECENT_KEEP >= total_tool_results;
                 tool_result_seen += 1;
-                let budget = if is_recent { RECENT_MAX_CHARS } else { OLD_MAX_CHARS };
+                let budget = if is_recent {
+                    RECENT_MAX_CHARS
+                } else {
+                    OLD_MAX_CHARS
+                };
                 let trimmed = truncate_tool_result(result, budget);
                 let text_content = format!("Tool '{}' returned:\n{}", name, trimmed);
                 (Some("user".to_string()), Some(text_content))
-            } else { (None, None) }
-        } else { (None, None) };
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
 
         if let (Some(r), Some(c)) = (role, new_content) {
             if !c.is_empty() {
@@ -1263,7 +1371,7 @@ fn parse_sse_delta(line: &str) -> Option<SSEParsed> {
     if line_trimmed.is_empty() {
         return None;
     }
-    
+
     let json_str = if line_trimmed.starts_with("data: ") {
         let content = line_trimmed.strip_prefix("data: ")?.trim();
         if content == "[DONE]" {
@@ -1273,10 +1381,13 @@ fn parse_sse_delta(line: &str) -> Option<SSEParsed> {
     } else {
         line_trimmed
     };
-    
+
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(type_str) = json.get("type").and_then(|t| t.as_str()) {
-            if type_str == "reasoning.start" || type_str == "reasoning.end" || type_str == "reasoning" {
+            if type_str == "reasoning.start"
+                || type_str == "reasoning.end"
+                || type_str == "reasoning"
+            {
                 return None;
             }
         }
@@ -1301,15 +1412,27 @@ fn parse_sse_delta(line: &str) -> Option<SSEParsed> {
         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
             if let Some(first) = choices.first() {
                 if let Some(delta) = first.get("delta") {
-                    let content = delta.get("content").and_then(|c| c.as_str()).map(|s| s.to_string());
-                    let reasoning = delta.get("reasoning_content").and_then(|r| r.as_str()).map(|s| s.to_string());
+                    let content = delta
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string());
+                    let reasoning = delta
+                        .get("reasoning_content")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string());
                     if content.is_some() || reasoning.is_some() {
                         return Some(SSEParsed { content, reasoning });
                     }
                 }
                 if let Some(msg) = first.get("message") {
-                    let content = msg.get("content").and_then(|c| c.as_str()).map(|s| s.to_string());
-                    let reasoning = msg.get("reasoning_content").and_then(|r| r.as_str()).map(|s| s.to_string());
+                    let content = msg
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string());
+                    let reasoning = msg
+                        .get("reasoning_content")
+                        .and_then(|r| r.as_str())
+                        .map(|s| s.to_string());
                     if content.is_some() || reasoning.is_some() {
                         return Some(SSEParsed { content, reasoning });
                     }
@@ -1351,9 +1474,9 @@ fn parse_sse_delta(line: &str) -> Option<SSEParsed> {
         // 6. Stateful LM Studio output
         if let Some(output) = json.get("output") {
             if let Some(arr) = output.as_array() {
-                let message_item = arr.iter().find(|item| {
-                    item.get("type").and_then(|t| t.as_str()) == Some("message")
-                });
+                let message_item = arr
+                    .iter()
+                    .find(|item| item.get("type").and_then(|t| t.as_str()) == Some("message"));
                 let target_item = message_item.or_else(|| arr.first());
                 if let Some(item) = target_item {
                     if let Some(content) = item.get("content").and_then(|c| c.as_str()) {
@@ -1382,6 +1505,240 @@ fn parse_sse_delta(line: &str) -> Option<SSEParsed> {
     None
 }
 
+// ─── Provider routing ──────────────────────────────────────────────────────────────
+// Each provider speaks its native protocol on its native endpoint.
+//
+// The universal floor for harness tools is the TEXT PROTOCOL: a ```tool_call
+// fenced block mandated by the system prompt and consumed by parse_tool_call.
+// It works on any model on any endpoint with no `tools` field at all.
+// Providers that support native/client tool calling additionally receive a
+// `tools` field, and any native calls they emit are bridged back into the text
+// protocol (bridge_tool_calls_into_text) so the run loop has exactly one
+// format to consume.
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ProviderKind {
+    /// OpenAI itself, or any OpenAI-compatible server ("openai", "custom").
+    OpenAiCompat,
+    /// Anthropic Messages API.
+    Anthropic,
+    /// Ollama's native /api/chat: NDJSON streaming, native tools, `options`.
+    OllamaNative,
+    /// LM Studio's native stateful /api/v1/chat: named SSE events, server-side
+    /// history via previous_response_id. No client `tools` field -> text protocol.
+    LmStudioStateful,
+}
+
+fn provider_kind(provider: &str) -> ProviderKind {
+    match provider {
+        "anthropic" => ProviderKind::Anthropic,
+        "ollama" => ProviderKind::OllamaNative,
+        "lmstudio" => ProviderKind::LmStudioStateful,
+        _ => ProviderKind::OpenAiCompat, // "openai", "custom", anything unknown
+    }
+}
+
+fn provider_supports_native_tools(kind: ProviderKind) -> bool {
+    matches!(
+        kind,
+        ProviderKind::OpenAiCompat | ProviderKind::Anthropic | ProviderKind::OllamaNative
+    )
+}
+
+/// Resolve the request URL from the user-configured base URL.
+///
+/// Policy: a full endpoint path is always respected verbatim. Otherwise the
+/// provider's documented endpoint is appended to the configured root. The only
+/// accommodation is recognizing the common "/v1" (and "/api/v1") root-suffix
+/// convention used by OpenAI-style client configs, so existing setups keep
+/// working. No other rewriting of user input is performed.
+fn resolve_endpoint(kind: ProviderKind, base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    match kind {
+        ProviderKind::OpenAiCompat => {
+            if base.ends_with("/chat/completions") {
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{}/chat/completions", base)
+            } else {
+                format!("{}/v1/chat/completions", base)
+            }
+        }
+        ProviderKind::Anthropic => {
+            if base.ends_with("/messages") {
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{}/messages", base)
+            } else {
+                format!("{}/v1/messages", base)
+            }
+        }
+        ProviderKind::OllamaNative => {
+            if base.ends_with("/api/chat") {
+                base.to_string()
+            } else {
+                let root = base.trim_end_matches("/v1").trim_end_matches('/');
+                format!("{}/api/chat", root)
+            }
+        }
+        ProviderKind::LmStudioStateful => {
+            if base.ends_with("/api/v1/chat") {
+                base.to_string()
+            } else {
+                let root = base
+                    .trim_end_matches("/api/v1")
+                    .trim_end_matches("/v1")
+                    .trim_end_matches('/');
+                format!("{}/api/v1/chat", root)
+            }
+        }
+    }
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(300))
+        .build()
+}
+
+fn run_is_cancelled(app_handle: &tauri::AppHandle, run_id: &str) -> bool {
+    if let Some(state_val) = app_handle.try_state::<AppState>() {
+        let cancelled = state_val.cancelled_runs.lock().unwrap();
+        cancelled.contains(run_id)
+    } else {
+        false
+    }
+}
+
+fn emit_chunk(app_handle: &tauri::AppHandle, run_id: &str, chunk: &str, done: bool) {
+    let _ = app_handle.emit(
+        "chat-chunk",
+        serde_json::json!({
+            "run_id": run_id,
+            "chunk": chunk,
+            "done": done,
+            "error": serde_json::Value::Null
+        }),
+    );
+}
+
+/// Convert the OpenAI function-tools schema into Anthropic's tool format
+/// (top-level name/description with `input_schema` instead of nested
+/// `function.parameters`).
+fn convert_tools_to_anthropic(tools: &serde_json::Value) -> serde_json::Value {
+    let mut out = Vec::new();
+    if let Some(arr) = tools.as_array() {
+        for t in arr {
+            let f = t.get("function").unwrap_or(t);
+            let name = f.get("name").cloned().unwrap_or(serde_json::json!(""));
+            let description = f
+                .get("description")
+                .cloned()
+                .unwrap_or(serde_json::json!(""));
+            let input_schema = f
+                .get("parameters")
+                .cloned()
+                .unwrap_or(serde_json::json!({"type": "object", "properties": {}}));
+            out.push(serde_json::json!({
+                "name": name,
+                "description": description,
+                "input_schema": input_schema
+            }));
+        }
+    }
+    serde_json::Value::Array(out)
+}
+
+/// Bridge natively-emitted tool calls into the universal text protocol so one
+/// parser (parse_tool_call) handles both native and text-emitted calls.
+/// APPENDS to the streamed prose rather than replacing it — otherwise what the
+/// user saw streaming and what history stores diverge.
+///
+/// The run loop executes one tool per step by design. If the model emitted
+/// parallel tool calls, the extras are dropped LOUDLY: logged, plus a note in
+/// the assistant message so the model sees on its next turn that the extra
+/// calls never ran (instead of silently assuming they succeeded and drifting).
+fn bridge_tool_calls_into_text(full_response: &mut String, accumulated: &[ToolCallAccumulator]) {
+    if accumulated.is_empty() {
+        return;
+    }
+    if let Some(tc) = accumulated.first() {
+        let name = tc.name.clone().unwrap_or_default();
+        let args_parsed: serde_json::Value =
+            serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        let formatted = format!(
+            "```tool_call\n{{\n  \"name\": \"{}\",\n  \"args\": {}\n}}\n```",
+            name, args_parsed
+        );
+        if !full_response.trim().is_empty() {
+            full_response.push_str("\n\n");
+        }
+        full_response.push_str(&formatted);
+    }
+    if accumulated.len() > 1 {
+        let dropped: Vec<String> = accumulated[1..]
+            .iter()
+            .map(|tc| tc.name.clone().unwrap_or_else(|| "<unnamed>".to_string()))
+            .collect();
+        log_error(&format!(
+            "Model emitted {} tool calls in one response; only the first was kept. Dropped: {}",
+            accumulated.len(),
+            dropped.join(", ")
+        ));
+        full_response.push_str(&format!(
+            "\n\n[harness note: {} additional tool call(s) ({}) were NOT executed. Emit exactly one tool call per message.]",
+            dropped.len(),
+            dropped.join(", ")
+        ));
+    }
+}
+
+/// Accumulate Anthropic streaming tool_use blocks (content_block_start with
+/// type "tool_use" + input_json_delta fragments) into ToolCallAccumulators.
+fn accumulate_anthropic_tool_calls(line: &str, accumulated: &mut Vec<ToolCallAccumulator>) {
+    let line_trimmed = line.trim();
+    let json_str = match line_trimmed.strip_prefix("data: ") {
+        Some(s) => s.trim(),
+        None => return,
+    };
+    let json: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(j) => j,
+        Err(_) => return,
+    };
+    match json.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "content_block_start" => {
+            if let Some(block) = json.get("content_block") {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    accumulated.push(ToolCallAccumulator {
+                        id: block
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .map(|s| s.to_string()),
+                        name: block
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string()),
+                        arguments: String::new(),
+                    });
+                }
+            }
+        }
+        "content_block_delta" => {
+            if let Some(delta) = json.get("delta") {
+                if delta.get("type").and_then(|t| t.as_str()) == Some("input_json_delta") {
+                    if let Some(pj) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                        if let Some(last) = accumulated.last_mut() {
+                            last.arguments.push_str(pj);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn call_llm(
     app_handle: &tauri::AppHandle,
     run_id: &str,
@@ -1397,281 +1754,645 @@ fn call_llm(
     }
     let config = load_config(app_handle);
     let settings = config.settings;
-    
-    let base_url = settings.api_url.trim().trim_end_matches('/');
+
+    let base_url = settings.api_url.trim().trim_end_matches('/').to_string();
     if base_url.is_empty() {
         let err = "API URL is empty. Please configure it in settings.".to_string();
         log_error(&err);
         return Err(err);
     }
 
-    let provider = settings.provider.to_lowercase();
-    let model = settings.model.clone();
-    
+    let kind = provider_kind(&settings.provider.to_lowercase());
+    let url = resolve_endpoint(kind, &base_url);
+
+    // Providers without client-side tool calling still get full tool support
+    // through the text protocol mandated in the system prompt.
+    let tools = if provider_supports_native_tools(kind) {
+        tools
+    } else {
+        None
+    };
+
     let mut messages = vec![serde_json::json!({
         "role": "system",
         "content": system_prompt
     })];
     messages.append(&mut chat_history);
 
-    if provider == "anthropic" {
-        let url = if base_url.contains("api.anthropic.com") || !base_url.contains('/') {
-            "https://api.anthropic.com/v1/messages".to_string()
-        } else {
-            format!("{}/messages", base_url)
-        };
-        
-        let anthropic_messages: Vec<serde_json::Value> = messages.iter()
-            .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
-            .cloned()
-            .collect();
-
-        let mut payload = serde_json::json!({
-            "model": model,
-            "max_tokens": 4000,
-            "system": system_prompt,
-            "messages": anthropic_messages,
-            "stream": true
-        });
-
-        if let Some(ref t) = tools {
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("tools".to_string(), t.clone());
-            }
+    match kind {
+        ProviderKind::Anthropic => call_anthropic(
+            app_handle,
+            run_id,
+            &url,
+            &settings,
+            system_prompt,
+            messages,
+            tools,
+        ),
+        ProviderKind::OllamaNative => {
+            call_ollama_native(app_handle, run_id, &url, &settings, messages, tools)
         }
-
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(10))
-            .timeout_read(std::time::Duration::from_secs(300))
-            .build();
-        let resp = agent.post(&url)
-            .set("Content-Type", "application/json")
-            .set("x-api-key", &settings.api_key)
-            .set("anthropic-version", "2023-06-01")
-            .send_json(payload)
-            .map_err(|e| {
-                let err_msg = format!("Anthropic network request failed: {}", e);
-                log_error(&err_msg);
-                err_msg
-            })?;
-
-        if resp.status() == 200 {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(resp.into_reader());
-            let mut full_response = String::new();
-            let mut in_reasoning = false;
-            
-            for line in reader.lines() {
-                if let Some(state_val) = app_handle.try_state::<AppState>() {
-                    let cancelled = state_val.cancelled_runs.lock().unwrap();
-                    if cancelled.contains(run_id) {
-                        return Err("Cancelled by user".to_string());
-                    }
-                }
-                let line_str = line.map_err(|e| e.to_string())?;
-                if let Some(parsed) = parse_sse_delta(&line_str) {
-                    let mut chunk_to_emit = String::new();
-                    
-                    if let Some(reasoning_chunk) = parsed.reasoning {
-                        if !in_reasoning {
-                            in_reasoning = true;
-                            chunk_to_emit.push_str("<think>\n");
-                        }
-                        chunk_to_emit.push_str(&reasoning_chunk);
-                    }
-                    
-                    if let Some(content_chunk) = parsed.content {
-                        if in_reasoning {
-                            in_reasoning = false;
-                            chunk_to_emit.push_str("\n</think>\n");
-                        }
-                        chunk_to_emit.push_str(&content_chunk);
-                    }
-                    
-                    if !chunk_to_emit.is_empty() {
-                        full_response.push_str(&chunk_to_emit);
-                        let _ = app_handle.emit("chat-chunk", serde_json::json!({
-                            "run_id": run_id,
-                            "chunk": chunk_to_emit,
-                            "done": false,
-                            "error": serde_json::Value::Null
-                        }));
-                    }
-                }
-            }
-            
-            if in_reasoning {
-                full_response.push_str("\n</think>\n");
-                let _ = app_handle.emit("chat-chunk", serde_json::json!({
-                    "run_id": run_id,
-                    "chunk": "\n</think>\n".to_string(),
-                    "done": false,
-                    "error": serde_json::Value::Null
-                }));
-            }
-            
-            let _ = app_handle.emit("chat-chunk", serde_json::json!({
-                "run_id": run_id,
-                "chunk": "",
-                "done": true,
-                "error": serde_json::Value::Null
-            }));
-            
-            Ok(full_response)
-        } else {
-            let error_text = resp.into_string().unwrap_or_default();
-            let err_msg = format!("Anthropic API error: {}", error_text);
-            log_error(&err_msg);
-            Err(err_msg)
-        }
-    } else {
-        let url = if provider == "lmstudio" {
-            let base_cleaned = base_url
-                .trim_end_matches("/chat")
-                .trim_end_matches("/api/v1")
-                .trim_end_matches("/v1")
-                .trim_end_matches('/');
-            format!("{}/v1/chat/completions", base_cleaned)
-        } else {
-            if base_url.ends_with("/chat/completions") {
-                base_url.to_string()
-            } else if base_url.ends_with("/v1") {
-                format!("{}/chat/completions", base_url)
-            } else {
-                format!("{}/v1/chat/completions", base_url)
-            }
-        };
-
-        let is_stateful_lmstudio = url.ends_with("/chat");
-        let mut payload = if is_stateful_lmstudio {
-            let latest_input = messages.last()
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            serde_json::json!({
-                "model": model,
-                "input": latest_input,
-                "stream": true
-            })
-        } else {
-            serde_json::json!({
-                "model": model,
-                "messages": messages,
-                "temperature": 0.7,
-                "stream": true
-            })
-        };
-
-        if let Some(ref t) = tools {
-            if let Some(obj) = payload.as_object_mut() {
-                obj.insert("tools".to_string(), t.clone());
-                obj.insert("tool_choice".to_string(), serde_json::json!("auto"));
-            }
-        }
-
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(10))
-            .timeout_read(std::time::Duration::from_secs(300))
-            .build();
-        let mut req = agent.post(&url)
-            .set("Content-Type", "application/json");
-
-        if !settings.api_key.trim().is_empty() {
-            req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
-        }
-
-        let resp = req.send_json(payload).map_err(|e| {
-            let err_msg = format!("Network request failed: {}", e);
-            log_error(&err_msg);
-            err_msg
-        })?;
-
-        if resp.status() == 200 {
-            use std::io::{BufRead, BufReader};
-            let reader = BufReader::new(resp.into_reader());
-            let mut full_response = String::new();
-            let mut accumulated_tool_calls: Vec<ToolCallAccumulator> = Vec::new();
-            let mut in_reasoning = false;
-            
-            for line in reader.lines() {
-                if let Some(state_val) = app_handle.try_state::<AppState>() {
-                    let cancelled = state_val.cancelled_runs.lock().unwrap();
-                    if cancelled.contains(run_id) {
-                        return Err("Cancelled by user".to_string());
-                    }
-                }
-                let line_str = line.map_err(|e| e.to_string())?;
-                if let Some(parsed) = parse_sse_delta(&line_str) {
-                    let mut chunk_to_emit = String::new();
-                    
-                    if let Some(reasoning_chunk) = parsed.reasoning {
-                        if !in_reasoning {
-                            in_reasoning = true;
-                            chunk_to_emit.push_str("<think>\n");
-                        }
-                        chunk_to_emit.push_str(&reasoning_chunk);
-                    }
-                    
-                    if let Some(content_chunk) = parsed.content {
-                        if in_reasoning {
-                            in_reasoning = false;
-                            chunk_to_emit.push_str("\n</think>\n");
-                        }
-                        chunk_to_emit.push_str(&content_chunk);
-                    }
-                    
-                    if !chunk_to_emit.is_empty() {
-                        full_response.push_str(&chunk_to_emit);
-                        let _ = app_handle.emit("chat-chunk", serde_json::json!({
-                            "run_id": run_id,
-                            "chunk": chunk_to_emit,
-                            "done": false,
-                            "error": serde_json::Value::Null
-                        }));
-                    }
-                }
-                accumulate_sse_tool_calls(&line_str, &mut accumulated_tool_calls);
-            }
-            
-            if in_reasoning {
-                full_response.push_str("\n</think>\n");
-                let _ = app_handle.emit("chat-chunk", serde_json::json!({
-                    "run_id": run_id,
-                    "chunk": "\n</think>\n".to_string(),
-                    "done": false,
-                    "error": serde_json::Value::Null
-                }));
-            }
-            
-            if !accumulated_tool_calls.is_empty() {
-                if let Some(tc) = accumulated_tool_calls.first() {
-                    let name = tc.name.clone().unwrap_or_default();
-                    let args_parsed: serde_json::Value = serde_json::from_str(&tc.arguments)
-                        .unwrap_or_else(|_| serde_json::json!({}));
-                    let formatted = format!(
-                        "```tool_call\n{{\n  \"name\": \"{}\",\n  \"args\": {}\n}}\n```",
-                        name, args_parsed
-                    );
-                    full_response = formatted;
-                }
-            }
-            
-            let _ = app_handle.emit("chat-chunk", serde_json::json!({
-                "run_id": run_id,
-                "chunk": "",
-                "done": true,
-                "error": serde_json::Value::Null
-            }));
-            
-            Ok(full_response)
-        } else {
-            let error_text = resp.into_string().unwrap_or_default();
-            let err_msg = format!("LLM API error: {}", error_text);
-            log_error(&err_msg);
-            Err(err_msg)
+        ProviderKind::LmStudioStateful => call_lmstudio_stateful(
+            app_handle,
+            run_id,
+            &url,
+            &settings,
+            system_prompt,
+            &messages,
+        ),
+        ProviderKind::OpenAiCompat => {
+            call_openai_compat(app_handle, run_id, &url, &settings, messages, tools)
         }
     }
+}
+
+fn call_anthropic(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    url: &str,
+    settings: &LlmSettings,
+    system_prompt: &str,
+    messages: Vec<serde_json::Value>,
+    tools: Option<serde_json::Value>,
+) -> Result<String, String> {
+    // Anthropic requires strictly alternating user/assistant roles starting
+    // with `user`. get_history_messages already merges adjacent same-role
+    // messages; this is a final guard that also covers histories that begin
+    // with an assistant turn.
+    let mut anthropic_messages: Vec<serde_json::Value> = Vec::new();
+    for m in messages.iter() {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        if role == "system" {
+            continue;
+        }
+        let content = m
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        if anthropic_messages.is_empty() && role == "assistant" {
+            anthropic_messages.push(serde_json::json!({
+                "role": "user",
+                "content": "(conversation resumed)"
+            }));
+        }
+        if let Some(last) = anthropic_messages.last_mut() {
+            if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+                if let Some(last_content) = last.get_mut("content") {
+                    let merged = format!("{}\n\n{}", last_content.as_str().unwrap_or(""), content);
+                    *last_content = serde_json::json!(merged);
+                    continue;
+                }
+            }
+        }
+        anthropic_messages.push(serde_json::json!({ "role": role, "content": content }));
+    }
+    if anthropic_messages.is_empty() {
+        anthropic_messages.push(serde_json::json!({ "role": "user", "content": "(empty)" }));
+    }
+
+    let mut payload = serde_json::json!({
+        "model": settings.model,
+        "max_tokens": 4000,
+        "system": system_prompt,
+        "messages": anthropic_messages,
+        "stream": true
+    });
+
+    if let Some(ref t) = tools {
+        if let Some(obj) = payload.as_object_mut() {
+            // Anthropic uses its own tool schema, not the OpenAI function shape.
+            obj.insert("tools".to_string(), convert_tools_to_anthropic(t));
+        }
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(300))
+        .build();
+    let resp = match agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .set("x-api-key", &settings.api_key)
+        .set("anthropic-version", "2023-06-01")
+        .send_json(payload)
+    {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let err_msg = format!("Anthropic API error {}: {}", code, body);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+        Err(e) => {
+            let err_msg = format!("Anthropic network request failed: {}", e);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+    };
+
+    if resp.status() == 200 {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(resp.into_reader());
+        let mut full_response = String::new();
+        let mut accumulated_tool_calls: Vec<ToolCallAccumulator> = Vec::new();
+        let mut in_reasoning = false;
+
+        for line in reader.lines() {
+            if let Some(state_val) = app_handle.try_state::<AppState>() {
+                let cancelled = state_val.cancelled_runs.lock().unwrap();
+                if cancelled.contains(run_id) {
+                    return Err("Cancelled by user".to_string());
+                }
+            }
+            let line_str = line.map_err(|e| e.to_string())?;
+            if let Some(parsed) = parse_sse_delta(&line_str) {
+                let mut chunk_to_emit = String::new();
+
+                if let Some(reasoning_chunk) = parsed.reasoning {
+                    if !in_reasoning {
+                        in_reasoning = true;
+                        chunk_to_emit.push_str("<think>\n");
+                    }
+                    chunk_to_emit.push_str(&reasoning_chunk);
+                }
+
+                if let Some(content_chunk) = parsed.content {
+                    if in_reasoning {
+                        in_reasoning = false;
+                        chunk_to_emit.push_str("\n</think>\n");
+                    }
+                    chunk_to_emit.push_str(&content_chunk);
+                }
+
+                if !chunk_to_emit.is_empty() {
+                    full_response.push_str(&chunk_to_emit);
+                    let _ = app_handle.emit(
+                        "chat-chunk",
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "chunk": chunk_to_emit,
+                            "done": false,
+                            "error": serde_json::Value::Null
+                        }),
+                    );
+                }
+            }
+            accumulate_anthropic_tool_calls(&line_str, &mut accumulated_tool_calls);
+        }
+
+        if in_reasoning {
+            full_response.push_str("\n</think>\n");
+            emit_chunk(app_handle, run_id, "\n</think>\n", false);
+        }
+
+        bridge_tool_calls_into_text(&mut full_response, &accumulated_tool_calls);
+
+        emit_chunk(app_handle, run_id, "", true);
+
+        Ok(full_response)
+    } else {
+        let error_text = resp.into_string().unwrap_or_default();
+        let err_msg = format!("Anthropic API error: {}", error_text);
+        log_error(&err_msg);
+        Err(err_msg)
+    }
+}
+
+fn call_openai_compat(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    url: &str,
+    settings: &LlmSettings,
+    messages: Vec<serde_json::Value>,
+    tools: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let mut payload = serde_json::json!({
+        "model": settings.model,
+        "messages": messages,
+        "temperature": 0.7,
+        "stream": true
+    });
+
+    if let Some(ref t) = tools {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("tools".to_string(), t.clone());
+            obj.insert("tool_choice".to_string(), serde_json::json!("auto"));
+        }
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(300))
+        .build();
+    let mut req = agent.post(&url).set("Content-Type", "application/json");
+
+    if !settings.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
+    }
+
+    let resp = match req.send_json(payload) {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            // ureq returns non-2xx as Err(Status), so the body (which holds the
+            // server's actual explanation) is only reachable here, not via a
+            // non-200 Ok. Pull it out and surface it.
+            let body = resp.into_string().unwrap_or_default();
+            let err_msg = format!("LLM API error {}: {}", code, body);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+        Err(e) => {
+            let err_msg = format!("Network request failed: {}", e);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+    };
+
+    if resp.status() == 200 {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(resp.into_reader());
+        let mut full_response = String::new();
+        let mut accumulated_tool_calls: Vec<ToolCallAccumulator> = Vec::new();
+        let mut in_reasoning = false;
+
+        for line in reader.lines() {
+            if let Some(state_val) = app_handle.try_state::<AppState>() {
+                let cancelled = state_val.cancelled_runs.lock().unwrap();
+                if cancelled.contains(run_id) {
+                    return Err("Cancelled by user".to_string());
+                }
+            }
+            let line_str = line.map_err(|e| e.to_string())?;
+            if let Some(parsed) = parse_sse_delta(&line_str) {
+                let mut chunk_to_emit = String::new();
+
+                if let Some(reasoning_chunk) = parsed.reasoning {
+                    if !in_reasoning {
+                        in_reasoning = true;
+                        chunk_to_emit.push_str("<think>\n");
+                    }
+                    chunk_to_emit.push_str(&reasoning_chunk);
+                }
+
+                if let Some(content_chunk) = parsed.content {
+                    if in_reasoning {
+                        in_reasoning = false;
+                        chunk_to_emit.push_str("\n</think>\n");
+                    }
+                    chunk_to_emit.push_str(&content_chunk);
+                }
+
+                if !chunk_to_emit.is_empty() {
+                    full_response.push_str(&chunk_to_emit);
+                    let _ = app_handle.emit(
+                        "chat-chunk",
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "chunk": chunk_to_emit,
+                            "done": false,
+                            "error": serde_json::Value::Null
+                        }),
+                    );
+                }
+            }
+            accumulate_sse_tool_calls(&line_str, &mut accumulated_tool_calls);
+        }
+
+        if in_reasoning {
+            full_response.push_str("\n</think>\n");
+            let _ = app_handle.emit(
+                "chat-chunk",
+                serde_json::json!({
+                    "run_id": run_id,
+                    "chunk": "\n</think>\n".to_string(),
+                    "done": false,
+                    "error": serde_json::Value::Null
+                }),
+            );
+        }
+
+        bridge_tool_calls_into_text(&mut full_response, &accumulated_tool_calls);
+
+        let _ = app_handle.emit(
+            "chat-chunk",
+            serde_json::json!({
+                "run_id": run_id,
+                "chunk": "",
+                "done": true,
+                "error": serde_json::Value::Null
+            }),
+        );
+
+        Ok(full_response)
+    } else {
+        let error_text = resp.into_string().unwrap_or_default();
+        let err_msg = format!("LLM API error: {}", error_text);
+        log_error(&err_msg);
+        Err(err_msg)
+    }
+}
+
+fn call_ollama_native(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    url: &str,
+    settings: &LlmSettings,
+    messages: Vec<serde_json::Value>,
+    tools: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let mut payload = serde_json::json!({
+        "model": settings.model,
+        "messages": messages,
+        "stream": true
+    });
+    if let Some(ref t) = tools {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("tools".to_string(), t.clone());
+        }
+    }
+
+    let agent = http_agent();
+    let mut req = agent.post(url).set("Content-Type", "application/json");
+    if !settings.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
+    }
+
+    let resp = match req.send_json(payload) {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let err_msg = format!("Ollama API error {}: {}", code, body);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+        Err(e) => {
+            let err_msg = format!("Ollama network request failed: {}", e);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+    };
+
+    if resp.status() != 200 {
+        let error_text = resp.into_string().unwrap_or_default();
+        let err_msg = format!("Ollama API error: {}", error_text);
+        log_error(&err_msg);
+        return Err(err_msg);
+    }
+
+    use std::io::{BufRead, BufReader};
+    // Ollama streams NDJSON: each line is one complete JSON object, no SSE framing.
+    let reader = BufReader::new(resp.into_reader());
+    let mut full_response = String::new();
+    let mut accumulated_tool_calls: Vec<ToolCallAccumulator> = Vec::new();
+    let mut in_reasoning = false;
+
+    for line in reader.lines() {
+        if run_is_cancelled(app_handle, run_id) {
+            return Err("Cancelled by user".to_string());
+        }
+        let line_str = line.map_err(|e| e.to_string())?;
+        let trimmed = line_str.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let json: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        if let Some(err) = json.get("error") {
+            let err_msg = format!("Ollama error: {}", err);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+
+        let msg = json.get("message");
+        let mut chunk_to_emit = String::new();
+
+        if let Some(thinking) = msg.and_then(|m| m.get("thinking")).and_then(|t| t.as_str()) {
+            if !thinking.is_empty() {
+                if !in_reasoning {
+                    in_reasoning = true;
+                    chunk_to_emit.push_str("<think>\n");
+                }
+                chunk_to_emit.push_str(thinking);
+            }
+        }
+        if let Some(content) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+            if !content.is_empty() {
+                if in_reasoning {
+                    in_reasoning = false;
+                    chunk_to_emit.push_str("\n</think>\n");
+                }
+                chunk_to_emit.push_str(content);
+            }
+        }
+        if let Some(tool_calls) = msg
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+        {
+            for tc in tool_calls {
+                if let Some(func) = tc.get("function") {
+                    accumulated_tool_calls.push(ToolCallAccumulator {
+                        id: None,
+                        name: func
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string()),
+                        // Ollama sends arguments as a JSON object, not a string.
+                        arguments: func
+                            .get("arguments")
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "{}".to_string()),
+                    });
+                }
+            }
+        }
+
+        if !chunk_to_emit.is_empty() {
+            full_response.push_str(&chunk_to_emit);
+            emit_chunk(app_handle, run_id, &chunk_to_emit, false);
+        }
+
+        if json.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            break;
+        }
+    }
+
+    if in_reasoning {
+        full_response.push_str("\n</think>\n");
+        emit_chunk(app_handle, run_id, "\n</think>\n", false);
+    }
+
+    bridge_tool_calls_into_text(&mut full_response, &accumulated_tool_calls);
+
+    emit_chunk(app_handle, run_id, "", true);
+    Ok(full_response)
+}
+
+fn call_lmstudio_stateful(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    url: &str,
+    settings: &LlmSettings,
+    system_prompt: &str,
+    messages: &[serde_json::Value],
+) -> Result<String, String> {
+    // History lives server-side: chain previous_response_id -> response_id per
+    // run/chat key so each thread continues from its own last good point.
+    let previous_response_id: Option<String> = app_handle
+        .try_state::<AppState>()
+        .and_then(|s| s.lmstudio_response_ids.lock().unwrap().get(run_id).cloned());
+
+    let non_system: Vec<&serde_json::Value> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"))
+        .collect();
+
+    // With an existing chain, only the newest message needs to be sent. With no
+    // chain but multiple local messages (first call after an app restart lost
+    // the in-memory chain), replay local history as a transcript so context
+    // isn't silently dropped.
+    let input_text = if previous_response_id.is_some() || non_system.len() <= 1 {
+        non_system
+            .last()
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string()
+    } else {
+        let mut transcript =
+            String::from("[Replaying prior conversation after session restart]\n\n");
+        for m in &non_system {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            transcript.push_str(&format!("[{}]: {}\n\n", role.to_uppercase(), content));
+        }
+        transcript
+    };
+
+    let mut payload = serde_json::json!({
+        "model": settings.model,
+        "input": input_text,
+        "system_prompt": system_prompt,
+        "stream": true
+    });
+    if let Some(ref prev) = previous_response_id {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("previous_response_id".to_string(), serde_json::json!(prev));
+        }
+    }
+
+    let agent = http_agent();
+    let mut req = agent.post(url).set("Content-Type", "application/json");
+    if !settings.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
+    }
+
+    let resp = match req.send_json(payload) {
+        Ok(resp) => resp,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let err_msg = format!("LM Studio API error {}: {}", code, body);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+        Err(e) => {
+            let err_msg = format!("LM Studio network request failed: {}", e);
+            log_error(&err_msg);
+            return Err(err_msg);
+        }
+    };
+
+    if resp.status() != 200 {
+        let error_text = resp.into_string().unwrap_or_default();
+        let err_msg = format!("LM Studio API error: {}", error_text);
+        log_error(&err_msg);
+        return Err(err_msg);
+    }
+
+    use std::io::{BufRead, BufReader};
+    // Named SSE events: `event: <type>` lines followed by `data: <json>` lines.
+    // The data payload carries its own `type` field, so data lines are enough.
+    let reader = BufReader::new(resp.into_reader());
+    let mut full_response = String::new();
+    let mut in_reasoning = false;
+
+    for line in reader.lines() {
+        if run_is_cancelled(app_handle, run_id) {
+            return Err("Cancelled by user".to_string());
+        }
+        let line_str = line.map_err(|e| e.to_string())?;
+        let trimmed = line_str.trim();
+        let data = match trimmed.strip_prefix("data: ") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(data) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+
+        match json.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "reasoning.delta" => {
+                if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
+                    let mut chunk_to_emit = String::new();
+                    if !in_reasoning {
+                        in_reasoning = true;
+                        chunk_to_emit.push_str("<think>\n");
+                    }
+                    chunk_to_emit.push_str(content);
+                    full_response.push_str(&chunk_to_emit);
+                    emit_chunk(app_handle, run_id, &chunk_to_emit, false);
+                }
+            }
+            "message.delta" => {
+                if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
+                    let mut chunk_to_emit = String::new();
+                    if in_reasoning {
+                        in_reasoning = false;
+                        chunk_to_emit.push_str("\n</think>\n");
+                    }
+                    chunk_to_emit.push_str(content);
+                    full_response.push_str(&chunk_to_emit);
+                    emit_chunk(app_handle, run_id, &chunk_to_emit, false);
+                }
+            }
+            "error" => {
+                let detail = json
+                    .get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown streaming error".to_string());
+                let err_msg = format!("LM Studio stream error: {}", detail);
+                log_error(&err_msg);
+                return Err(err_msg);
+            }
+            "chat.end" => {
+                let response_id = json
+                    .get("result")
+                    .and_then(|r| r.get("response_id"))
+                    .or_else(|| json.get("response_id"))
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+                if let Some(rid) = response_id {
+                    if let Some(state_val) = app_handle.try_state::<AppState>() {
+                        let mut ids = state_val.lmstudio_response_ids.lock().unwrap();
+                        ids.insert(run_id.to_string(), rid);
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    if in_reasoning {
+        full_response.push_str("\n</think>\n");
+        emit_chunk(app_handle, run_id, "\n</think>\n", false);
+    }
+
+    emit_chunk(app_handle, run_id, "", true);
+    Ok(full_response)
 }
 
 #[tauri::command]
@@ -1683,19 +2404,23 @@ pub fn send_design_chat(
     message: String,
 ) -> Result<(), String> {
     let cleaned_path = clean_project_path(&project_path);
-    let log_key = format!("{}/design/{}", cleaned_path.to_string_lossy().replace('\\', "/"), doc_name);
-    
+    let log_key = format!(
+        "{}/design/{}",
+        cleaned_path.to_string_lossy().replace('\\', "/"),
+        doc_name
+    );
+
     let mut logs = state.design_logs.lock().unwrap();
     let events = logs.entry(log_key.clone()).or_insert_with(Vec::new);
     let user_msg = serde_json::json!({ "role": "user", "content": message });
     let user_payload = serde_json::to_string(&user_msg).unwrap_or_default();
-    
+
     events.push(RunEvent {
         run_id: log_key.clone(),
         event_type: "message".to_string(),
         payload: user_payload,
     });
-    
+
     drop(logs);
 
     let app_handle_clone = app_handle.clone();
@@ -1705,7 +2430,7 @@ pub fn send_design_chat(
 
     tauri::async_runtime::spawn(async move {
         let state = app_handle_clone.state::<AppState>();
-        
+
         // Ensure no concurrent run loops run for this log_key
         {
             let mut active = state.active_runs.lock().unwrap();
@@ -1714,7 +2439,7 @@ pub fn send_design_chat(
             }
             active.insert(log_key_clone.clone());
         }
-        
+
         let _guard = ActiveRunGuard {
             app_handle: app_handle_clone.clone(),
             run_id: log_key_clone.clone(),
@@ -1722,14 +2447,17 @@ pub fn send_design_chat(
 
         let max_steps = 10;
         let mut step = 0;
-        
+
         loop {
             if step >= max_steps {
-                let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": log_key_clone }));
+                let _ = app_handle_clone.emit(
+                    "chat-finished",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
                 break;
             }
             step += 1;
-            
+
             let history = {
                 let logs = state.design_logs.lock().unwrap();
                 if let Some(evs) = logs.get(&log_key_clone) {
@@ -1738,11 +2466,27 @@ pub fn send_design_chat(
                     Vec::new()
                 }
             };
-            
-            let system_prompt = construct_architect_system_prompt(&cleaned_path_clone, &doc_name_clone);
-            let tools_schema = get_openai_tools_schema(&["read_file", "outline_file", "write_file", "list_dir", "web_search", "send_notification", "search_grep", "patch_file"]);
-            
-            let response = match call_llm(&app_handle_clone, &log_key_clone, &system_prompt, history, Some(tools_schema)) {
+
+            let system_prompt =
+                construct_architect_system_prompt(&cleaned_path_clone, &doc_name_clone);
+            let tools_schema = get_openai_tools_schema(&[
+                "read_file",
+                "outline_file",
+                "write_file",
+                "list_dir",
+                "web_search",
+                "send_notification",
+                "search_grep",
+                "patch_file",
+            ]);
+
+            let response = match call_llm(
+                &app_handle_clone,
+                &log_key_clone,
+                &system_prompt,
+                history,
+                Some(tools_schema),
+            ) {
                 Ok(reply) => reply,
                 Err(e) => {
                     log_error(&format!("Design chat LLM error: {}", e));
@@ -1761,53 +2505,106 @@ pub fn send_design_chat(
                                 payload: serde_json::json!({
                                     "role": "agent",
                                     "content": "Chat stopped by user."
-                                }).to_string(),
+                                })
+                                .to_string(),
                             });
                         }
-                        let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
+                        let _ = app_handle_clone.emit(
+                            "run-updated",
+                            serde_json::json!({ "run_id": log_key_clone }),
+                        );
                     }
-                    let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": log_key_clone }));
+                    let _ = app_handle_clone.emit(
+                        "chat-finished",
+                        serde_json::json!({ "run_id": log_key_clone }),
+                    );
                     break;
                 }
             };
-            
+
             let (reasoning, remaining) = extract_reasoning(&response);
             if let Some(reasoning_content) = reasoning {
-                append_design_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "reasoning".to_string(),
-                    payload: reasoning_content,
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
+                append_design_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "reasoning".to_string(),
+                        payload: reasoning_content,
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
             }
-            
+
             if let Some((tool_name, args)) = parse_tool_call(&remaining) {
-                append_design_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "tool_call".to_string(),
-                    payload: serde_json::json!({ "name": tool_name.clone(), "args": args.clone() }).to_string(),
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
-                
-                let tool_result = execute_tool(&app_handle_clone, &cleaned_path_clone, &tool_name, &args, &log_key_clone);
-                
-                append_design_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "tool_result".to_string(),
-                    payload: serde_json::json!({ "name": tool_name.clone(), "result": tool_result }).to_string(),
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
-                
+                append_design_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "tool_call".to_string(),
+                        payload:
+                            serde_json::json!({ "name": tool_name.clone(), "args": args.clone() })
+                                .to_string(),
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
+
+                let tool_result = execute_tool(
+                    &app_handle_clone,
+                    &cleaned_path_clone,
+                    &tool_name,
+                    &args,
+                    &log_key_clone,
+                );
+
+                append_design_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "tool_result".to_string(),
+                        payload:
+                            serde_json::json!({ "name": tool_name.clone(), "result": tool_result })
+                                .to_string(),
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
+
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             } else {
-                let payload = serde_json::json!({ "role": "agent", "content": remaining.clone() }).to_string();
-                append_design_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "message".to_string(),
-                    payload,
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
-                let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": log_key_clone }));
+                let payload = serde_json::json!({ "role": "agent", "content": remaining.clone() })
+                    .to_string();
+                append_design_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "message".to_string(),
+                        payload,
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
+                let _ = app_handle_clone.emit(
+                    "chat-finished",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
                 break;
             }
         }
@@ -1823,7 +2620,11 @@ pub fn get_design_log(
     doc_name: String,
 ) -> Result<Vec<RunEvent>, String> {
     let cleaned_path = clean_project_path(&project_path);
-    let log_key = format!("{}/design/{}", cleaned_path.to_string_lossy().replace('\\', "/"), doc_name);
+    let log_key = format!(
+        "{}/design/{}",
+        cleaned_path.to_string_lossy().replace('\\', "/"),
+        doc_name
+    );
     let logs = state.design_logs.lock().unwrap();
     if let Some(events) = logs.get(&log_key) {
         Ok(events.clone())
@@ -1841,19 +2642,23 @@ pub fn send_code_chat(
     message: String,
 ) -> Result<(), String> {
     let cleaned_path = clean_project_path(&project_path);
-    let log_key = format!("{}/code/{}", cleaned_path.to_string_lossy().replace('\\', "/"), file_path);
-    
+    let log_key = format!(
+        "{}/code/{}",
+        cleaned_path.to_string_lossy().replace('\\', "/"),
+        file_path
+    );
+
     let mut logs = state.code_logs.lock().unwrap();
     let events = logs.entry(log_key.clone()).or_insert_with(Vec::new);
     let user_msg = serde_json::json!({ "role": "user", "content": message });
     let user_payload = serde_json::to_string(&user_msg).unwrap_or_default();
-    
+
     events.push(RunEvent {
         run_id: log_key.clone(),
         event_type: "message".to_string(),
         payload: user_payload,
     });
-    
+
     drop(logs);
 
     let app_handle_clone = app_handle.clone();
@@ -1863,7 +2668,7 @@ pub fn send_code_chat(
 
     tauri::async_runtime::spawn(async move {
         let state = app_handle_clone.state::<AppState>();
-        
+
         // Ensure no concurrent run loops run for this log_key
         {
             let mut active = state.active_runs.lock().unwrap();
@@ -1872,7 +2677,7 @@ pub fn send_code_chat(
             }
             active.insert(log_key_clone.clone());
         }
-        
+
         let _guard = ActiveRunGuard {
             app_handle: app_handle_clone.clone(),
             run_id: log_key_clone.clone(),
@@ -1880,14 +2685,17 @@ pub fn send_code_chat(
 
         let max_steps = 10;
         let mut step = 0;
-        
+
         loop {
             if step >= max_steps {
-                let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": log_key_clone }));
+                let _ = app_handle_clone.emit(
+                    "chat-finished",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
                 break;
             }
             step += 1;
-            
+
             let history = {
                 let logs = state.code_logs.lock().unwrap();
                 if let Some(evs) = logs.get(&log_key_clone) {
@@ -1896,11 +2704,29 @@ pub fn send_code_chat(
                     Vec::new()
                 }
             };
-            
-            let system_prompt = construct_copilot_system_prompt(&cleaned_path_clone, &file_path_clone);
-            let tools_schema = get_openai_tools_schema(&["read_file", "outline_file", "write_file", "list_dir", "git_status", "git_diff", "run_command", "web_search", "search_grep", "patch_file"]);
-            
-            let response = match call_llm(&app_handle_clone, &log_key_clone, &system_prompt, history, Some(tools_schema)) {
+
+            let system_prompt =
+                construct_copilot_system_prompt(&cleaned_path_clone, &file_path_clone);
+            let tools_schema = get_openai_tools_schema(&[
+                "read_file",
+                "outline_file",
+                "write_file",
+                "list_dir",
+                "git_status",
+                "git_diff",
+                "run_command",
+                "web_search",
+                "search_grep",
+                "patch_file",
+            ]);
+
+            let response = match call_llm(
+                &app_handle_clone,
+                &log_key_clone,
+                &system_prompt,
+                history,
+                Some(tools_schema),
+            ) {
                 Ok(reply) => reply,
                 Err(e) => {
                     log_error(&format!("Code chat LLM error: {}", e));
@@ -1919,53 +2745,106 @@ pub fn send_code_chat(
                                 payload: serde_json::json!({
                                     "role": "agent",
                                     "content": "Chat stopped by user."
-                                }).to_string(),
+                                })
+                                .to_string(),
                             });
                         }
-                        let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
+                        let _ = app_handle_clone.emit(
+                            "run-updated",
+                            serde_json::json!({ "run_id": log_key_clone }),
+                        );
                     }
-                    let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": log_key_clone }));
+                    let _ = app_handle_clone.emit(
+                        "chat-finished",
+                        serde_json::json!({ "run_id": log_key_clone }),
+                    );
                     break;
                 }
             };
-            
+
             let (reasoning, remaining) = extract_reasoning(&response);
             if let Some(reasoning_content) = reasoning {
-                append_code_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "reasoning".to_string(),
-                    payload: reasoning_content,
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
+                append_code_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "reasoning".to_string(),
+                        payload: reasoning_content,
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
             }
-            
+
             if let Some((tool_name, args)) = parse_tool_call(&remaining) {
-                append_code_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "tool_call".to_string(),
-                    payload: serde_json::json!({ "name": tool_name.clone(), "args": args.clone() }).to_string(),
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
-                
-                let tool_result = execute_tool(&app_handle_clone, &cleaned_path_clone, &tool_name, &args, &log_key_clone);
-                
-                append_code_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "tool_result".to_string(),
-                    payload: serde_json::json!({ "name": tool_name.clone(), "result": tool_result }).to_string(),
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
-                
+                append_code_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "tool_call".to_string(),
+                        payload:
+                            serde_json::json!({ "name": tool_name.clone(), "args": args.clone() })
+                                .to_string(),
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
+
+                let tool_result = execute_tool(
+                    &app_handle_clone,
+                    &cleaned_path_clone,
+                    &tool_name,
+                    &args,
+                    &log_key_clone,
+                );
+
+                append_code_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "tool_result".to_string(),
+                        payload:
+                            serde_json::json!({ "name": tool_name.clone(), "result": tool_result })
+                                .to_string(),
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
+
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             } else {
-                let payload = serde_json::json!({ "role": "agent", "content": remaining.clone() }).to_string();
-                append_code_event(&app_handle_clone, &state, &log_key_clone, RunEvent {
-                    run_id: log_key_clone.clone(),
-                    event_type: "message".to_string(),
-                    payload,
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": log_key_clone }));
-                let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": log_key_clone }));
+                let payload = serde_json::json!({ "role": "agent", "content": remaining.clone() })
+                    .to_string();
+                append_code_event(
+                    &app_handle_clone,
+                    &state,
+                    &log_key_clone,
+                    RunEvent {
+                        run_id: log_key_clone.clone(),
+                        event_type: "message".to_string(),
+                        payload,
+                    },
+                );
+                let _ = app_handle_clone.emit(
+                    "run-updated",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
+                let _ = app_handle_clone.emit(
+                    "chat-finished",
+                    serde_json::json!({ "run_id": log_key_clone }),
+                );
                 break;
             }
         }
@@ -1981,7 +2860,11 @@ pub fn get_code_log(
     file_path: String,
 ) -> Result<Vec<RunEvent>, String> {
     let cleaned_path = clean_project_path(&project_path);
-    let log_key = format!("{}/code/{}", cleaned_path.to_string_lossy().replace('\\', "/"), file_path);
+    let log_key = format!(
+        "{}/code/{}",
+        cleaned_path.to_string_lossy().replace('\\', "/"),
+        file_path
+    );
     let logs = state.code_logs.lock().unwrap();
     if let Some(events) = logs.get(&log_key) {
         Ok(events.clone())
@@ -1991,9 +2874,13 @@ pub fn get_code_log(
 }
 
 #[tauri::command]
-pub fn list_cards(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, project_path: String) -> Vec<Card> {
+pub fn list_cards(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    project_path: String,
+) -> Vec<Card> {
     let mut cards = state.cards.lock().unwrap();
-    
+
     let has_cards = cards.iter().any(|c| c.project_path == project_path);
     if !has_cards {
         if let Ok(conn) = get_db_conn(&app_handle) {
@@ -2002,15 +2889,23 @@ pub fn list_cards(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
             }
         }
     }
-    
-    cards.iter()
+
+    cards
+        .iter()
         .filter(|c| c.project_path == project_path)
         .cloned()
         .collect()
 }
 
 #[tauri::command]
-pub fn create_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, project_path: String, title: String, description: String, status: Option<String>) -> Card {
+pub fn create_card(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    project_path: String,
+    title: String,
+    description: String,
+    status: Option<String>,
+) -> Card {
     let mut cards = state.cards.lock().unwrap();
     let initial_status = status.unwrap_or_else(|| "backlog".to_string());
     let new_card = Card {
@@ -2024,30 +2919,35 @@ pub fn create_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppStat
         todo_list: Vec::new(),
     };
     cards.push(new_card.clone());
-    
+
     if let Ok(conn) = get_db_conn(&app_handle) {
         let _ = conn.execute(
             "INSERT INTO cards (id, project_path, title, description, status, run_id, assignee) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (&new_card.id, &new_card.project_path, &new_card.title, &new_card.description, &new_card.status, &new_card.run_id, &new_card.assignee),
         );
     }
-    
+
     new_card
 }
 
 #[tauri::command]
-pub fn update_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, card_id: String, status: String) -> Result<Card, String> {
+pub fn update_card(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    card_id: String,
+    status: String,
+) -> Result<Card, String> {
     let mut cards = state.cards.lock().unwrap();
     if let Some(card) = cards.iter_mut().find(|c| c.id == card_id) {
         card.status = status.clone();
-        
+
         if let Ok(conn) = get_db_conn(&app_handle) {
             let _ = conn.execute(
                 "UPDATE cards SET status = ?1 WHERE id = ?2",
                 (&status, &card_id),
             );
         }
-        
+
         Ok(card.clone())
     } else {
         Err("Card not found".to_string())
@@ -2055,7 +2955,11 @@ pub fn update_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppStat
 }
 
 #[tauri::command]
-pub fn save_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, card: Card) -> Result<Card, String> {
+pub fn save_card(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    card: Card,
+) -> Result<Card, String> {
     let mut cards = state.cards.lock().unwrap();
     if let Some(c) = cards.iter_mut().find(|item| item.id == card.id) {
         c.title = card.title;
@@ -2064,13 +2968,13 @@ pub fn save_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>
         c.todo_list = card.todo_list;
         c.status = card.status;
         c.project_path = card.project_path;
-        
+
         if let Ok(conn) = get_db_conn(&app_handle) {
             let _ = conn.execute(
                 "UPDATE cards SET title = ?1, description = ?2, status = ?3, run_id = ?4, assignee = ?5, project_path = ?6 WHERE id = ?7",
                 (&c.title, &c.description, &c.status, &c.run_id, &c.assignee, &c.project_path, &c.id),
             );
-            
+
             let _ = conn.execute("DELETE FROM todo_items WHERE card_id = ?1", [&c.id]);
             for (idx, item) in c.todo_list.iter().enumerate() {
                 let _ = conn.execute(
@@ -2079,7 +2983,7 @@ pub fn save_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>
                 );
             }
         }
-        
+
         Ok(c.clone())
     } else {
         Err("Card not found".to_string())
@@ -2087,16 +2991,20 @@ pub fn save_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>
 }
 
 #[tauri::command]
-pub fn delete_card(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, card_id: String) -> Result<(), String> {
+pub fn delete_card(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    card_id: String,
+) -> Result<(), String> {
     let mut cards = state.cards.lock().unwrap();
     let pos = cards.iter().position(|c| c.id == card_id);
     if let Some(idx) = pos {
         cards.remove(idx);
-        
+
         if let Ok(conn) = get_db_conn(&app_handle) {
             let _ = conn.execute("DELETE FROM cards WHERE id = ?1", [&card_id]);
         }
-        
+
         Ok(())
     } else {
         Err("Card not found".to_string())
@@ -2111,7 +3019,11 @@ pub fn start_run(
 ) -> Result<String, String> {
     let mut cards = state.cards.lock().unwrap();
     if let Some(card) = cards.iter_mut().find(|c| c.id == card_id) {
-        let run_id = format!("run_{}_{}", card_id, chrono::Local::now().format("%Y%m%d%H%M%S"));
+        let run_id = format!(
+            "run_{}_{}",
+            card_id,
+            chrono::Local::now().format("%Y%m%d%H%M%S")
+        );
 
         // Clear any stale cancellation flag so a fresh run can never begin life
         // already-cancelled (the cancelled set is never otherwise pruned).
@@ -2127,12 +3039,19 @@ pub fn start_run(
         if !git::is_git_repo(&repo_path) {
             return Err("This project is not a git repository. BeetleAI requires git so each run is isolated in a worktree. Run `git init` in the project root and try again.".to_string());
         }
-        let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
+        let base_branch =
+            git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
         git::create_worktree(&repo_path, &run_id, &base_branch)?;
 
         card.run_id = Some(run_id.clone());
         card.status = "running".to_string();
-        
+        let card_title = card.title.clone();
+        let card_desc = card.description.clone();
+        let task_payload = serde_json::json!({
+            "role": "user",
+            "content": format!("Your assigned task:\nTitle: {}\nDescription: {}\n\nBegin working on this task now using the available tools. Call task_complete when finished.", card_title, card_desc)
+        }).to_string();
+
         if let Ok(conn) = get_db_conn(&app_handle) {
             let _ = conn.execute(
                 "UPDATE cards SET status = 'running', run_id = ?1 WHERE id = ?2",
@@ -2146,6 +3065,10 @@ pub fn start_run(
             let _ = conn.execute(
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
                 ("run", &card.id, &run_id, "message", content),
+            );
+            let _ = conn.execute(
+                "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("run", &card.id, &run_id, "message", &task_payload),
             );
         }
 
@@ -2163,14 +3086,19 @@ pub fn start_run(
                     event_type: "message".to_string(),
                     payload: "{\"role\":\"agent\",\"content\":\"Run started. Isolated git worktree sandbox created. Spawning agent loop...\"}".to_string(),
                 },
+                RunEvent {
+                    run_id: run_id.clone(),
+                    event_type: "message".to_string(),
+                    payload: task_payload.clone(),
+                },
             ],
         );
-        
+
         drop(cards);
         drop(logs);
-        
+
         run_agent_loop(app_handle, run_id.clone(), card_id);
-        
+
         Ok(run_id)
     } else {
         Err("Card not found".to_string())
@@ -2178,19 +3106,30 @@ pub fn start_run(
 }
 
 #[tauri::command]
-pub fn cancel_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+pub fn cancel_run(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<(), String> {
     abort_chat(app_handle, state, run_id)
 }
 
 #[tauri::command]
-pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+pub fn abort_chat(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<(), String> {
     let mut cancelled = state.cancelled_runs.lock().unwrap();
     cancelled.insert(run_id.clone());
     drop(cancelled);
-    
+
     let card_info_opt = {
         let mut cards = state.cards.lock().unwrap();
-        if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
+        if let Some(card) = cards
+            .iter_mut()
+            .find(|c| c.run_id.as_deref() == Some(&run_id))
+        {
             card.status = "failed".to_string();
             if let Ok(conn) = get_db_conn(&app_handle) {
                 let _ = conn.execute(
@@ -2203,13 +3142,13 @@ pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
             None
         }
     };
-    
+
     if let Some((card_id, project_path)) = &card_info_opt {
         let repo_path = clean_project_path(project_path);
         if git::is_git_repo(&repo_path) {
             let _ = git::remove_worktree(&repo_path, &run_id);
         }
-        
+
         if let Ok(conn) = get_db_conn(&app_handle) {
             let _ = conn.execute(
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2236,7 +3175,7 @@ pub fn abort_chat(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
             });
         }
     }
-    
+
     Ok(())
 }
 
@@ -2254,7 +3193,10 @@ pub fn unblock_run(
     reply: String,
 ) -> Result<(), String> {
     let mut cards = state.cards.lock().unwrap();
-    if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
+    if let Some(card) = cards
+        .iter_mut()
+        .find(|c| c.run_id.as_deref() == Some(&run_id))
+    {
         // Only paused-but-recoverable runs can be resumed. `blocked` (question, error,
         // or step ceiling) and `review` (reopen for more work) are resumable;
         // `done`/`failed` are terminal and their worktrees may already be gone.
@@ -2275,19 +3217,19 @@ pub fn unblock_run(
         card.status = "running".to_string();
         let card_id = card.id.clone();
         drop(cards);
-        
+
         if let Ok(conn) = get_db_conn(&app_handle) {
             let _ = conn.execute(
                 "UPDATE cards SET status = 'running' WHERE id = ?1",
                 [&card_id],
             );
         }
-        
+
         let mut logs = state.run_logs.lock().unwrap();
         if let Some(run_events) = logs.get_mut(&run_id) {
             let user_msg = serde_json::json!({ "role": "user", "content": reply });
             let user_payload = serde_json::to_string(&user_msg).unwrap_or_default();
-            
+
             if let Ok(conn) = get_db_conn(&app_handle) {
                 let _ = conn.execute(
                     "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2302,7 +3244,7 @@ pub fn unblock_run(
             });
         }
         drop(logs);
-        
+
         run_agent_loop(app_handle, run_id, card_id);
         Ok(())
     } else {
@@ -2311,16 +3253,20 @@ pub fn unblock_run(
 }
 
 #[tauri::command]
-pub fn accept_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+pub fn accept_run(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<(), String> {
     let mut cards = state.cards.lock().unwrap();
-    if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
+    if let Some(card) = cards
+        .iter_mut()
+        .find(|c| c.run_id.as_deref() == Some(&run_id))
+    {
         card.status = "done".to_string();
 
         if let Ok(conn) = get_db_conn(&app_handle) {
-            let _ = conn.execute(
-                "UPDATE cards SET status = 'done' WHERE id = ?1",
-                [&card.id],
-            );
+            let _ = conn.execute("UPDATE cards SET status = 'done' WHERE id = ?1", [&card.id]);
             let _ = conn.execute(
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
                 ("run", &card.id, &run_id, "status", "done"),
@@ -2334,7 +3280,8 @@ pub fn accept_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
 
         let repo_path = clean_project_path(&card.project_path);
         if git::is_git_repo(&repo_path) {
-            let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
+            let base_branch =
+                git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
             git::merge_worktree(&repo_path, &run_id, &base_branch)?;
         }
 
@@ -2358,9 +3305,16 @@ pub fn accept_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
 }
 
 #[tauri::command]
-pub fn reject_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState>, run_id: String) -> Result<(), String> {
+pub fn reject_run(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<(), String> {
     let mut cards = state.cards.lock().unwrap();
-    if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
+    if let Some(card) = cards
+        .iter_mut()
+        .find(|c| c.run_id.as_deref() == Some(&run_id))
+    {
         card.status = "failed".to_string();
 
         if let Ok(conn) = get_db_conn(&app_handle) {
@@ -2372,7 +3326,8 @@ pub fn reject_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
                 ("run", &card.id, &run_id, "status", "failed"),
             );
-            let content = "{\"role\":\"agent\",\"content\":\"Worktree discarded and branch deleted.\"}";
+            let content =
+                "{\"role\":\"agent\",\"content\":\"Worktree discarded and branch deleted.\"}";
             let _ = conn.execute(
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
                 ("run", &card.id, &run_id, "message", content),
@@ -2394,7 +3349,9 @@ pub fn reject_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
             run_events.push(RunEvent {
                 run_id: run_id.clone(),
                 event_type: "message".to_string(),
-                payload: "{\"role\":\"agent\",\"content\":\"Worktree discarded and branch deleted.\"}".to_string(),
+                payload:
+                    "{\"role\":\"agent\",\"content\":\"Worktree discarded and branch deleted.\"}"
+                        .to_string(),
             });
         }
         Ok(())
@@ -2404,7 +3361,10 @@ pub fn reject_run(app_handle: tauri::AppHandle, state: tauri::State<'_, AppState
 }
 
 #[tauri::command]
-pub fn get_run_log(state: tauri::State<'_, AppState>, run_id: String) -> Result<Vec<RunEvent>, String> {
+pub fn get_run_log(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<Vec<RunEvent>, String> {
     let logs = state.run_logs.lock().unwrap();
     if let Some(events) = logs.get(&run_id) {
         Ok(events.clone())
@@ -2424,29 +3384,32 @@ pub fn send_chat(
     if let Some(run_events) = logs.get_mut(&run_id) {
         let user_msg = serde_json::json!({ "role": "user", "content": message });
         let user_payload = serde_json::to_string(&user_msg).unwrap_or_default();
-        
+
         run_events.push(RunEvent {
             run_id: run_id.clone(),
             event_type: "message".to_string(),
             payload: user_payload,
         });
-        
+
         drop(logs);
-        
+
         // Resume loop by setting card status back to "running"
         let mut cards = state.cards.lock().unwrap();
-        let card_id = if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(&run_id)) {
+        let card_id = if let Some(card) = cards
+            .iter_mut()
+            .find(|c| c.run_id.as_deref() == Some(&run_id))
+        {
             card.status = "running".to_string();
             Some(card.id.clone())
         } else {
             None
         };
         drop(cards);
-        
+
         if let Some(c_id) = card_id {
             run_agent_loop(app_handle, run_id, c_id);
         }
-        
+
         Ok(())
     } else {
         Err("Run not found".to_string())
@@ -2457,7 +3420,8 @@ pub fn send_chat(
 pub fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Result<String, String> {
     let repo_path = repo_path_for_run(&state, &run_id).unwrap_or_else(get_repo_path);
     if git::is_git_repo(&repo_path) {
-        let base_branch = git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
+        let base_branch =
+            git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
         match git::get_diff(&repo_path, &run_id, &base_branch) {
             Ok(diff) => {
                 if diff.trim().is_empty() {
@@ -2492,7 +3456,8 @@ index 0000000..f67ab7c
 +        Err(String::from_utf8_lossy(&output.stderr).to_string())
 +    }
 +}
-+"#.to_string())
++"#
+                    .to_string())
                 } else {
                     Err(e)
                 }
@@ -2507,19 +3472,20 @@ index 0000000..f67ab7c
 pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let base_path = Path::new(&path);
     let mut entries = Vec::new();
-    
+
     if let Ok(rd) = fs::read_dir(base_path) {
         for entry in rd.flatten() {
             let p = entry.path();
-            let name = p.file_name()
+            let name = p
+                .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            
+
             if name.starts_with('.') || name == "node_modules" || name == "target" {
                 continue;
             }
-            
+
             entries.push(DirEntry {
                 name,
                 path: p.to_string_lossy().into_owned(),
@@ -2527,7 +3493,7 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
             });
         }
     }
-    
+
     entries.sort_by(|a, b| {
         if a.is_dir != b.is_dir {
             b.is_dir.cmp(&a.is_dir)
@@ -2535,7 +3501,7 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
             a.name.cmp(&b.name)
         }
     });
-    
+
     Ok(entries)
 }
 
@@ -2554,7 +3520,7 @@ pub struct ModelInfo {
 #[tauri::command]
 pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo>, String> {
     let base_url = url.trim_end_matches('/');
-    
+
     // Helper closure to parse OpenAI compatible or LM Studio response JSON from /models
     let parse_openai_models = |resp: ureq::Response| -> Option<Vec<ModelInfo>> {
         if resp.status() == 200 {
@@ -2564,21 +3530,29 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
                     for m in data {
                         if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
                             // Determine if loaded (LM Studio uses "loaded", default to true)
-                            let is_loaded = m.get("loaded")
+                            let is_loaded = m
+                                .get("loaded")
                                 .or_else(|| m.get("is_loaded"))
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(true);
 
                             // Extract context size (LM Studio settings.contextLength, or OpenAI context_length/window)
-                            let context_size = m.get("settings")
-                                .and_then(|s| s.get("contextLength").or_else(|| s.get("context_length")))
-                                .or_else(|| m.get("metadata").and_then(|md| md.get("contextLength").or_else(|| md.get("context_window"))))
+                            let context_size = m
+                                .get("settings")
+                                .and_then(|s| {
+                                    s.get("contextLength").or_else(|| s.get("context_length"))
+                                })
+                                .or_else(|| {
+                                    m.get("metadata").and_then(|md| {
+                                        md.get("contextLength").or_else(|| md.get("context_window"))
+                                    })
+                                })
                                 .or_else(|| m.get("context_length"))
                                 .or_else(|| m.get("context_window"))
                                 .or_else(|| m.get("context_size"))
                                 .and_then(|v| v.as_u64())
                                 .map(|v| v as u32);
-                                
+
                             models_list.push(ModelInfo {
                                 name: id.to_string(),
                                 is_loaded,
@@ -2593,14 +3567,75 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
         None
     };
 
+    // LM Studio's native v1 REST API returns a far richer models list than the
+    // OpenAI-compat shim: real loaded state via `loaded_instances`, the context
+    // length actually configured on the loaded instance, and capability flags.
+    // Try it first for the lmstudio provider; fall through to generic probing.
+    let parse_lmstudio_native_models = |resp: ureq::Response| -> Option<Vec<ModelInfo>> {
+        if resp.status() == 200 {
+            if let Ok(json) = resp.into_json::<serde_json::Value>() {
+                if let Some(models) = json.get("models").and_then(|v| v.as_array()) {
+                    let mut models_list = Vec::new();
+                    for m in models {
+                        // Embedding models aren't chat-usable; skip them.
+                        if m.get("type").and_then(|t| t.as_str()) == Some("embedding") {
+                            continue;
+                        }
+                        let key = match m.get("key").and_then(|v| v.as_str()) {
+                            Some(k) => k,
+                            None => continue,
+                        };
+                        let loaded_instances = m.get("loaded_instances").and_then(|v| v.as_array());
+                        let is_loaded = loaded_instances.map(|a| !a.is_empty()).unwrap_or(false);
+                        // Prefer the context length configured on the loaded
+                        // instance; fall back to the model's maximum.
+                        let context_size = loaded_instances
+                            .and_then(|a| a.first())
+                            .and_then(|inst| inst.get("config"))
+                            .and_then(|c| c.get("context_length"))
+                            .or_else(|| m.get("max_context_length"))
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32);
+                        models_list.push(ModelInfo {
+                            name: key.to_string(),
+                            is_loaded,
+                            context_size,
+                        });
+                    }
+                    if !models_list.is_empty() {
+                        return Some(models_list);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    if provider == "lmstudio" {
+        let root = base_url
+            .trim_end_matches("/api/v1/chat")
+            .trim_end_matches("/api/v1")
+            .trim_end_matches("/v1")
+            .trim_end_matches('/');
+        let native_url = format!("{}/api/v1/models", root);
+        if let Ok(resp) = ureq::get(&native_url)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+        {
+            if let Some(models) = parse_lmstudio_native_models(resp) {
+                return Ok(models);
+            }
+        }
+    }
+
     // If LM Studio or OpenAI is selected, skip Ollama-specific endpoints entirely
-    if provider != "custom" {
+    if provider != "custom" && provider != "ollama" {
         let mut candidates = vec![
             format!("{}/models", base_url),
             format!("{}/v1/models", base_url),
             format!("{}/api/v1/models", base_url),
         ];
-        
+
         if base_url.ends_with("/api/v1") {
             let root = base_url.trim_end_matches("/api/v1").trim_end_matches('/');
             candidates.push(format!("{}/v1/models", root));
@@ -2610,12 +3645,15 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
             candidates.push(format!("{}/api/v1/models", root));
             candidates.push(format!("{}/models", root));
         }
-        
+
         candidates.sort();
         candidates.dedup();
 
         for url in candidates {
-            if let Ok(resp) = ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call() {
+            if let Ok(resp) = ureq::get(&url)
+                .timeout(std::time::Duration::from_secs(3))
+                .call()
+            {
                 if let Some(models) = parse_openai_models(resp) {
                     return Ok(models);
                 }
@@ -2624,18 +3662,23 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
     } else {
         // For custom (Ollama), try Ollama specific endpoints first
         let tags_url = format!("{}/api/tags", base_url);
-        if let Ok(resp) = ureq::get(&tags_url).timeout(std::time::Duration::from_secs(3)).call() {
+        if let Ok(resp) = ureq::get(&tags_url)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+        {
             if resp.status() == 200 {
                 if let Ok(json) = resp.into_json::<serde_json::Value>() {
                     let mut models_list = Vec::new();
-                    
+
                     // Get list of loaded models from /api/ps
                     let mut loaded_models = std::collections::HashSet::new();
                     let ps_url = format!("{}/api/ps", base_url);
                     if let Ok(ps_resp) = ureq::get(&ps_url).call() {
                         if ps_resp.status() == 200 {
                             if let Ok(ps_json) = ps_resp.into_json::<serde_json::Value>() {
-                                if let Some(models) = ps_json.get("models").and_then(|v| v.as_array()) {
+                                if let Some(models) =
+                                    ps_json.get("models").and_then(|v| v.as_array())
+                                {
                                     for m in models {
                                         if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
                                             loaded_models.insert(name.to_string());
@@ -2645,28 +3688,38 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
                             }
                         }
                     }
-                    
+
                     // Process all models from /api/tags
                     if let Some(models) = json.get("models").and_then(|v| v.as_array()) {
                         for m in models {
                             if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
                                 let name_str = name.to_string();
                                 let is_loaded = loaded_models.contains(&name_str);
-                                
+
                                 // Query /api/show for context size ONLY if the model is currently loaded
                                 let mut context_size = None;
                                 if is_loaded {
                                     let show_url = format!("{}/api/show", base_url);
                                     let show_payload = serde_json::json!({ "name": name_str });
-                                    if let Ok(show_resp) = ureq::post(&show_url).send_json(show_payload) {
+                                    if let Ok(show_resp) =
+                                        ureq::post(&show_url).send_json(show_payload)
+                                    {
                                         if show_resp.status() == 200 {
-                                            if let Ok(show_json) = show_resp.into_json::<serde_json::Value>() {
-                                                if let Some(params) = show_json.get("parameters").and_then(|v| v.as_str()) {
+                                            if let Ok(show_json) =
+                                                show_resp.into_json::<serde_json::Value>()
+                                            {
+                                                if let Some(params) = show_json
+                                                    .get("parameters")
+                                                    .and_then(|v| v.as_str())
+                                                {
                                                     // Parse num_ctx e.g. "num_ctx 8192"
                                                     for line in params.lines() {
-                                                        let parts: Vec<&str> = line.split_whitespace().collect();
-                                                        if parts.len() >= 2 && parts[0] == "num_ctx" {
-                                                            if let Ok(val) = parts[1].parse::<u32>() {
+                                                        let parts: Vec<&str> =
+                                                            line.split_whitespace().collect();
+                                                        if parts.len() >= 2 && parts[0] == "num_ctx"
+                                                        {
+                                                            if let Ok(val) = parts[1].parse::<u32>()
+                                                            {
                                                                 context_size = Some(val);
                                                                 break;
                                                             }
@@ -2677,7 +3730,7 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
                                         }
                                     }
                                 }
-                                
+
                                 models_list.push(ModelInfo {
                                     name: name_str,
                                     is_loaded,
@@ -2686,7 +3739,7 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
                             }
                         }
                     }
-                    
+
                     return Ok(models_list);
                 }
             }
@@ -2694,14 +3747,20 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
 
         // If Ollama tag endpoints failed/not Ollama, fall back to /v1/models and /models
         let oai_url = format!("{}/v1/models", base_url);
-        if let Ok(resp) = ureq::get(&oai_url).timeout(std::time::Duration::from_secs(3)).call() {
+        if let Ok(resp) = ureq::get(&oai_url)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+        {
             if let Some(models) = parse_openai_models(resp) {
                 return Ok(models);
             }
         }
 
         let oai_url_alt = format!("{}/models", base_url);
-        if let Ok(resp) = ureq::get(&oai_url_alt).timeout(std::time::Duration::from_secs(3)).call() {
+        if let Ok(resp) = ureq::get(&oai_url_alt)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+        {
             if let Some(models) = parse_openai_models(resp) {
                 return Ok(models);
             }
@@ -2711,7 +3770,10 @@ pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo
     Err("Could not retrieve models from endpoints.".to_string())
 }
 
-fn verify_sandbox<P1: AsRef<Path>, P2: AsRef<Path>>(project_path: P1, target_path: P2) -> Result<PathBuf, String> {
+fn verify_sandbox<P1: AsRef<Path>, P2: AsRef<Path>>(
+    project_path: P1,
+    target_path: P2,
+) -> Result<PathBuf, String> {
     let proj = clean_project_path(project_path);
     let t_ref = target_path.as_ref();
     let target_abs = if t_ref.is_absolute() {
@@ -2844,14 +3906,23 @@ impl Drop for ActiveRunGuard {
     }
 }
 
-fn append_run_event(app_handle: &tauri::AppHandle, state: &AppState, run_id: &str, event: RunEvent) {
+fn append_run_event(
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    run_id: &str,
+    event: RunEvent,
+) {
     let mut logs = state.run_logs.lock().unwrap();
     if let Some(run_events) = logs.get_mut(run_id) {
         run_events.push(event.clone());
-        
+
         let card_id = {
             let cards = state.cards.lock().unwrap();
-            cards.iter().find(|c| c.run_id.as_deref() == Some(run_id)).map(|c| c.id.clone()).unwrap_or_else(|| "".to_string())
+            cards
+                .iter()
+                .find(|c| c.run_id.as_deref() == Some(run_id))
+                .map(|c| c.id.clone())
+                .unwrap_or_else(|| "".to_string())
         };
 
         if let Ok(conn) = get_db_conn(app_handle) {
@@ -2867,7 +3938,7 @@ fn set_card_status(app_handle: &tauri::AppHandle, state: &AppState, card_id: &st
     let mut cards = state.cards.lock().unwrap();
     if let Some(card) = cards.iter_mut().find(|c| c.id == card_id) {
         card.status = status.to_string();
-        
+
         if let Ok(conn) = get_db_conn(app_handle) {
             let _ = conn.execute(
                 "UPDATE cards SET status = ?1 WHERE id = ?2",
@@ -2882,7 +3953,9 @@ fn extract_reasoning(response: &str) -> (Option<String>, String) {
         let after_start = &response[start_idx + 7..];
         if let Some(end_idx) = after_start.find("</think>") {
             let reasoning = after_start[..end_idx].trim().to_string();
-            let remaining = format!("{}{}", &response[..start_idx], &after_start[end_idx + 8..]).trim().to_string();
+            let remaining = format!("{}{}", &response[..start_idx], &after_start[end_idx + 8..])
+                .trim()
+                .to_string();
             return (Some(reasoning), remaining);
         } else {
             let reasoning = after_start.trim().to_string();
@@ -2893,7 +3966,11 @@ fn extract_reasoning(response: &str) -> (Option<String>, String) {
     (None, response.to_string())
 }
 
-fn construct_agent_system_prompt(worktree_path: &Path, card_title: &str, card_description: &str) -> String {
+fn construct_agent_system_prompt(
+    worktree_path: &Path,
+    card_title: &str,
+    card_description: &str,
+) -> String {
     format!(
         "You are BeetleAI, an autonomous coding agent. You have been assigned the following task:\n\
          Title: {}\n\
@@ -2927,7 +4004,8 @@ fn construct_agent_system_prompt(worktree_path: &Path, card_title: &str, card_de
 }
 
 fn parse_tool_call_fallback(js: &str) -> Option<(String, serde_json::Value)> {
-    let name = if js.contains("\"name\": \"write_file\"") || js.contains("\"name\":\"write_file\"") {
+    let name = if js.contains("\"name\": \"write_file\"") || js.contains("\"name\":\"write_file\"")
+    {
         Some("write_file")
     } else if js.contains("\"name\": \"read_file\"") || js.contains("\"name\":\"read_file\"") {
         Some("read_file")
@@ -2935,9 +4013,13 @@ fn parse_tool_call_fallback(js: &str) -> Option<(String, serde_json::Value)> {
         Some("list_dir")
     } else if js.contains("\"name\": \"web_search\"") || js.contains("\"name\":\"web_search\"") {
         Some("web_search")
-    } else if js.contains("\"name\": \"send_notification\"") || js.contains("\"name\":\"send_notification\"") {
+    } else if js.contains("\"name\": \"send_notification\"")
+        || js.contains("\"name\":\"send_notification\"")
+    {
         Some("send_notification")
-    } else if js.contains("\"name\": \"task_complete\"") || js.contains("\"name\":\"task_complete\"") {
+    } else if js.contains("\"name\": \"task_complete\"")
+        || js.contains("\"name\":\"task_complete\"")
+    {
         Some("task_complete")
     } else if js.contains("\"name\": \"search_grep\"") || js.contains("\"name\":\"search_grep\"") {
         Some("search_grep")
@@ -2948,7 +4030,7 @@ fn parse_tool_call_fallback(js: &str) -> Option<(String, serde_json::Value)> {
     };
 
     let name_str = name?;
-    
+
     if name_str == "write_file" {
         let path_marker = "\"path\":";
         let path = if let Some(idx) = js.find(path_marker) {
@@ -2957,9 +4039,15 @@ fn parse_tool_call_fallback(js: &str) -> Option<(String, serde_json::Value)> {
                 let rest_after_quote = &rest[start_quote + 1..];
                 if let Some(end_quote) = rest_after_quote.find('"') {
                     Some(rest_after_quote[..end_quote].to_string())
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let content_marker = "\"content\":";
         let content = if let Some(idx) = js.find(content_marker) {
@@ -2968,18 +4056,28 @@ fn parse_tool_call_fallback(js: &str) -> Option<(String, serde_json::Value)> {
                 let rest_after_quote = &rest[start_quote + 1..];
                 if let Some(last_quote_idx) = rest_after_quote.rfind('"') {
                     Some(rest_after_quote[..last_quote_idx].to_string())
-                } else { None }
-            } else { None }
-        } else { None };
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if let (Some(p), Some(c)) = (path, content) {
-            let cleaned_content = c.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\\\", "\\");
+            let cleaned_content = c
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\");
             return Some((
                 "write_file".to_string(),
                 serde_json::json!({
                     "path": p,
                     "content": cleaned_content
-                })
+                }),
             ));
         }
     }
@@ -2991,7 +4089,14 @@ fn strip_lang_prefix(s: &str) -> &str {
     for prefix in &["tool_call", "json", "javascript", "js"] {
         if trimmed.starts_with(prefix) {
             let rest = trimmed[prefix.len()..].trim_start();
-            if rest.starts_with('{') || rest.is_empty() || trimmed.chars().nth(prefix.len()).map(|c| c.is_whitespace()).unwrap_or(false) {
+            if rest.starts_with('{')
+                || rest.is_empty()
+                || trimmed
+                    .chars()
+                    .nth(prefix.len())
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(false)
+            {
                 trimmed = rest;
                 break;
             }
@@ -3007,7 +4112,7 @@ fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
             return Some((name.to_string(), args));
         }
     }
-    
+
     if let Some(start_brace) = s.find('{') {
         if let Some(end_brace) = s.rfind('}') {
             if end_brace > start_brace {
@@ -3024,11 +4129,11 @@ fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
             }
         }
     }
-    
+
     if let Some(res) = parse_tool_call_fallback(s) {
         return Some(res);
     }
-    
+
     None
 }
 
@@ -3037,19 +4142,19 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
     if response_cleaned.ends_with("<tool_call|>") {
         response_cleaned = response_cleaned.trim_end_matches("<tool_call|>").trim();
     }
-    
+
     for len in (2..=5).rev() {
         let bt = "`".repeat(len);
         let mut start_search = 0;
-        
+
         while let Some(start_idx) = response_cleaned[start_search..].find(&bt) {
             let absolute_start = start_search + start_idx;
             let after_start = &response_cleaned[absolute_start + len..];
-            
+
             if let Some(end_idx) = after_start.find(&bt) {
                 let block_str = &after_start[..end_idx];
                 let trimmed_block = strip_lang_prefix(block_str);
-                
+
                 if let Some(parsed) = try_parse_json(trimmed_block) {
                     return Some(parsed);
                 }
@@ -3057,11 +4162,11 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
             start_search = absolute_start + len;
         }
     }
-    
+
     if let Some(parsed) = try_parse_json(response_cleaned) {
         return Some(parsed);
     }
-    
+
     None
 }
 
@@ -3093,7 +4198,7 @@ fn run_shell_command<P: AsRef<Path>>(dir: P, command_str: &str) -> Result<String
     let output = cmd.output().map_err(|e| e.to_string())?;
     let out = String::from_utf8_lossy(&output.stdout).to_string();
     let err = String::from_utf8_lossy(&output.stderr).to_string();
-    
+
     let mut combined = format!("{}\n{}", out, err);
     if combined.len() > 3000 {
         combined = format!("{}... [TRUNCATED]", &combined[..3000]);
@@ -3113,23 +4218,27 @@ fn strip_html_tags(html: &str) -> String {
             clean.push(c);
         }
     }
-    clean.replace("&amp;", "&")
-         .replace("&lt;", "<")
-         .replace("&gt;", ">")
-         .replace("&quot;", "\"")
-         .replace("&#x27;", "'")
-         .replace("&#39;", "'")
+    clean
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
 }
 
 fn perform_web_search(query: &str) -> String {
-    let encoded = query.chars().map(|c| {
-        if c.is_alphanumeric() {
-            c.to_string()
-        } else {
-            format!("%{:02X}", c as u32)
-        }
-    }).collect::<String>();
-    
+    let encoded = query
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u32)
+            }
+        })
+        .collect::<String>();
+
     let url = format!("https://html.duckduckgo.com/html/?q={}", encoded);
     match ureq::get(&url)
         .set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
@@ -3200,17 +4309,42 @@ fn outline_file_impl(worktree_path: &Path, path: &str) -> String {
             // Match common declaration keywords across languages. We check the
             // leading token after optional visibility/qualifier words.
             let starters = [
-                "fn ", "pub fn ", "async fn ", "pub async fn ",
-                "struct ", "pub struct ", "enum ", "pub enum ",
-                "trait ", "pub trait ", "impl ", "type ", "pub type ",
-                "const ", "pub const ", "static ", "pub static ",
-                "class ", "def ", "function ", "export function ",
-                "export default ", "interface ", "export interface ",
-                "export class ", "export const ", "mod ", "pub mod ",
+                "fn ",
+                "pub fn ",
+                "async fn ",
+                "pub async fn ",
+                "struct ",
+                "pub struct ",
+                "enum ",
+                "pub enum ",
+                "trait ",
+                "pub trait ",
+                "impl ",
+                "type ",
+                "pub type ",
+                "const ",
+                "pub const ",
+                "static ",
+                "pub static ",
+                "class ",
+                "def ",
+                "function ",
+                "export function ",
+                "export default ",
+                "interface ",
+                "export interface ",
+                "export class ",
+                "export const ",
+                "mod ",
+                "pub mod ",
             ];
             if starters.iter().any(|s| trimmed.starts_with(s)) {
                 // Trim trailing body opener for readability.
-                let sig = trimmed.split(|c| c == '{' || c == ';').next().unwrap_or(trimmed).trim_end();
+                let sig = trimmed
+                    .split(|c| c == '{' || c == ';')
+                    .next()
+                    .unwrap_or(trimmed)
+                    .trim_end();
                 out.push(format!("{}: {}", ln, sig));
             }
         }
@@ -3225,7 +4359,13 @@ fn outline_file_impl(worktree_path: &Path, path: &str) -> String {
 
 /// Read a file, optionally limited to a line range, with a hard character cap so a
 /// single read can never blow the context budget. Returns 1-indexed line content.
-fn read_file_range_impl(worktree_path: &Path, path: &str, start_line: Option<usize>, end_line: Option<usize>, max_chars: usize) -> String {
+fn read_file_range_impl(
+    worktree_path: &Path,
+    path: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    max_chars: usize,
+) -> String {
     let target = match verify_sandbox(worktree_path, path) {
         Ok(p) => p,
         Err(e) => return format!("Error: {}", e),
@@ -3245,7 +4385,10 @@ fn read_file_range_impl(worktree_path: &Path, path: &str, start_line: Option<usi
         (Some(s), Some(e)) => (s.max(1), e.min(total)),
     };
     if lo > total {
-        return format!("Error: start_line {} is past end of file ({} lines)", lo, total);
+        return format!(
+            "Error: start_line {} is past end of file ({} lines)",
+            lo, total
+        );
     }
     if hi < lo {
         return format!("Error: end_line {} is before start_line {}", hi, lo);
@@ -3275,11 +4418,11 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
         Ok(p) => p,
         Err(e) => return format!("Error: {}", e),
     };
-    
+
     let mut results = Vec::new();
     let mut count = 0;
     let max_results = 50;
-    
+
     if target.is_file() {
         match fs::read_to_string(&target) {
             Ok(content) => {
@@ -3303,14 +4446,19 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
             worktree_abs: &Path,
             results: &mut Vec<String>,
             count: &mut usize,
-            max_results: usize
+            max_results: usize,
         ) -> std::io::Result<()> {
             if dir.is_dir() {
                 for entry in fs::read_dir(dir)? {
                     let entry = entry?;
                     let path = entry.path();
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    if name.starts_with('.') || name == "node_modules" || name == "target" || name == "dist" || name == ".harness" {
+                    if name.starts_with('.')
+                        || name == "node_modules"
+                        || name == "target"
+                        || name == "dist"
+                        || name == ".harness"
+                    {
                         continue;
                     }
                     if path.is_dir() {
@@ -3320,7 +4468,8 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
                         }
                     } else {
                         if let Ok(content) = fs::read_to_string(&path) {
-                            let rel_path = path.strip_prefix(worktree_abs)
+                            let rel_path = path
+                                .strip_prefix(worktree_abs)
                                 .unwrap_or(&path)
                                 .to_string_lossy()
                                 .into_owned();
@@ -3329,7 +4478,10 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
                                     results.push(format!("{}:{}: {}", rel_path, idx + 1, line));
                                     *count += 1;
                                     if *count >= max_results {
-                                        results.push(format!("... truncated after {} results", max_results));
+                                        results.push(format!(
+                                            "... truncated after {} results",
+                                            max_results
+                                        ));
                                         break;
                                     }
                                 }
@@ -3340,7 +4492,14 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
             }
             Ok(())
         }
-        if let Err(e) = visit_dirs(&target, query, &worktree_abs, &mut results, &mut count, max_results) {
+        if let Err(e) = visit_dirs(
+            &target,
+            query,
+            &worktree_abs,
+            &mut results,
+            &mut count,
+            max_results,
+        ) {
             return format!("Error searching directory: {}", e);
         }
     }
@@ -3351,13 +4510,18 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
     }
 }
 
-fn patch_file_impl(worktree_path: &Path, path: &str, target_str: &str, replacement_str: &str) -> String {
+fn patch_file_impl(
+    worktree_path: &Path,
+    path: &str,
+    target_str: &str,
+    replacement_str: &str,
+) -> String {
     let worktree_abs = clean_project_path(worktree_path);
     let target_file = match verify_sandbox(&worktree_abs, path) {
         Ok(p) => p,
         Err(e) => return format!("Error: {}", e),
     };
-    
+
     match fs::read_to_string(&target_file) {
         Ok(content) => {
             let matches: Vec<_> = content.match_indices(target_str).collect();
@@ -3382,7 +4546,6 @@ fn patch_file_impl(worktree_path: &Path, path: &str, target_str: &str, replaceme
 }
 
 fn execute_tool(
-
     app_handle: &tauri::AppHandle,
     worktree_path: &Path,
     tool_name: &str,
@@ -3395,8 +4558,14 @@ fn execute_tool(
                 Some(p) => p,
                 None => return "Error: Missing path argument".to_string(),
             };
-            let start_line = args.get("start_line").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let end_line = args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let start_line = args
+                .get("start_line")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let end_line = args
+                .get("end_line")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             // Hard cap on a single read so it can't blow the context budget. A full
             // read past this is truncated with guidance to range-read or outline first.
             read_file_range_impl(worktree_path, path, start_line, end_line, 8000)
@@ -3440,12 +4609,20 @@ fn execute_tool(
                     let mut entries = Vec::new();
                     for entry in rd.flatten() {
                         let p = entry.path();
-                        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                        let name = p
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned();
                         if name.starts_with('.') || name == "node_modules" || name == "target" {
                             continue;
                         }
                         let is_dir = p.is_dir();
-                        entries.push(format!("{} ({})", name, if is_dir { "folder" } else { "file" }));
+                        entries.push(format!(
+                            "{} ({})",
+                            name,
+                            if is_dir { "folder" } else { "file" }
+                        ));
                     }
                     if entries.is_empty() {
                         "Directory is empty".to_string()
@@ -3456,18 +4633,14 @@ fn execute_tool(
                 Err(e) => format!("Error listing directory: {}", e),
             }
         }
-        "git_status" => {
-            match run_git_command(worktree_path, &["status"]) {
-                Ok(out) => out,
-                Err(e) => format!("Error: {}", e),
-            }
-        }
-        "git_diff" => {
-            match run_git_command(worktree_path, &["diff"]) {
-                Ok(out) => out,
-                Err(e) => format!("Error: {}", e),
-            }
-        }
+        "git_status" => match run_git_command(worktree_path, &["status"]) {
+            Ok(out) => out,
+            Err(e) => format!("Error: {}", e),
+        },
+        "git_diff" => match run_git_command(worktree_path, &["diff"]) {
+            Ok(out) => out,
+            Err(e) => format!("Error: {}", e),
+        },
         "run_command" => {
             let command = match args.get("command").and_then(|c| c.as_str()) {
                 Some(c) => c,
@@ -3497,7 +4670,10 @@ fn execute_tool(
             let summary = args.get("summary").and_then(|s| s.as_str()).unwrap_or("");
             let state = app_handle.state::<AppState>();
             let mut cards = state.cards.lock().unwrap();
-            if let Some(card) = cards.iter_mut().find(|c| c.run_id.as_deref() == Some(run_id)) {
+            if let Some(card) = cards
+                .iter_mut()
+                .find(|c| c.run_id.as_deref() == Some(run_id))
+            {
                 card.status = "review".to_string();
                 let _ = app_handle.emit("notification", format!("Task completed: {}", card.title));
             }
@@ -3530,17 +4706,13 @@ fn execute_tool(
     }
 }
 
-pub fn run_agent_loop(
-    app_handle: tauri::AppHandle,
-    run_id: String,
-    card_id: String,
-) {
+pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: String) {
     let app_handle_clone = app_handle.clone();
     let run_id_clone = run_id.clone();
-    
+
     tauri::async_runtime::spawn(async move {
         let state = app_handle_clone.state::<AppState>();
-        
+
         {
             let mut active = state.active_runs.lock().unwrap();
             if active.contains(&run_id_clone) {
@@ -3548,7 +4720,7 @@ pub fn run_agent_loop(
             }
             active.insert(run_id_clone.clone());
         }
-        
+
         let _guard = ActiveRunGuard {
             app_handle: app_handle_clone.clone(),
             run_id: run_id_clone.clone(),
@@ -3556,12 +4728,18 @@ pub fn run_agent_loop(
 
         let config = load_config(&app_handle_clone);
         let max_steps = config.settings.max_steps as usize;
-        
+
         let card_meta = {
             let cards = state.cards.lock().unwrap();
-            cards.iter().find(|c| c.id == card_id).map(|c| (c.title.clone(), c.description.clone(), c.project_path.clone()))
+            cards.iter().find(|c| c.id == card_id).map(|c| {
+                (
+                    c.title.clone(),
+                    c.description.clone(),
+                    c.project_path.clone(),
+                )
+            })
         };
-        
+
         let (card_title, card_desc, card_project_path) = match card_meta {
             Some(meta) => meta,
             None => return,
@@ -3569,10 +4747,13 @@ pub fn run_agent_loop(
 
         // Scope the run to the card's project, not BeetleAI's own working dir.
         let repo_path = clean_project_path(&card_project_path);
-        let worktree_path = repo_path.join(".harness").join("worktrees").join(&run_id_clone);
-        
+        let worktree_path = repo_path
+            .join(".harness")
+            .join("worktrees")
+            .join(&run_id_clone);
+
         let mut step = 0;
-        
+
         loop {
             {
                 let cards = state.cards.lock().unwrap();
@@ -3584,9 +4765,12 @@ pub fn run_agent_loop(
                     break;
                 }
             }
-            
+
             if step >= max_steps {
-                log_error(&format!("Max step ceiling reached ({}) for run {}", max_steps, run_id_clone));
+                log_error(&format!(
+                    "Max step ceiling reached ({}) for run {}",
+                    max_steps, run_id_clone
+                ));
                 append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
                     run_id: run_id_clone.clone(),
                     event_type: "blocked".to_string(),
@@ -3596,12 +4780,13 @@ pub fn run_agent_loop(
                     }).to_string(),
                 });
                 set_card_status(&app_handle_clone, &state, &card_id, "blocked");
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                let _ = app_handle_clone
+                    .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
                 break;
             }
-            
+
             step += 1;
-            
+
             let history = {
                 let logs = state.run_logs.lock().unwrap();
                 if let Some(events) = logs.get(&run_id_clone) {
@@ -3610,10 +4795,30 @@ pub fn run_agent_loop(
                     Vec::new()
                 }
             };
-            
-            let system_prompt = construct_agent_system_prompt(&worktree_path, &card_title, &card_desc);
-            let tools_schema = get_openai_tools_schema(&["read_file", "outline_file", "write_file", "list_dir", "git_status", "git_diff", "run_command", "web_search", "send_notification", "task_complete", "search_grep", "patch_file"]);
-            let response = match call_llm(&app_handle_clone, &run_id_clone, &system_prompt, history, Some(tools_schema)) {
+
+            let system_prompt =
+                construct_agent_system_prompt(&worktree_path, &card_title, &card_desc);
+            let tools_schema = get_openai_tools_schema(&[
+                "read_file",
+                "outline_file",
+                "write_file",
+                "list_dir",
+                "git_status",
+                "git_diff",
+                "run_command",
+                "web_search",
+                "send_notification",
+                "task_complete",
+                "search_grep",
+                "patch_file",
+            ]);
+            let response = match call_llm(
+                &app_handle_clone,
+                &run_id_clone,
+                &system_prompt,
+                history,
+                Some(tools_schema),
+            ) {
                 Ok(reply) => reply,
                 Err(e) => {
                     log_error(&format!("Agent loop LLM error: {}", e));
@@ -3635,91 +4840,140 @@ pub fn run_agent_loop(
                             }).to_string(),
                         });
                         set_card_status(&app_handle_clone, &state, &card_id, "blocked");
-                        let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                        let _ = app_handle_clone
+                            .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
                     }
                     break;
                 }
             };
-            
+
             let (reasoning, remaining) = extract_reasoning(&response);
             if let Some(reasoning_content) = reasoning {
-                append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
-                    run_id: run_id_clone.clone(),
-                    event_type: "reasoning".to_string(),
-                    payload: reasoning_content,
-                });
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                append_run_event(
+                    &app_handle_clone,
+                    &state,
+                    &run_id_clone,
+                    RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "reasoning".to_string(),
+                        payload: reasoning_content,
+                    },
+                );
+                let _ = app_handle_clone
+                    .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
             }
-            
+
             if let Some((tool_name, args)) = parse_tool_call(&remaining) {
-                append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
-                    run_id: run_id_clone.clone(),
-                    event_type: "tool_call".to_string(),
-                    payload: serde_json::json!({
-                        "name": tool_name.clone(),
-                        "args": args.clone(),
-                    }).to_string(),
-                });
-                
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
-                
-                let tool_result = execute_tool(&app_handle_clone, &worktree_path, &tool_name, &args, &run_id_clone);
-                
-                append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
-                    run_id: run_id_clone.clone(),
-                    event_type: "tool_result".to_string(),
-                    payload: serde_json::json!({
-                        "name": tool_name.clone(),
-                        "result": tool_result,
-                    }).to_string(),
-                });
-                
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
-                
+                append_run_event(
+                    &app_handle_clone,
+                    &state,
+                    &run_id_clone,
+                    RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "tool_call".to_string(),
+                        payload: serde_json::json!({
+                            "name": tool_name.clone(),
+                            "args": args.clone(),
+                        })
+                        .to_string(),
+                    },
+                );
+
+                let _ = app_handle_clone
+                    .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+
+                let tool_result = execute_tool(
+                    &app_handle_clone,
+                    &worktree_path,
+                    &tool_name,
+                    &args,
+                    &run_id_clone,
+                );
+
+                append_run_event(
+                    &app_handle_clone,
+                    &state,
+                    &run_id_clone,
+                    RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "tool_result".to_string(),
+                        payload: serde_json::json!({
+                            "name": tool_name.clone(),
+                            "result": tool_result,
+                        })
+                        .to_string(),
+                    },
+                );
+
+                let _ = app_handle_clone
+                    .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+
                 // task_complete moves the card to `review` (done inside execute_tool).
                 // Break the loop immediately so the next iteration can't overwrite that
                 // status with a `blocked`/`running` transition.
                 if tool_name == "task_complete" {
-                    let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                    let _ = app_handle_clone
+                        .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
                     break;
                 }
-                
+
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             } else {
                 // No tool call and not complete: the agent is asking a question or
                 // reporting it's stuck. Genuine "needs input" — pause as `blocked`,
                 // resumable via unblock_run/send_chat.
-                append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
-                    run_id: run_id_clone.clone(),
-                    event_type: "message".to_string(),
-                    payload: serde_json::json!({
-                        "role": "agent",
-                        "content": remaining
-                    }).to_string(),
-                });
-                append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
-                    run_id: run_id_clone.clone(),
-                    event_type: "blocked".to_string(),
-                    payload: serde_json::json!({
-                        "reason": "question",
-                        "message": "The agent is waiting for your input."
-                    }).to_string(),
-                });
-                
+                append_run_event(
+                    &app_handle_clone,
+                    &state,
+                    &run_id_clone,
+                    RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "message".to_string(),
+                        payload: serde_json::json!({
+                            "role": "agent",
+                            "content": remaining
+                        })
+                        .to_string(),
+                    },
+                );
+                append_run_event(
+                    &app_handle_clone,
+                    &state,
+                    &run_id_clone,
+                    RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "blocked".to_string(),
+                        payload: serde_json::json!({
+                            "reason": "question",
+                            "message": "The agent is waiting for your input."
+                        })
+                        .to_string(),
+                    },
+                );
+
                 set_card_status(&app_handle_clone, &state, &card_id, "blocked");
-                let _ = app_handle_clone.emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                let _ = app_handle_clone
+                    .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
                 break;
             }
         }
-        let _ = app_handle_clone.emit("chat-finished", serde_json::json!({ "run_id": run_id_clone }));
+        let _ = app_handle_clone.emit(
+            "chat-finished",
+            serde_json::json!({ "run_id": run_id_clone }),
+        );
     });
 }
 
-fn append_design_event(app_handle: &tauri::AppHandle, state: &AppState, log_key: &str, event: RunEvent) {
+fn append_design_event(
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    log_key: &str,
+    event: RunEvent,
+) {
     let mut logs = state.design_logs.lock().unwrap();
     if let Some(events) = logs.get_mut(log_key) {
         events.push(event.clone());
-        
+
         if let Ok(conn) = get_db_conn(app_handle) {
             let _ = conn.execute(
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3729,11 +4983,16 @@ fn append_design_event(app_handle: &tauri::AppHandle, state: &AppState, log_key:
     }
 }
 
-fn append_code_event(app_handle: &tauri::AppHandle, state: &AppState, log_key: &str, event: RunEvent) {
+fn append_code_event(
+    app_handle: &tauri::AppHandle,
+    state: &AppState,
+    log_key: &str,
+    event: RunEvent,
+) {
     let mut logs = state.code_logs.lock().unwrap();
     if let Some(events) = logs.get_mut(log_key) {
         events.push(event.clone());
-        
+
         if let Ok(conn) = get_db_conn(app_handle) {
             let _ = conn.execute(
                 "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -3768,7 +5027,11 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
 }
 
 fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> String {
-    let target = if file_path.is_empty() { "the workspace" } else { file_path };
+    let target = if file_path.is_empty() {
+        "the workspace"
+    } else {
+        file_path
+    };
     format!(
         "You are BeetleAI, a software developer copilot. You are helping the user update or write code in: {}\n\
          The project root is located at: {}\n\n\
@@ -3909,7 +5172,8 @@ BeetleAI
                 payload: serde_json::json!({
                     "name": "read_file",
                     "args": {"path": "DesignDoc.md"}
-                }).to_string(),
+                })
+                .to_string(),
             },
             RunEvent {
                 run_id: "test".to_string(),
@@ -3917,8 +5181,9 @@ BeetleAI
                 payload: serde_json::json!({
                     "name": "read_file",
                     "result": "File contents here."
-                }).to_string(),
-            }
+                })
+                .to_string(),
+            },
         ];
 
         let history = get_history_messages(&events);
@@ -3932,7 +5197,10 @@ BeetleAI
 
         let second = &history[1];
         assert_eq!(second.get("role").unwrap().as_str().unwrap(), "user");
-        assert_eq!(second.get("content").unwrap().as_str().unwrap(), "Tool 'read_file' returned:\nFile contents here.");
+        assert_eq!(
+            second.get("content").unwrap().as_str().unwrap(),
+            "Tool 'read_file' returned:\nFile contents here."
+        );
     }
 
     #[test]
@@ -3943,9 +5211,17 @@ BeetleAI
 
         let file_a = wt_path.join("file_a.txt");
         let file_b = wt_path.join("file_b.txt");
-        
-        fs::write(&file_a, "Hello World!\nThis is a large file line.\nRust is awesome!\n").unwrap();
-        fs::write(&file_b, "Hello World!\nThis is another file.\nRust coding is great!\n").unwrap();
+
+        fs::write(
+            &file_a,
+            "Hello World!\nThis is a large file line.\nRust is awesome!\n",
+        )
+        .unwrap();
+        fs::write(
+            &file_b,
+            "Hello World!\nThis is another file.\nRust coding is great!\n",
+        )
+        .unwrap();
 
         // 1. Test search_grep_impl recursively
         let res_search = search_grep_impl(wt_path, "Rust", "");
@@ -3960,7 +5236,12 @@ BeetleAI
         assert!(!normalized_file.contains("file_b.txt"));
 
         // 3. Test patch_file_impl unique replacement
-        let res_patch = patch_file_impl(wt_path, "file_a.txt", "Rust is awesome!", "Rust is incredibly fast!");
+        let res_patch = patch_file_impl(
+            wt_path,
+            "file_a.txt",
+            "Rust is awesome!",
+            "Rust is incredibly fast!",
+        );
         assert_eq!(res_patch, "Success: File patched successfully");
 
         let patched_content = fs::read_to_string(&file_a).unwrap();

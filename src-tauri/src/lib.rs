@@ -22,9 +22,6 @@ pub fn clean_project_path<P: AsRef<Path>>(path: P) -> PathBuf {
                 stack.pop();
             }
             std::path::Component::Normal(c) => {
-                if c == "src-tauri" {
-                    continue;
-                }
                 stack.push(c);
             }
             c => {
@@ -39,6 +36,19 @@ pub fn clean_project_path<P: AsRef<Path>>(path: P) -> PathBuf {
     }
 
     normalized
+}
+
+/// The application's own root directory: the cwd, stepping out of `src-tauri`
+/// if launched from there (cargo/tauri dev runs). This src-tauri quirk applies
+/// ONLY to resolving the app's own location — never to user project or tool
+/// paths, where silently dropping a path component corrupts file operations on
+/// any project that legitimately contains a `src-tauri` directory.
+pub fn app_root_path() -> PathBuf {
+    let mut p = clean_project_path(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if p.ends_with("src-tauri") {
+        p.pop();
+    }
+    p
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -66,7 +76,7 @@ pub fn run() {
             backtrace
         );
 
-        let logs_dir = clean_project_path(".").join("logs");
+        let logs_dir = app_root_path().join("logs");
         let _ = std::fs::create_dir_all(&logs_dir);
         let _ = std::fs::write(logs_dir.join("error.log"), &log_content);
     }));

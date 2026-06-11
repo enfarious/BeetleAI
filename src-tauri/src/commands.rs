@@ -202,11 +202,7 @@ impl AppState {
 }
 
 // Config persistence helpers
-use crate::clean_project_path;
-
-fn get_repo_path() -> PathBuf {
-    clean_project_path(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
+use crate::{app_root_path, clean_project_path};
 
 /// Resolve the repo path for a run from the owning card's project_path, rather than
 /// the app's own working directory. This is what scopes the run engine to the
@@ -1359,7 +1355,7 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
 }
 
 fn log_error(msg: &str) {
-    let logs_dir = clean_project_path(".").join("logs");
+    let logs_dir = app_root_path().join("logs");
     let _ = fs::create_dir_all(&logs_dir);
     if let Ok(mut file) = fs::OpenOptions::new()
         .create(true)
@@ -3433,7 +3429,14 @@ pub fn send_chat(
 
 #[tauri::command]
 pub fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Result<String, String> {
-    let repo_path = repo_path_for_run(&state, &run_id).unwrap_or_else(get_repo_path);
+    // If the run's card can't be found, there is no correct repo to diff against —
+    // fail loudly rather than silently diffing the app's own working directory.
+    let repo_path = repo_path_for_run(&state, &run_id).ok_or_else(|| {
+        format!(
+            "No card found for run '{}'; cannot resolve its repository",
+            run_id
+        )
+    })?;
     if git::is_git_repo(&repo_path) {
         let base_branch =
             git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());

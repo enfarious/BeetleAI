@@ -1185,6 +1185,24 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                     }
                 }
             }),
+            "replace_lines" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "replace_lines",
+                    "description": "Replaces an inclusive 1-indexed line range with new content. The precision tool for compiler errors: the compiler reports file:line and read_file output is line-numbered — use those exact numbers. Empty content deletes the range. Prefer this over patch_file when the target text contains quotes or escapes.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string", "description": "Relative path to the file" },
+                            "start_line": { "type": "integer", "description": "First line to replace (1-indexed, inclusive)" },
+                            "end_line": { "type": "integer", "description": "Last line to replace (1-indexed, inclusive)" },
+                            "content": { "type": "string", "description": "Replacement text; may span multiple lines; empty string deletes the range" }
+                        },
+                        "required": ["path", "start_line", "end_line", "content"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
             "patch_file" => serde_json::json!({
                 "type": "function",
                 "function": {
@@ -4028,10 +4046,11 @@ fn construct_agent_system_prompt(
          6. `git_status()`: Runs `git status` in the sandbox.\n\
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
          8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
-         9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. Prefer this over write_file for small edits to large files.\n\
-         10. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
-         11. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
-         12. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
+         9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. The target must match byte-for-byte including quotes and whitespace; if the snippet contains quotes or escapes, use replace_lines instead.\n\
+         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error.\n\
+         11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
+         12. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
+         13. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     )
@@ -4546,6 +4565,60 @@ fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String
     }
 }
 
+fn replace_lines_impl(
+    worktree_path: &Path,
+    path: &str,
+    start_line: usize,
+    end_line: usize,
+    new_content: &str,
+) -> String {
+    let worktree_abs = clean_project_path(worktree_path);
+    let target_file = match verify_sandbox(&worktree_abs, path) {
+        Ok(p) => p,
+        Err(e) => return format!("Error: {}", e),
+    };
+    let original = match fs::read_to_string(&target_file) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading '{}': {}", path, e),
+    };
+    let lines: Vec<&str> = original.lines().collect();
+    if start_line == 0 || end_line < start_line || start_line > lines.len() {
+        return format!(
+            "Error: invalid line range {}-{} ('{}' has {} lines)",
+            start_line,
+            end_line,
+            path,
+            lines.len()
+        );
+    }
+    let end_line = end_line.min(lines.len());
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    out.extend(lines[..start_line - 1].iter().map(|s| s.to_string()));
+    let mut inserted = 0usize;
+    if !new_content.is_empty() {
+        for l in new_content.lines() {
+            out.push(l.to_string());
+            inserted += 1;
+        }
+    }
+    out.extend(lines[end_line..].iter().map(|s| s.to_string()));
+    let mut joined = out.join("\n");
+    if original.ends_with('\n') {
+        joined.push('\n');
+    }
+    if let Err(e) = fs::write(&target_file, joined) {
+        return format!("Error writing '{}': {}", path, e);
+    }
+    format!(
+        "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). Verify with read_file or re-run your check.",
+        start_line,
+        end_line,
+        path,
+        end_line - start_line + 1,
+        inserted
+    )
+}
+
 fn patch_file_impl(
     worktree_path: &Path,
     path: &str,
@@ -4562,7 +4635,7 @@ fn patch_file_impl(
         Ok(content) => {
             let matches: Vec<_> = content.match_indices(target_str).collect();
             if matches.is_empty() {
-                return format!("Error: Target text not found in '{}'", path);
+                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If the snippet contains quotes or escapes, use replace_lines with the line numbers from read_file instead.", path);
             }
             if matches.len() > 1 {
                 return format!(
@@ -4738,8 +4811,24 @@ fn execute_tool(
             };
             patch_file_impl(worktree_path, path, target_str, replacement_str)
         }
+        "replace_lines" => {
+            let path = match args.get("path").and_then(|p| p.as_str()) {
+                Some(p) => p,
+                None => return "Error: Missing path argument".to_string(),
+            };
+            let start_line = match args.get("start_line").and_then(|v| v.as_u64()) {
+                Some(v) => v as usize,
+                None => return "Error: Missing start_line argument".to_string(),
+            };
+            let end_line = match args.get("end_line").and_then(|v| v.as_u64()) {
+                Some(v) => v as usize,
+                None => return "Error: Missing end_line argument".to_string(),
+            };
+            let content = args.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            replace_lines_impl(worktree_path, path, start_line, end_line, content)
+        }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, list_dir, search_grep, git_status, git_diff, run_command, web_search, send_notification, task_complete. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, git_status, git_diff, run_command, web_search, send_notification, task_complete. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -4862,6 +4951,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "task_complete",
                 "search_grep",
                 "patch_file",
+                "replace_lines",
             ]);
             let response = match call_llm(
                 &app_handle_clone,

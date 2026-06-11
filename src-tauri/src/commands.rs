@@ -4027,7 +4027,7 @@ fn construct_agent_system_prompt(
          Description: {}\n\n\
          You are executing inside an isolated git worktree sandbox located at: {}\n\
          All your file paths MUST be relative to this directory (do not write outside this directory).\n\n\
-         You have access to the following tools to interact with the repository. To call a tool, you MUST output a single Markdown JSON code block of type \"tool_call\" in the following format:\n\n\
+         You have access to the following tools to interact with the repository. Issue EXACTLY ONE tool call per message, as a JSON object with \"name\" and \"args\". If your model has a native tool-call format (such as <tool_call>...</tool_call>), use it — it is fully supported. Otherwise, use this reference format:\n\n\
          ```tool_call\n\
          {{\n\
            \"name\": \"tool_name\",\n\
@@ -4036,7 +4036,7 @@ fn construct_agent_system_prompt(
            }}\n\
          }}\n\
          ```\n\n\
-         No other text should be inside the code block. Once you call a tool, the system will execute it and append the result. You can then analyze the output and make further tool calls.\n\n\
+         Keep any commentary brief and outside the tool call itself. Once you call a tool, the system will execute it and append the result. You can then analyze the output and make further tool calls.\n\n\
          Tools available:\n\
          1. `read_file(path: String, start_line?: Int, end_line?: Int)`: Reads file content. For large files, call outline_file first, then read only the line range you need. Output is line-numbered and capped — don't read whole large files when a range will do.\n\
          2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
@@ -4158,10 +4158,28 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
+/// Extract tool arguments tolerantly: our protocol says "args", but native
+/// chat templates use "arguments" (Qwen/Hermes) or "parameters", and some
+/// stringify the object. Accept all of them.
+fn extract_tool_args(val: &serde_json::Value) -> serde_json::Value {
+    let args = val
+        .get("args")
+        .or_else(|| val.get("arguments"))
+        .or_else(|| val.get("parameters"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::String(s) = &args {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+            return parsed;
+        }
+    }
+    args
+}
+
 fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(s) {
         if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-            let args = val.get("args").cloned().unwrap_or(serde_json::Value::Null);
+            let args = extract_tool_args(&val);
             return Some((name.to_string(), args));
         }
     }
@@ -4172,7 +4190,7 @@ fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
                 let json_sub = &s[start_brace..=end_brace];
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_sub) {
                     if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-                        let args = val.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                        let args = extract_tool_args(&val);
                         return Some((name.to_string(), args));
                     }
                 }
@@ -4213,6 +4231,28 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
                 }
             }
             start_search = absolute_start + len;
+        }
+    }
+
+    // Native chat-template formats: Qwen/Hermes-style <tool_call>{...}</tool_call>,
+    // pipe and space variants included, tolerating a missing closing tag when
+    // generation was truncated. Models with thinking disabled fall back to their
+    // trained format regardless of what the system prompt asks for — meet them
+    // where they are instead of blocking on a perfectly good tool call.
+    const TAG_OPENERS: [&str; 4] = ["<tool_call>", "<|tool_call|>", "<tool call>", "<|tool call|>"];
+    for opener in TAG_OPENERS {
+        let mut search = 0;
+        while let Some(idx) = response_cleaned[search..].find(opener) {
+            let start = search + idx + opener.len();
+            let rest = &response_cleaned[start..];
+            let inner = match rest.find("</tool_call>").or_else(|| rest.find("<|/tool_call|>")) {
+                Some(end) => &rest[..end],
+                None => rest,
+            };
+            if let Some(parsed) = try_parse_json(inner.trim()) {
+                return Some(parsed);
+            }
+            search = start;
         }
     }
 
@@ -5224,7 +5264,7 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
     format!(
         "You are BeetleAI, a software architect copilot. You are discussing and updating the design document: {}\n\
          The project root is located at: {}\n\n\
-         You have access to tools to read/write files and research solutions. To call a tool, you MUST output a single Markdown JSON code block of type \"tool_call\" in the following format:\n\n\
+         You have access to tools to read/write files and research solutions. Issue EXACTLY ONE tool call per message, as a JSON object with \"name\" and \"args\". Your model's native tool-call format (such as <tool_call>...</tool_call>) is fully supported; otherwise use this reference format:\n\n\
          ```tool_call\n\
          {{\n\
            \"name\": \"tool_name\",\n\
@@ -5253,7 +5293,7 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
     format!(
         "You are BeetleAI, a software developer copilot. You are helping the user update or write code in: {}\n\
          The project root is located at: {}\n\n\
-         You have access to tools to read/write source files and test compilation. To call a tool, you MUST output a single Markdown JSON code block of type \"tool_call\" in the following format:\n\n\
+         You have access to tools to read/write source files and test compilation. Issue EXACTLY ONE tool call per message, as a JSON object with \"name\" and \"args\". Your model's native tool-call format (such as <tool_call>...</tool_call>) is fully supported; otherwise use this reference format:\n\n\
          ```tool_call\n\
          {{\n\
            \"name\": \"tool_name\",\n\

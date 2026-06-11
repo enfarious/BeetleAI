@@ -472,6 +472,7 @@ body.resizing-active .resizer {
   background-color: rgba(0, 0, 0, 0.2) !important;
   border-radius: 4px;
   overflow-x: auto;
+  overflow-y: auto;
   white-space: pre-wrap;
   max-height: 250px;
   border: 1px solid rgba(255, 255, 255, 0.05);

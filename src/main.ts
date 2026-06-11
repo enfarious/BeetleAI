@@ -1777,7 +1777,7 @@ function renderLogs(logs: RunEvent[]) {
           const resultStr = escapeHtml(resultDetails.result || "");
           resultSection = `
             <div class="tool-result-header" style="margin-top: 8px; font-weight: 600; font-size: 0.8rem; color: var(--text-secondary);">Result:</div>
-            <pre class="tool-details"><code>${resultStr}</code></pre>
+            <pre class="tool-details tool-result-pre"><code>${resultStr}</code></pre>
           `;
         } else {
           resultSection = `

@@ -4114,7 +4114,7 @@ fn construct_agent_system_prompt(
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
          8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
          9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. The target must match byte-for-byte including quotes and whitespace; if the snippet contains quotes or escapes, use replace_lines instead.\n\
-         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error.\n\
+         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error. WARNING: line numbers SHIFT after every successful edit — re-read the affected range before chaining another replace_lines.\n\
          11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
          12. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
          13. `read_card()`: Shows YOUR current card: title, description, status, and its todo list with indices. Read it at the start of a run and use the todos as your work plan.\n\
@@ -4950,6 +4950,10 @@ fn replace_lines_impl(
         );
     }
     let end_line = end_line.min(lines.len());
+    let first_removed: String = lines
+        .get(start_line - 1)
+        .map(|l| l.chars().take(90).collect())
+        .unwrap_or_default();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     out.extend(lines[..start_line - 1].iter().map(|s| s.to_string()));
     let mut inserted = 0usize;
@@ -4968,13 +4972,62 @@ fn replace_lines_impl(
         return format!("Error writing '{}': {}", path, e);
     }
     format!(
-        "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). Verify with read_file or re-run your check.",
+        "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). First removed line was: `{}`. If that is NOT the line you expected to remove, the file has changed since you read it — line numbers SHIFT after every edit. Re-read the section before making further edits.",
         start_line,
         end_line,
         path,
         end_line - start_line + 1,
-        inserted
+        inserted,
+        first_removed
     )
+}
+
+/// Detect the worktree's project type and run its compile/type check.
+/// Ok(note) when the check passed or no recognizable build system exists;
+/// Err(message with the first ~2500 chars of output) when the check FAILED.
+/// The loop's ground truth is the compiler, not the model's self-report.
+fn run_verification(worktree_path: &Path) -> Result<String, String> {
+    let (dir, label, program, args): (PathBuf, &str, &str, Vec<&str>) =
+        if worktree_path.join("src-tauri").join("Cargo.toml").exists() {
+            (
+                worktree_path.join("src-tauri"),
+                "cargo check",
+                "cargo",
+                vec!["check", "--color", "never"],
+            )
+        } else if worktree_path.join("Cargo.toml").exists() {
+            (
+                worktree_path.to_path_buf(),
+                "cargo check",
+                "cargo",
+                vec!["check", "--color", "never"],
+            )
+        } else if worktree_path.join("tsconfig.json").exists() {
+            (
+                worktree_path.to_path_buf(),
+                "npx tsc --noEmit",
+                "cmd.exe",
+                vec!["/C", "npx tsc --noEmit"],
+            )
+        } else {
+            return Ok("no recognizable build system; verification skipped".to_string());
+        };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&args);
+    cmd.current_dir(&dir);
+    crate::configure_no_window(&mut cmd);
+    match cmd.output() {
+        Ok(output) if output.status.success() => Ok(format!("{} passed", label)),
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{}\n{}", stdout, stderr);
+            let head: String = combined.chars().take(2500).collect();
+            Err(format!("{} FAILED:\n{}", label, head))
+        }
+        // Tool missing on PATH etc. — don't hard-block completion on environment problems.
+        Err(e) => Ok(format!("could not run {} ({}); verification skipped", label, e)),
+    }
 }
 
 fn patch_file_impl(
@@ -5135,16 +5188,39 @@ fn execute_tool(
         }
         "task_complete" => {
             let summary = args.get("summary").and_then(|s| s.as_str()).unwrap_or("");
-            let state = app_handle.state::<AppState>();
-            let mut cards = state.cards.lock().unwrap();
-            if let Some(card) = cards
-                .iter_mut()
-                .find(|c| c.run_id.as_deref() == Some(run_id))
-            {
-                card.status = "review".to_string();
-                let _ = app_handle.emit("notification", format!("Task completed: {}", card.title));
+            // Gate completion on verification: claiming done with a broken build
+            // is the single most expensive failure mode for the reviewer.
+            match run_verification(worktree_path) {
+                Err(failure) => {
+                    return format!(
+                        "Error: task_complete REJECTED — the project does not verify cleanly.\n{}\nFix the errors above (replace_lines with the reported line numbers), confirm with run_command, then call task_complete again.",
+                        failure
+                    );
+                }
+                Ok(note) => {
+                    let changes = run_git_command(worktree_path, &["status", "--short"])
+                        .unwrap_or_else(|e| format!("(git status unavailable: {})", e));
+                    let changes_display = if changes.trim().is_empty() {
+                        "(none — WARNING: there are no changes to merge)".to_string()
+                    } else {
+                        changes.trim().to_string()
+                    };
+                    let state = app_handle.state::<AppState>();
+                    let mut cards = state.cards.lock().unwrap();
+                    if let Some(card) = cards
+                        .iter_mut()
+                        .find(|c| c.run_id.as_deref() == Some(run_id))
+                    {
+                        card.status = "review".to_string();
+                        let _ = app_handle
+                            .emit("notification", format!("Task completed: {}", card.title));
+                    }
+                    format!(
+                        "Success: Task completed ({}).\nWorking-tree changes:\n{}\nSummary: {}",
+                        note, changes_display, summary
+                    )
+                }
             }
-            format!("Success: Task completed. Summary: {}", summary)
         }
         "search_grep" => {
             let query = match args.get("query").and_then(|q| q.as_str()) {
@@ -5520,8 +5596,11 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
 
                 // task_complete moves the card to `review` (done inside execute_tool).
                 // Break the loop immediately so the next iteration can't overwrite that
-                // status with a `blocked`/`running` transition.
-                if tool_name == "task_complete" {
+                // status with a `blocked`/`running` transition. Only break on a
+                // SUCCESSFUL completion — a rejected task_complete (failed
+                // verification) returns an Error result and the loop continues
+                // so the model can fix the build.
+                if tool_name == "task_complete" && tool_result.starts_with("Success") {
                     let _ = app_handle_clone
                         .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
                     break;

@@ -4175,8 +4175,10 @@ const KNOWN_TOOLS: [&str; 13] = [
 ];
 
 /// Parse function-call style tool syntax some chat templates emit, e.g.
-/// `call:list_dir(path="src")` or `read_file(path="a.rs", start_line=10)`.
-/// Values may be quoted strings (with escapes), integers, booleans, or null.
+/// `call:list_dir(path="src")` or `replace_lines(start_line: 10, end_line: 12, content: "...")`.
+/// Keys may use `=` or `:` as separator. Values may be quoted strings,
+/// integers, booleans, or null. Payload-bearing calls whose `content` value
+/// contains unescaped interior quotes are handled by a greedy fallback.
 fn parse_function_syntax(s: &str) -> Option<(String, serde_json::Value)> {
     let mut t = s.trim();
     for prefix in ["call:", "tool:", "function:"] {
@@ -4187,7 +4189,7 @@ fn parse_function_syntax(s: &str) -> Option<(String, serde_json::Value)> {
     }
     let open = t.find('(')?;
     let name = t[..open].trim();
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !fn_ident_ok(name) {
         return None;
     }
     let close = t.rfind(')')?;
@@ -4195,76 +4197,143 @@ fn parse_function_syntax(s: &str) -> Option<(String, serde_json::Value)> {
         return None;
     }
     let args_str = t[open + 1..close].trim();
+    let args = parse_fn_args_strict(args_str)
+        .or_else(|| parse_fn_args_greedy_content(args_str))?;
+    Some((name.to_string(), serde_json::Value::Object(args)))
+}
+
+fn fn_ident_ok(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_fn_scalar_value(val_str: &str) -> serde_json::Value {
+    let v = val_str.trim();
+    if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+        serde_json::from_str(v)
+            .unwrap_or_else(|_| serde_json::Value::String(v[1..v.len() - 1].to_string()))
+    } else if let Ok(n) = v.parse::<i64>() {
+        serde_json::json!(n)
+    } else if v == "true" {
+        serde_json::json!(true)
+    } else if v == "false" {
+        serde_json::json!(false)
+    } else if v == "null" {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(v.to_string())
+    }
+}
+
+/// Strict pass: comma-split at top level respecting (well-escaped) quoted
+/// strings. Returns None if any part fails to parse cleanly — which happens
+/// when a content payload contains unescaped quotes; the greedy pass rescues.
+fn parse_fn_args_strict(
+    args_str: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut args = serde_json::Map::new();
-    if !args_str.is_empty() {
-        // Split on commas at top level, respecting quoted strings with escapes.
-        let mut parts: Vec<String> = Vec::new();
-        let mut cur = String::new();
-        let mut in_str = false;
-        let mut prev_escape = false;
-        for c in args_str.chars() {
-            if in_str {
-                if prev_escape {
-                    prev_escape = false;
-                    cur.push(c);
-                    continue;
-                }
-                if c == '\\' {
-                    prev_escape = true;
-                    cur.push(c);
-                    continue;
-                }
-                if c == '"' {
-                    in_str = false;
-                }
+    if args_str.is_empty() {
+        return Some(args);
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut prev_escape = false;
+    for c in args_str.chars() {
+        if in_str {
+            if prev_escape {
+                prev_escape = false;
                 cur.push(c);
-            } else {
-                match c {
-                    '"' => {
-                        in_str = true;
-                        cur.push(c);
-                    }
-                    ',' => {
-                        parts.push(cur.clone());
-                        cur.clear();
-                    }
-                    _ => cur.push(c),
+                continue;
+            }
+            if c == '\\' {
+                prev_escape = true;
+                cur.push(c);
+                continue;
+            }
+            if c == '"' {
+                in_str = false;
+            }
+            cur.push(c);
+        } else {
+            match c {
+                '"' => {
+                    in_str = true;
+                    cur.push(c);
                 }
+                ',' => {
+                    parts.push(cur.clone());
+                    cur.clear();
+                }
+                _ => cur.push(c),
             }
-        }
-        if !cur.trim().is_empty() {
-            parts.push(cur);
-        }
-        for part in parts {
-            let part = part.trim();
-            let eq = part.find('=')?;
-            let key = part[..eq].trim();
-            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return None;
-            }
-            let val_str = part[eq + 1..].trim();
-            let value: serde_json::Value = if val_str.starts_with('"')
-                && val_str.ends_with('"')
-                && val_str.len() >= 2
-            {
-                serde_json::from_str(val_str).unwrap_or_else(|_| {
-                    serde_json::Value::String(val_str[1..val_str.len() - 1].to_string())
-                })
-            } else if let Ok(n) = val_str.parse::<i64>() {
-                serde_json::json!(n)
-            } else if val_str == "true" {
-                serde_json::json!(true)
-            } else if val_str == "false" {
-                serde_json::json!(false)
-            } else if val_str == "null" {
-                serde_json::Value::Null
-            } else {
-                serde_json::Value::String(val_str.to_string())
-            };
-            args.insert(key.to_string(), value);
         }
     }
-    Some((name.to_string(), serde_json::Value::Object(args)))
+    if !cur.trim().is_empty() {
+        parts.push(cur);
+    }
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let sep = part.find(|c| c == '=' || c == ':')?;
+        let key = part[..sep].trim();
+        if !fn_ident_ok(key) {
+            return None;
+        }
+        args.insert(key.to_string(), parse_fn_scalar_value(part[sep + 1..].trim()));
+    }
+    Some(args)
+}
+
+/// Lenient scalar parsing for the regions around a greedy content span.
+fn parse_fn_args_lenient(s: &str, args: &mut serde_json::Map<String, serde_json::Value>) {
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(sep) = part.find(|c| c == '=' || c == ':') {
+            let key = part[..sep].trim();
+            if fn_ident_ok(key) {
+                args.insert(key.to_string(), parse_fn_scalar_value(part[sep + 1..].trim()));
+            }
+        }
+    }
+}
+
+/// Greedy pass for payload calls with unescaped interior quotes: `content` is
+/// taken as the span from its opening quote to the LAST quote in the argument
+/// list, and the scalar args before/after it are parsed leniently. Sound as
+/// long as `content` is the only string-valued argument — true for
+/// write_file/replace_lines/patch_file-style calls where the payload is code.
+fn parse_fn_args_greedy_content(
+    args_str: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let ckey = args_str.find("content")?;
+    let after = &args_str[ckey + 7..];
+    let sep_rel = after.find(|c| c == '=' || c == ':')?;
+    if !after[..sep_rel].trim().is_empty() {
+        return None;
+    }
+    let q_off = after[sep_rel + 1..].find('"')?;
+    let content_start = ckey + 7 + sep_rel + 1 + q_off + 1;
+    let last_q = args_str.rfind('"')?;
+    if last_q <= content_start {
+        return None;
+    }
+    let content_val = &args_str[content_start..last_q];
+    let mut args = serde_json::Map::new();
+    parse_fn_args_lenient(args_str[..ckey].trim_end().trim_end_matches(','), &mut args);
+    parse_fn_args_lenient(
+        args_str[last_q + 1..].trim_start().trim_start_matches(','),
+        &mut args,
+    );
+    args.insert(
+        "content".to_string(),
+        serde_json::Value::String(content_val.to_string()),
+    );
+    Some(args)
 }
 
 /// Extract tool arguments tolerantly: our protocol says "args", but native

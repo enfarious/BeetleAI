@@ -27,6 +27,8 @@ ureq = { version = "2", features = ["json"] }
 chrono = "0.4"
 tokio = { version = "1", features = ["time"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+grep-searcher = "0.1.16"
+ignore = "0.4.26"
 
 
 [dev-dependencies]

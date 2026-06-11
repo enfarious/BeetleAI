@@ -2553,6 +2553,15 @@ function renderDiffHtml(diff: string): string {
     `;
   }
 
+  if (!diff.includes("diff --git ")) {
+    return `
+      <div class="empty-state">
+        <span class="empty-state-icon">ℹ️</span>
+        <span>${escapeHtml(diff)}</span>
+      </div>
+    `;
+  }
+
   const files = diff.split("diff --git ");
   let html = `<div class="diff-viewer">`;
 

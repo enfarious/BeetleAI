@@ -4,9 +4,10 @@ use std::process::Command;
 
 /// Run a git command with args in a specific directory
 fn run_git_cmd<P: AsRef<Path>>(cwd: P, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .current_dir(cwd.as_ref())
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.current_dir(cwd.as_ref()).args(args);
+    crate::configure_no_window(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to execute git: {}", e))?;
 

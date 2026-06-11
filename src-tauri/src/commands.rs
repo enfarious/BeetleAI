@@ -757,13 +757,13 @@ pub struct DirEntry {
 }
 
 #[tauri::command]
-pub fn list_projects(app_handle: tauri::AppHandle) -> Vec<Project> {
+pub async fn list_projects(app_handle: tauri::AppHandle) -> Vec<Project> {
     let config = load_config(&app_handle);
     config.projects
 }
 
 #[tauri::command]
-pub fn open_project(path: String) -> Result<Project, String> {
+pub async fn open_project(path: String) -> Result<Project, String> {
     let p = Path::new(&path);
     if p.exists() {
         Ok(Project {
@@ -783,7 +783,7 @@ pub fn open_project(path: String) -> Result<Project, String> {
 }
 
 #[tauri::command]
-pub fn create_project(
+pub async fn create_project(
     app_handle: tauri::AppHandle,
     name: String,
     path: String,
@@ -809,10 +809,10 @@ pub fn create_project(
 
     // Auto-init git repository
     if !git::is_git_repo(p) {
-        let _ = Command::new("git")
-            .current_dir(p)
-            .args(&["init", "-b", "main"])
-            .output();
+        let mut init_cmd = Command::new("git");
+        init_cmd.current_dir(p).args(&["init", "-b", "main"]);
+        crate::configure_no_window(&mut init_cmd);
+        let _ = init_cmd.output();
 
         let gitignore = p.join(".gitignore");
         if !gitignore.exists() {
@@ -843,20 +843,20 @@ pub fn create_project(
 }
 
 #[tauri::command]
-pub fn get_settings(app_handle: tauri::AppHandle) -> LlmSettings {
+pub async fn get_settings(app_handle: tauri::AppHandle) -> LlmSettings {
     let config = load_config(&app_handle);
     config.settings
 }
 
 #[tauri::command]
-pub fn save_settings(app_handle: tauri::AppHandle, settings: LlmSettings) -> Result<(), String> {
+pub async fn save_settings(app_handle: tauri::AppHandle, settings: LlmSettings) -> Result<(), String> {
     let mut config = load_config(&app_handle);
     config.settings = settings;
     save_config(&app_handle, &config)
 }
 
 #[tauri::command]
-pub fn list_design_docs(project_path: String) -> Result<Vec<String>, String> {
+pub async fn list_design_docs(project_path: String) -> Result<Vec<String>, String> {
     let cleaned_path = clean_project_path(&project_path);
     let design_dir = cleaned_path.join("design");
     if !design_dir.exists() {
@@ -893,7 +893,7 @@ pub fn list_design_docs(project_path: String) -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-pub fn read_design_doc(project_path: String, doc_name: String) -> Result<String, String> {
+pub async fn read_design_doc(project_path: String, doc_name: String) -> Result<String, String> {
     let p = clean_project_path(&project_path)
         .join("design")
         .join(&doc_name);
@@ -905,7 +905,7 @@ pub fn read_design_doc(project_path: String, doc_name: String) -> Result<String,
 }
 
 #[tauri::command]
-pub fn write_design_doc(
+pub async fn write_design_doc(
     project_path: String,
     doc_name: String,
     content: String,
@@ -2407,7 +2407,7 @@ fn call_lmstudio_stateful(
 }
 
 #[tauri::command]
-pub fn send_design_chat(
+pub async fn send_design_chat(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_path: String,
@@ -2625,7 +2625,7 @@ pub fn send_design_chat(
 }
 
 #[tauri::command]
-pub fn get_design_log(
+pub async fn get_design_log(
     state: tauri::State<'_, AppState>,
     project_path: String,
     doc_name: String,
@@ -2645,7 +2645,7 @@ pub fn get_design_log(
 }
 
 #[tauri::command]
-pub fn send_code_chat(
+pub async fn send_code_chat(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_path: String,
@@ -2865,7 +2865,7 @@ pub fn send_code_chat(
 }
 
 #[tauri::command]
-pub fn get_code_log(
+pub async fn get_code_log(
     state: tauri::State<'_, AppState>,
     project_path: String,
     file_path: String,
@@ -2885,11 +2885,11 @@ pub fn get_code_log(
 }
 
 #[tauri::command]
-pub fn list_cards(
+pub async fn list_cards(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_path: String,
-) -> Vec<Card> {
+) -> Result<Vec<Card>, String> {
     let mut cards = state.cards.lock().unwrap();
 
     let has_cards = cards.iter().any(|c| c.project_path == project_path);
@@ -2901,22 +2901,22 @@ pub fn list_cards(
         }
     }
 
-    cards
+    Ok(cards
         .iter()
         .filter(|c| c.project_path == project_path)
         .cloned()
-        .collect()
+        .collect())
 }
 
 #[tauri::command]
-pub fn create_card(
+pub async fn create_card(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_path: String,
     title: String,
     description: String,
     status: Option<String>,
-) -> Card {
+) -> Result<Card, String> {
     let mut cards = state.cards.lock().unwrap();
     let initial_status = status.unwrap_or_else(|| "backlog".to_string());
     let new_card = Card {
@@ -2938,11 +2938,11 @@ pub fn create_card(
         );
     }
 
-    new_card
+    Ok(new_card)
 }
 
 #[tauri::command]
-pub fn update_card(
+pub async fn update_card(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     card_id: String,
@@ -2966,7 +2966,7 @@ pub fn update_card(
 }
 
 #[tauri::command]
-pub fn save_card(
+pub async fn save_card(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     card: Card,
@@ -3002,7 +3002,7 @@ pub fn save_card(
 }
 
 #[tauri::command]
-pub fn delete_card(
+pub async fn delete_card(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     card_id: String,
@@ -3023,7 +3023,7 @@ pub fn delete_card(
 }
 
 #[tauri::command]
-pub fn start_run(
+pub async fn start_run(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     card_id: String,
@@ -3117,16 +3117,16 @@ pub fn start_run(
 }
 
 #[tauri::command]
-pub fn cancel_run(
+pub async fn cancel_run(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     run_id: String,
 ) -> Result<(), String> {
-    abort_chat(app_handle, state, run_id)
+    abort_chat(app_handle, state, run_id).await
 }
 
 #[tauri::command]
-pub fn abort_chat(
+pub async fn abort_chat(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     run_id: String,
@@ -3191,13 +3191,13 @@ pub fn abort_chat(
 }
 
 #[tauri::command]
-pub fn is_run_active(state: tauri::State<'_, AppState>, run_id: String) -> bool {
+pub async fn is_run_active(state: tauri::State<'_, AppState>, run_id: String) -> Result<bool, String> {
     let active = state.active_runs.lock().unwrap();
-    active.contains(&run_id)
+    Ok(active.contains(&run_id))
 }
 
 #[tauri::command]
-pub fn unblock_run(
+pub async fn unblock_run(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     run_id: String,
@@ -3264,7 +3264,7 @@ pub fn unblock_run(
 }
 
 #[tauri::command]
-pub fn accept_run(
+pub async fn accept_run(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     run_id: String,
@@ -3316,7 +3316,7 @@ pub fn accept_run(
 }
 
 #[tauri::command]
-pub fn reject_run(
+pub async fn reject_run(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     run_id: String,
@@ -3372,7 +3372,7 @@ pub fn reject_run(
 }
 
 #[tauri::command]
-pub fn get_run_log(
+pub async fn get_run_log(
     state: tauri::State<'_, AppState>,
     run_id: String,
 ) -> Result<Vec<RunEvent>, String> {
@@ -3385,7 +3385,7 @@ pub fn get_run_log(
 }
 
 #[tauri::command]
-pub fn send_chat(
+pub async fn send_chat(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     run_id: String,
@@ -3428,7 +3428,7 @@ pub fn send_chat(
 }
 
 #[tauri::command]
-pub fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Result<String, String> {
+pub async fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Result<String, String> {
     // If the run's card can't be found, there is no correct repo to diff against —
     // fail loudly rather than silently diffing the app's own working directory.
     let repo_path = repo_path_for_run(&state, &run_id).ok_or_else(|| {
@@ -3487,7 +3487,7 @@ index 0000000..f67ab7c
 }
 
 #[tauri::command]
-pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
+pub async fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let base_path = Path::new(&path);
     let mut entries = Vec::new();
 
@@ -3524,7 +3524,7 @@ pub fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
 }
 
 #[tauri::command]
-pub fn read_file(path: String) -> Result<String, String> {
+pub async fn read_file(path: String) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
@@ -3536,7 +3536,7 @@ pub struct ModelInfo {
 }
 
 #[tauri::command]
-pub fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo>, String> {
+pub async fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo>, String> {
     let base_url = url.trim_end_matches('/');
 
     // Helper closure to parse OpenAI compatible or LM Studio response JSON from /models
@@ -3863,7 +3863,7 @@ fn path_is_within(target: &Path, base: &Path) -> bool {
 }
 
 #[tauri::command]
-pub fn create_file(project_path: String, path: String) -> Result<(), String> {
+pub async fn create_file(project_path: String, path: String) -> Result<(), String> {
     let target = verify_sandbox(&project_path, &path)?;
     if target.exists() {
         return Err("File already exists".to_string());
@@ -3876,7 +3876,7 @@ pub fn create_file(project_path: String, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn create_dir(project_path: String, path: String) -> Result<(), String> {
+pub async fn create_dir(project_path: String, path: String) -> Result<(), String> {
     let target = verify_sandbox(&project_path, &path)?;
     if target.exists() {
         return Err("Directory already exists".to_string());
@@ -3886,14 +3886,14 @@ pub fn create_dir(project_path: String, path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn save_file(project_path: String, path: String, content: String) -> Result<(), String> {
+pub async fn save_file(project_path: String, path: String, content: String) -> Result<(), String> {
     let target = verify_sandbox(&project_path, &path)?;
     fs::write(&target, content).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_item(project_path: String, path: String) -> Result<(), String> {
+pub async fn delete_item(project_path: String, path: String) -> Result<(), String> {
     let target = verify_sandbox(&project_path, &path)?;
     if !target.exists() {
         return Err("Path does not exist".to_string());
@@ -4194,6 +4194,7 @@ fn run_git_command<P: AsRef<Path>>(dir: P, args: &[&str]) -> Result<String, Stri
     let mut cmd = Command::new("git");
     cmd.current_dir(dir);
     cmd.args(args);
+    crate::configure_no_window(&mut cmd);
     let output = cmd.output().map_err(|e| e.to_string())?;
     let out = String::from_utf8_lossy(&output.stdout).to_string();
     let err = String::from_utf8_lossy(&output.stderr).to_string();
@@ -4215,6 +4216,7 @@ fn run_shell_command<P: AsRef<Path>>(dir: P, command_str: &str) -> Result<String
         c
     };
     cmd.current_dir(dir);
+    crate::configure_no_window(&mut cmd);
     let output = cmd.output().map_err(|e| e.to_string())?;
     let out = String::from_utf8_lossy(&output.stdout).to_string();
     let err = String::from_utf8_lossy(&output.stderr).to_string();

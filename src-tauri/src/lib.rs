@@ -51,6 +51,24 @@ pub fn app_root_path() -> PathBuf {
     p
 }
 
+/// On Windows, prevent spawned child processes (git, cmd.exe) from flashing a
+/// console window. Windowed-subsystem release builds have no parent console,
+/// so every child otherwise gets its own conhost: a visible flash plus
+/// 100-300ms of spawn overhead per call. Dev builds never show this because
+/// the dev exe has a console the children quietly attach to.
+pub fn configure_no_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     std::panic::set_hook(Box::new(|panic_info| {

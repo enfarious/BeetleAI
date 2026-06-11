@@ -503,59 +503,120 @@ function setupResizablePanels() {
 
   const resizerLeft = document.getElementById("resizer-left") as HTMLDivElement;
   const resizerRight = document.getElementById("resizer-right") as HTMLDivElement;
-
   if (!resizerLeft || !resizerRight) return;
 
-  let leftWidth = 280;
-  let centerWidth = 480;
+  const panelIds = ["left-panel", "center-panel", "right-panel"];
+  const panels: Record<string, HTMLElement> = {};
+  for (const id of panelIds) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    panels[id] = el;
+  }
 
-  const minLeft = 180;
-  const maxLeft = 500;
-  const minCenter = 300;
-  const maxCenter = 800;
+  // Per-panel widths; whichever panel sits in the LAST position flexes (1fr).
+  const minWidths: Record<string, number> = { "left-panel": 180, "center-panel": 300, "right-panel": 300 };
+  const maxWidths: Record<string, number> = { "left-panel": 500, "center-panel": 800, "right-panel": 900 };
+  const widths: Record<string, number> = { "left-panel": 280, "center-panel": 480, "right-panel": 600 };
+  let order: string[] = [...panelIds];
 
-  resizerLeft.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    document.body.classList.add("resizing-active");
-    resizerLeft.classList.add("dragging");
+  // Restore persisted layout (order + widths).
+  try {
+    const saved = JSON.parse(localStorage.getItem("beetle-panel-layout") || "null");
+    if (saved && Array.isArray(saved.order) && saved.order.length === 3 && panelIds.every(id => saved.order.includes(id))) {
+      order = saved.order;
+    }
+    if (saved && saved.widths) {
+      for (const id of panelIds) {
+        if (typeof saved.widths[id] === "number") widths[id] = saved.widths[id];
+      }
+    }
+  } catch {
+    // Corrupt layout state: fall back to defaults.
+  }
 
-    const onMouseMove = (moveEvent: MouseEvent) => {
-      leftWidth = Math.max(minLeft, Math.min(maxLeft, moveEvent.clientX));
-      container.style.gridTemplateColumns = `${leftWidth}px 4px ${centerWidth}px 4px 1fr`;
-    };
+  function persist() {
+    localStorage.setItem("beetle-panel-layout", JSON.stringify({ order, widths }));
+  }
 
-    const onMouseUp = () => {
-      document.body.classList.remove("resizing-active");
-      resizerLeft.classList.remove("dragging");
-      document.removeEventListener("mousemove", onMouseMove);
-      document.removeEventListener("mouseup", onMouseUp);
-    };
+  function clampWidth(id: string, w: number): number {
+    return Math.max(minWidths[id], Math.min(maxWidths[id], w));
+  }
 
-    document.addEventListener("mousemove", onMouseMove);
-    document.addEventListener("mouseup", onMouseUp);
-  });
+  function applyWidths() {
+    const w0 = clampWidth(order[0], widths[order[0]]);
+    const w1 = clampWidth(order[1], widths[order[1]]);
+    container.style.gridTemplateColumns = `${w0}px 4px ${w1}px 4px 1fr`;
+  }
 
-  resizerRight.addEventListener("mousedown", (e) => {
-    e.preventDefault();
-    document.body.classList.add("resizing-active");
-    resizerRight.classList.add("dragging");
+  function applyLayout() {
+    // Grid auto-places by DOM order: panel, resizer, panel, resizer, panel.
+    container.appendChild(panels[order[0]]);
+    container.appendChild(resizerLeft);
+    container.appendChild(panels[order[1]]);
+    container.appendChild(resizerRight);
+    container.appendChild(panels[order[2]]);
+    applyWidths();
+  }
 
-    const onMouseMove = (moveEvent: MouseEvent) => {
-      const centerStart = leftWidth + 4;
-      centerWidth = Math.max(minCenter, Math.min(maxCenter, moveEvent.clientX - centerStart));
-      container.style.gridTemplateColumns = `${leftWidth}px 4px ${centerWidth}px 4px 1fr`;
-    };
+  // Resizers operate on positions, not specific panels, so they keep working
+  // after a reorder: position 0 sizes the first panel, position 1 the second.
+  function attachResizer(resizer: HTMLDivElement, position: 0 | 1) {
+    resizer.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      document.body.classList.add("resizing-active");
+      resizer.classList.add("dragging");
 
-    const onMouseUp = () => {
-      document.body.classList.remove("resizing-active");
-      resizerRight.classList.remove("dragging");
-      document.removeEventListener("mousemove", onMouseMove);
-      document.removeEventListener("mouseup", onMouseUp);
-    };
+      const onMouseMove = (moveEvent: MouseEvent) => {
+        const id = order[position];
+        const offset = position === 0 ? 0 : clampWidth(order[0], widths[order[0]]) + 4;
+        widths[id] = clampWidth(id, moveEvent.clientX - offset);
+        applyWidths();
+      };
 
-    document.addEventListener("mousemove", onMouseMove);
-    document.addEventListener("mouseup", onMouseUp);
-  });
+      const onMouseUp = () => {
+        document.body.classList.remove("resizing-active");
+        resizer.classList.remove("dragging");
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+        persist();
+      };
+
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    });
+  }
+
+  attachResizer(resizerLeft, 0);
+  attachResizer(resizerRight, 1);
+
+  // Reorder: drag a panel's header onto another panel to swap their positions.
+  for (const id of panelIds) {
+    const header = panels[id].querySelector(".panel-header") as HTMLElement | null;
+    if (!header) continue;
+    header.draggable = true;
+    header.style.cursor = "grab";
+    header.title = "Drag to swap panel positions";
+    header.addEventListener("dragstart", (e) => {
+      e.dataTransfer?.setData("text/panel-id", id);
+      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+    });
+    panels[id].addEventListener("dragover", (e) => {
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    });
+    panels[id].addEventListener("drop", (e) => {
+      e.preventDefault();
+      const fromId = e.dataTransfer?.getData("text/panel-id");
+      if (!fromId || fromId === id || !panelIds.includes(fromId)) return;
+      const a = order.indexOf(fromId);
+      const b = order.indexOf(id);
+      [order[a], order[b]] = [order[b], order[a]];
+      applyLayout();
+      persist();
+    });
+  }
+
+  applyLayout();
 }
 
 // Initialize App

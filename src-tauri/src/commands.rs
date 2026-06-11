@@ -1246,6 +1246,15 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
         .filter(|e| e.event_type == "tool_result")
         .count();
     let mut tool_result_seen = 0usize;
+    // Reasoning is budgeted even harder: replaying old chain-of-thought every
+    // step is pure prompt-ingestion tax with zero value to the model. Only the
+    // most recent reasoning block is kept, truncated.
+    let total_reasoning = events
+        .iter()
+        .filter(|e| e.event_type == "reasoning")
+        .count();
+    let mut reasoning_seen = 0usize;
+    const REASONING_MAX_CHARS: usize = 2000;
     // The most recent N results are kept fuller; everything older is trimmed hard.
     const RECENT_KEEP: usize = 2;
     const RECENT_MAX_CHARS: usize = 6000;
@@ -1274,10 +1283,16 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
                 (None, None)
             }
         } else if event.event_type == "reasoning" {
-            (
-                Some("assistant".to_string()),
-                Some(format!("<think>\n{}\n</think>", event.payload)),
-            )
+            reasoning_seen += 1;
+            if reasoning_seen == total_reasoning {
+                let trimmed = truncate_tool_result(&event.payload, REASONING_MAX_CHARS);
+                (
+                    Some("assistant".to_string()),
+                    Some(format!("<think>\n{}\n</think>", trimmed)),
+                )
+            } else {
+                (None, None)
+            }
         } else if event.event_type == "tool_call" {
             if let Ok(call_json) = serde_json::from_str::<serde_json::Value>(&event.payload) {
                 let name = call_json.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -3992,12 +4007,14 @@ fn construct_agent_system_prompt(
          2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
          3. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed).\n\
          4. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
-         5. `git_status()`: Runs `git status` in the sandbox.\n\
-         6. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
-         7. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests!\n\
-         8. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
-         9. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
-         10. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
+         5. `search_grep(query: String, path?: String)`: Searches file contents for a substring across the whole repo (or under a path). Use this to find where symbols, strings, or config values live — do NOT use shell grep.\n\
+         6. `git_status()`: Runs `git status` in the sandbox.\n\
+         7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
+         8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
+         9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. Prefer this over write_file for small edits to large files.\n\
+         10. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
+         11. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
+         12. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     )
@@ -4702,7 +4719,10 @@ fn execute_tool(
             };
             patch_file_impl(worktree_path, path, target_str, replacement_str)
         }
-        _ => format!("Error: Unknown tool '{}'", tool_name),
+        _ => format!(
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, list_dir, search_grep, git_status, git_diff, run_command, web_search, send_notification, task_complete. You may ONLY call these tools.",
+            tool_name
+        ),
     }
 }
 
@@ -4753,6 +4773,11 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
             .join(&run_id_clone);
 
         let mut step = 0;
+        // Loop-guard state: consecutive identical tool calls are a stuck model,
+        // not progress. Nudge at 3 repeats, hard-block at 5 instead of burning
+        // a slow local model all the way to the step ceiling.
+        let mut last_tool_signature: Option<String> = None;
+        let mut repeat_count: u32 = 0;
 
         loop {
             {
@@ -4798,6 +4823,10 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
 
             let system_prompt =
                 construct_agent_system_prompt(&worktree_path, &card_title, &card_desc);
+            let system_prompt = format!(
+                "{}\n\nYou are on step {} of a maximum of {} for this run. Pace your work to finish and call task_complete before hitting the ceiling.",
+                system_prompt, step, max_steps
+            );
             let tools_schema = get_openai_tools_schema(&[
                 "read_file",
                 "outline_file",
@@ -4882,13 +4911,51 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 let _ = app_handle_clone
                     .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
 
-                let tool_result = execute_tool(
+                // Loop-guard: track consecutive identical calls.
+                let signature = format!("{}:{}", tool_name, args);
+                if last_tool_signature.as_deref() == Some(signature.as_str()) {
+                    repeat_count += 1;
+                } else {
+                    repeat_count = 0;
+                    last_tool_signature = Some(signature);
+                }
+
+                if repeat_count >= 4 {
+                    log_error(&format!(
+                        "Run {} blocked: tool '{}' called identically {} times in a row",
+                        run_id_clone,
+                        tool_name,
+                        repeat_count + 1
+                    ));
+                    append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "blocked".to_string(),
+                        payload: serde_json::json!({
+                            "reason": "stuck_loop",
+                            "message": format!("The agent called '{}' with identical arguments {} times in a row and appears stuck. Reply in chat to redirect it.", tool_name, repeat_count + 1)
+                        }).to_string(),
+                    });
+                    set_card_status(&app_handle_clone, &state, &card_id, "blocked");
+                    let _ = app_handle_clone
+                        .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                    break;
+                }
+
+                let mut tool_result = execute_tool(
                     &app_handle_clone,
                     &worktree_path,
                     &tool_name,
                     &args,
                     &run_id_clone,
                 );
+
+                if repeat_count >= 2 {
+                    tool_result.push_str(&format!(
+                        "\n\n[harness note: you have now called '{}' with identical arguments {} times in a row. The result will not change. Try a different tool, different arguments, or reconsider your approach.]",
+                        tool_name,
+                        repeat_count + 1
+                    ));
+                }
 
                 append_run_event(
                     &app_handle_clone,

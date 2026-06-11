@@ -4158,6 +4158,115 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
+const KNOWN_TOOLS: [&str; 13] = [
+    "read_file",
+    "outline_file",
+    "write_file",
+    "patch_file",
+    "replace_lines",
+    "list_dir",
+    "search_grep",
+    "git_status",
+    "git_diff",
+    "run_command",
+    "web_search",
+    "send_notification",
+    "task_complete",
+];
+
+/// Parse function-call style tool syntax some chat templates emit, e.g.
+/// `call:list_dir(path="src")` or `read_file(path="a.rs", start_line=10)`.
+/// Values may be quoted strings (with escapes), integers, booleans, or null.
+fn parse_function_syntax(s: &str) -> Option<(String, serde_json::Value)> {
+    let mut t = s.trim();
+    for prefix in ["call:", "tool:", "function:"] {
+        if let Some(stripped) = t.strip_prefix(prefix) {
+            t = stripped.trim_start();
+            break;
+        }
+    }
+    let open = t.find('(')?;
+    let name = t[..open].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let close = t.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let args_str = t[open + 1..close].trim();
+    let mut args = serde_json::Map::new();
+    if !args_str.is_empty() {
+        // Split on commas at top level, respecting quoted strings with escapes.
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut in_str = false;
+        let mut prev_escape = false;
+        for c in args_str.chars() {
+            if in_str {
+                if prev_escape {
+                    prev_escape = false;
+                    cur.push(c);
+                    continue;
+                }
+                if c == '\\' {
+                    prev_escape = true;
+                    cur.push(c);
+                    continue;
+                }
+                if c == '"' {
+                    in_str = false;
+                }
+                cur.push(c);
+            } else {
+                match c {
+                    '"' => {
+                        in_str = true;
+                        cur.push(c);
+                    }
+                    ',' => {
+                        parts.push(cur.clone());
+                        cur.clear();
+                    }
+                    _ => cur.push(c),
+                }
+            }
+        }
+        if !cur.trim().is_empty() {
+            parts.push(cur);
+        }
+        for part in parts {
+            let part = part.trim();
+            let eq = part.find('=')?;
+            let key = part[..eq].trim();
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return None;
+            }
+            let val_str = part[eq + 1..].trim();
+            let value: serde_json::Value = if val_str.starts_with('"')
+                && val_str.ends_with('"')
+                && val_str.len() >= 2
+            {
+                serde_json::from_str(val_str).unwrap_or_else(|_| {
+                    serde_json::Value::String(val_str[1..val_str.len() - 1].to_string())
+                })
+            } else if let Ok(n) = val_str.parse::<i64>() {
+                serde_json::json!(n)
+            } else if val_str == "true" {
+                serde_json::json!(true)
+            } else if val_str == "false" {
+                serde_json::json!(false)
+            } else if val_str == "null" {
+                serde_json::Value::Null
+            } else {
+                serde_json::Value::String(val_str.to_string())
+            };
+            args.insert(key.to_string(), value);
+        }
+    }
+    Some((name.to_string(), serde_json::Value::Object(args)))
+}
+
 /// Extract tool arguments tolerantly: our protocol says "args", but native
 /// chat templates use "arguments" (Qwen/Hermes) or "parameters", and some
 /// stringify the object. Accept all of them.
@@ -4235,21 +4344,35 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
     }
 
     // Native chat-template formats: Qwen/Hermes-style <tool_call>{...}</tool_call>,
-    // pipe and space variants included, tolerating a missing closing tag when
-    // generation was truncated. Models with thinking disabled fall back to their
-    // trained format regardless of what the system prompt asks for — meet them
-    // where they are instead of blocking on a perfectly good tool call.
-    const TAG_OPENERS: [&str; 4] = ["<tool_call>", "<|tool_call|>", "<tool call>", "<|tool call|>"];
+    // pipe/space variants, and MANGLED special-token approximations like
+    // `<|tool_call>...<tool_call|>` (a model typing its own special token from
+    // memory). Tolerates a missing closing tag when generation was truncated.
+    const TAG_OPENERS: [&str; 5] = [
+        "<tool_call>",
+        "<|tool_call|>",
+        "<|tool_call>",
+        "<tool call>",
+        "<|tool call|>",
+    ];
     for opener in TAG_OPENERS {
         let mut search = 0;
         while let Some(idx) = response_cleaned[search..].find(opener) {
             let start = search + idx + opener.len();
             let rest = &response_cleaned[start..];
-            let inner = match rest.find("</tool_call>").or_else(|| rest.find("<|/tool_call|>")) {
-                Some(end) => &rest[..end],
+            let end = rest
+                .find("</tool_call>")
+                .or_else(|| rest.find("<|/tool_call|>"))
+                .or_else(|| rest.find("<tool_call|>"))
+                .or_else(|| rest.find("<|tool_call>"));
+            let inner = match end {
+                Some(e) => &rest[..e],
                 None => rest,
             };
-            if let Some(parsed) = try_parse_json(inner.trim()) {
+            let inner = inner.trim();
+            if let Some(parsed) = try_parse_json(inner) {
+                return Some(parsed);
+            }
+            if let Some(parsed) = parse_function_syntax(inner) {
                 return Some(parsed);
             }
             search = start;
@@ -4258,6 +4381,19 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
 
     if let Some(parsed) = try_parse_json(response_cleaned) {
         return Some(parsed);
+    }
+
+    // Bare function-call syntax in the response body (e.g. `list_dir(path="src")`),
+    // anchored to known tool names so ordinary prose can't false-positive.
+    for tool in KNOWN_TOOLS {
+        let pat = format!("{}(", tool);
+        if let Some(idx) = response_cleaned.find(&pat) {
+            if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..]) {
+                if name == tool {
+                    return Some((name, args));
+                }
+            }
+        }
     }
 
     None

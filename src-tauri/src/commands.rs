@@ -1185,6 +1185,30 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                     }
                 }
             }),
+            "read_card" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "read_card",
+                    "description": "Shows your current card: title, description, status, and its todo list with indices and completion marks. Use the todos as your work plan.",
+                    "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+                }
+            }),
+            "set_todo" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "set_todo",
+                    "description": "Checks off (or unchecks) a todo item on your card. Mark items complete as you finish them so progress is visible to the developer.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "index": { "type": "integer", "description": "Todo index from read_card (0-based)" },
+                            "completed": { "type": "boolean", "description": "true to check off (default), false to uncheck" }
+                        },
+                        "required": ["index"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
             "replace_lines" => serde_json::json!({
                 "type": "function",
                 "function": {
@@ -3471,6 +3495,22 @@ pub async fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Res
     if git::is_git_repo(&repo_path) {
         let base_branch =
             git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
+        // Live runs keep their work UNCOMMITTED in the worktree — a committed-
+        // range diff is blind to it. Diff the worktree's tree against base.
+        let worktree_dir = repo_path.join(".harness").join("worktrees").join(&run_id);
+        if worktree_dir.exists() {
+            return match git::get_worktree_diff(&repo_path, &run_id, &base_branch) {
+                Ok(diff) if diff.trim().is_empty() => {
+                    Ok("No changes detected in this run.".to_string())
+                }
+                Ok(diff) => Ok(diff),
+                Err(e) => {
+                    let err_msg = format!("Error generating diff: {}", e);
+                    log_error(&err_msg);
+                    Err(err_msg)
+                }
+            };
+        }
         // A cancelled or rejected run's branch has been deleted by cleanup; the
         // card may still reference the run_id. That's a normal state, not an error.
         let branch_name = format!("harness/run-{}", run_id);
@@ -4058,7 +4098,9 @@ fn construct_agent_system_prompt(
          10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error.\n\
          11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
          12. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
-         13. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status.\n\n\
+         13. `read_card()`: Shows YOUR current card: title, description, status, and its todo list with indices. Read it at the start of a run and use the todos as your work plan.\n\
+         14. `set_todo(index: int, completed: bool)`: Checks off a todo on your card (index from read_card). Mark items complete as you finish them so progress is visible.\n\
+         15. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status. Before calling it, read_card and confirm every todo is checked — or explain why not in your summary.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     )
@@ -4166,7 +4208,7 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
-const KNOWN_TOOLS: [&str; 13] = [
+const KNOWN_TOOLS: [&str; 15] = [
     "read_file",
     "outline_file",
     "write_file",
@@ -4179,6 +4221,8 @@ const KNOWN_TOOLS: [&str; 13] = [
     "run_command",
     "web_search",
     "send_notification",
+    "read_card",
+    "set_todo",
     "task_complete",
 ];
 
@@ -5081,8 +5125,77 @@ fn execute_tool(
             let content = args.get("content").and_then(|c| c.as_str()).unwrap_or("");
             replace_lines_impl(worktree_path, path, start_line, end_line, content)
         }
+        "read_card" => {
+            let state_handle = match app_handle.try_state::<AppState>() {
+                Some(s) => s,
+                None => return "Error: app state unavailable".to_string(),
+            };
+            let cards = state_handle.cards.lock().unwrap();
+            match cards.iter().find(|c| c.run_id.as_deref() == Some(run_id)) {
+                Some(card) => {
+                    let mut out = format!(
+                        "Card: {}\nStatus: {}\nDescription: {}\n\nTodo list:",
+                        card.title, card.status, card.description
+                    );
+                    if card.todo_list.is_empty() {
+                        out.push_str(" (empty)");
+                    }
+                    for (i, t) in card.todo_list.iter().enumerate() {
+                        out.push_str(&format!(
+                            "\n  {}. [{}] {}",
+                            i,
+                            if t.completed { "x" } else { " " },
+                            t.text
+                        ));
+                    }
+                    out
+                }
+                None => "Error: no card found for this run".to_string(),
+            }
+        }
+        "set_todo" => {
+            const USAGE: &str = " Usage: set_todo(index: int, completed: bool) — index comes from read_card; completed defaults to true.";
+            let index = match args.get("index").and_then(|v| v.as_u64()) {
+                Some(v) => v as usize,
+                None => return format!("Error: Missing 'index' argument.{}", USAGE),
+            };
+            let completed = args.get("completed").and_then(|v| v.as_bool()).unwrap_or(true);
+            let state_handle = match app_handle.try_state::<AppState>() {
+                Some(s) => s,
+                None => return "Error: app state unavailable".to_string(),
+            };
+            let mut cards = state_handle.cards.lock().unwrap();
+            match cards.iter_mut().find(|c| c.run_id.as_deref() == Some(run_id)) {
+                Some(card) => {
+                    if index >= card.todo_list.len() {
+                        return format!(
+                            "Error: index {} out of range — this card has {} todo item(s). Call read_card to see them.",
+                            index,
+                            card.todo_list.len()
+                        );
+                    }
+                    card.todo_list[index].completed = completed;
+                    let card_id = card.id.clone();
+                    let text = card.todo_list[index].text.clone();
+                    if let Ok(conn) = get_db_conn(app_handle) {
+                        let _ = conn.execute(
+                            "UPDATE todo_items SET completed = ?1 WHERE card_id = ?2 AND idx = ?3",
+                            (if completed { 1 } else { 0 }, &card_id, index as i32),
+                        );
+                    }
+                    let _ = app_handle.emit("run-updated", serde_json::json!({ "run_id": run_id }));
+                    format!(
+                        "Success: todo {} ('{}') marked {}.",
+                        index,
+                        text,
+                        if completed { "complete" } else { "incomplete" }
+                    )
+                }
+                None => "Error: no card found for this run".to_string(),
+            }
+        }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, git_status, git_diff, run_command, web_search, send_notification, task_complete. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -5206,6 +5319,8 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "search_grep",
                 "patch_file",
                 "replace_lines",
+                "read_card",
+                "set_todo",
             ]);
             let response = match call_llm(
                 &app_handle_clone,

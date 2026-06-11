@@ -5,6 +5,7 @@ This document serves as a high-level overview and Table of Contents for all majo
 ## 1. Core Architecture (Agent Harness)
 *Status: Foundation / North-Star*
 - [DesignDoc.md](../DesignDoc.md) - The core architectural blueprint for the agent loop and execution engine.
+- [architecture.md](architecture.md) - System architecture overview: command bridge, run lifecycle, functional domains, tech stack, and roadmap.
 
 ## 2. Safety & Isolation
 *Status: High Priority*

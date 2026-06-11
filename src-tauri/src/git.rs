@@ -99,6 +99,36 @@ pub fn merge_worktree<P: AsRef<Path>>(
 ) -> Result<(), String> {
     let repo_path = repo_path.as_ref();
     let branch_name = format!("harness/run-{}", run_id);
+    let worktree_dir = repo_path.join(".harness").join("worktrees").join(run_id);
+
+    // 0. Commit the agent's work. Edits live as UNCOMMITTED working-tree state
+    //    in the worktree; without this commit the branch tip never moves, the
+    //    merge below is a silent no-op, and the --force cleanup deletes the
+    //    only copy of the work.
+    if worktree_dir.exists() {
+        run_git_cmd(&worktree_dir, &["add", "-A"])?;
+        // "nothing to commit" is a legitimate outcome; tolerate it.
+        let _ = run_git_cmd(
+            &worktree_dir,
+            &["commit", "-m", &format!("Harness run {}", run_id)],
+        );
+    }
+
+    // 0b. Refuse a no-op merge loudly instead of pretending success.
+    let ahead = run_git_cmd(
+        repo_path,
+        &[
+            "rev-list",
+            "--count",
+            &format!("{}..{}", base_branch, branch_name),
+        ],
+    )?;
+    if ahead.trim() == "0" {
+        return Err(format!(
+            "Nothing to merge: run {} produced no committed changes relative to {}.",
+            run_id, base_branch
+        ));
+    }
 
     // 1. Check out base branch (must be clean as verified earlier)
     run_git_cmd(repo_path, &["checkout", base_branch])?;
@@ -137,6 +167,22 @@ pub fn get_diff<P: AsRef<Path>>(
     // Call: git diff base_branch..harness/run-run_id
     let range = format!("{}..{}", base_branch, branch_name);
     run_git_cmd(repo_path, &["diff", &range])
+}
+
+/// Diff for a LIVE run: the worktree's current (typically uncommitted) state
+/// against the base branch. Committed-range diffs are blind to uncommitted
+/// work, which is where an in-progress run's changes actually live.
+pub fn get_worktree_diff<P: AsRef<Path>>(
+    repo_path: P,
+    run_id: &str,
+    base_branch: &str,
+) -> Result<String, String> {
+    let repo_path = repo_path.as_ref();
+    let worktree_dir = repo_path.join(".harness").join("worktrees").join(run_id);
+    if worktree_dir.exists() {
+        return run_git_cmd(&worktree_dir, &["diff", base_branch]);
+    }
+    get_diff(repo_path, run_id, base_branch)
 }
 
 /// Clean up any orphaned worktrees left behind on app crashes/forced quits

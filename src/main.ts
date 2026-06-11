@@ -1574,10 +1574,11 @@ async function updateActiveCardUI() {
   
   chatInput.disabled = true;
   btnSendChat.disabled = true;
-  chatInput.placeholder = "Agent is offline...";
+  chatInput.placeholder = "No active run for this card...";
 
   if (activeCard.status === "backlog" || activeCard.status === "todo" || activeCard.status === "failed") {
     controlsRun.style.display = "block";
+    chatInput.placeholder = "Start a run to put the agent to work on this card...";
   } else if (activeCard.status === "running") {
     controlsActive.style.display = "block";
     chatInput.disabled = false;
@@ -1590,6 +1591,7 @@ async function updateActiveCardUI() {
     chatInput.placeholder = "Provide feedback to unblock agent...";
   } else if (activeCard.status === "review") {
     controlsReview.style.display = "flex";
+    chatInput.placeholder = "Run finished — review the diff and accept or reject...";
   }
 
   if (activeCard.run_id) {

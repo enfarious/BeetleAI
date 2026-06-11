@@ -3226,6 +3226,14 @@ pub async fn unblock_run(
     run_id: String,
     reply: String,
 ) -> Result<(), String> {
+    // Unblocking is a world-refresh: drop the LM Studio stateful response-id
+    // chain so the next call re-bootstraps with the CURRENT system prompt and
+    // a full transcript replay. Threads otherwise keep the system prompt they
+    // were born with, so tools added after a rebuild stay invisible mid-run.
+    {
+        let mut ids = state.lmstudio_response_ids.lock().unwrap();
+        ids.remove(&run_id);
+    }
     let mut cards = state.cards.lock().unwrap();
     if let Some(card) = cards
         .iter_mut()
@@ -4880,7 +4888,7 @@ fn patch_file_impl(
         Ok(content) => {
             let matches: Vec<_> = content.match_indices(target_str).collect();
             if matches.is_empty() {
-                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If the snippet contains quotes or escapes, use replace_lines with the line numbers from read_file instead.", path);
+                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If the snippet contains quotes or escapes, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.", path);
             }
             if matches.len() > 1 {
                 return format!(
@@ -5057,17 +5065,18 @@ fn execute_tool(
             patch_file_impl(worktree_path, path, target_str, replacement_str)
         }
         "replace_lines" => {
+            const USAGE: &str = " Usage: replace_lines(path: String, start_line: int, end_line: int, content: String) — path is the file to edit, relative to the project root (the same path you passed to read_file).";
             let path = match args.get("path").and_then(|p| p.as_str()) {
                 Some(p) => p,
-                None => return "Error: Missing path argument".to_string(),
+                None => return format!("Error: Missing 'path' argument.{}", USAGE),
             };
             let start_line = match args.get("start_line").and_then(|v| v.as_u64()) {
                 Some(v) => v as usize,
-                None => return "Error: Missing start_line argument".to_string(),
+                None => return format!("Error: Missing 'start_line' argument.{}", USAGE),
             };
             let end_line = match args.get("end_line").and_then(|v| v.as_u64()) {
                 Some(v) => v as usize,
-                None => return "Error: Missing end_line argument".to_string(),
+                None => return format!("Error: Missing 'end_line' argument.{}", USAGE),
             };
             let content = args.get("content").and_then(|c| c.as_str()).unwrap_or("");
             replace_lines_impl(worktree_path, path, start_line, end_line, content)

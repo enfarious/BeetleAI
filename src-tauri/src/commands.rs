@@ -1074,7 +1074,12 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                     "description": "Runs `git status` in the repository sandbox.",
                     "parameters": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "confirm": {
+                                "type": "boolean",
+                                "description": "Optional confirmation flag; defaults to true"
+                            }
+                        },
                         "additionalProperties": false
                     }
                 }
@@ -1086,7 +1091,12 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                     "description": "Runs `git diff` to view current repository changes.",
                     "parameters": {
                         "type": "object",
-                        "properties": {},
+                        "properties": {
+                            "confirm": {
+                                "type": "boolean",
+                                "description": "Optional confirmation flag; defaults to true"
+                            }
+                        },
                         "additionalProperties": false
                     }
                 }
@@ -1190,7 +1200,16 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "function": {
                     "name": "read_card",
                     "description": "Shows your current card: title, description, status, and its todo list with indices and completion marks. Use the todos as your work plan.",
-                    "parameters": { "type": "object", "properties": {}, "additionalProperties": false }
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "confirm": {
+                                "type": "boolean",
+                                "description": "Optional confirmation flag; defaults to true"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
                 }
             }),
             "set_todo" => serde_json::json!({
@@ -4438,6 +4457,28 @@ fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
     None
 }
 
+fn parse_qwen_syntax(s: &str) -> Option<(String, serde_json::Value)> {
+    let mut t = s.trim();
+    for prefix in ["call:", "tool:", "function:"] {
+        if let Some(stripped) = t.strip_prefix(prefix) {
+            t = stripped.trim_start();
+            break;
+        }
+    }
+    let brace = t.find('{')?;
+    let name = t[..brace].trim();
+    if !fn_ident_ok(name) {
+        return None;
+    }
+    let close = t.rfind('}')?;
+    if close < brace {
+        return None;
+    }
+    let json_str = &t[brace..=close];
+    let args: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    Some((name.to_string(), args))
+}
+
 fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
     let mut response_cleaned = response.trim();
     if response_cleaned.ends_with("<tool_call|>") {
@@ -4496,6 +4537,9 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
             if let Some(parsed) = parse_function_syntax(inner) {
                 return Some(parsed);
             }
+            if let Some(parsed) = parse_qwen_syntax(inner) {
+                return Some(parsed);
+            }
             search = start;
         }
     }
@@ -4510,6 +4554,23 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
         let pat = format!("{}(", tool);
         if let Some(idx) = response_cleaned.find(&pat) {
             if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..]) {
+                if name == tool {
+                    return Some((name, args));
+                }
+            }
+        }
+        // Bare Qwen/Hermes-style JSON calls in the response body (e.g. `list_dir{"path": "src"}` or `call:list_dir{"path": "src"}`)
+        let pat_brace = format!("{}{{", tool);
+        if let Some(idx) = response_cleaned.find(&pat_brace) {
+            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
+                if name == tool {
+                    return Some((name, args));
+                }
+            }
+        }
+        let pat_prefix = format!("call:{}{{", tool);
+        if let Some(idx) = response_cleaned.find(&pat_prefix) {
+            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
                 if name == tool {
                     return Some((name, args));
                 }
@@ -5726,6 +5787,23 @@ BeetleAI
         assert!(res.is_some());
         let (name, _) = res.unwrap();
         assert_eq!(name, "git_status");
+    }
+
+    #[test]
+    fn test_parse_tool_call_qwen_syntax() {
+        let input = "<|tool_call>call:read_card{}<tool_call|>";
+        let res = parse_tool_call(input);
+        assert!(res.is_some());
+        let (name, args) = res.unwrap();
+        assert_eq!(name, "read_card");
+        assert!(args.is_object());
+
+        let input_bare = "call:write_file{\"path\": \"foo.txt\", \"content\": \"bar\"}";
+        let res_bare = parse_tool_call(input_bare);
+        assert!(res_bare.is_some());
+        let (name_b, args_b) = res_bare.unwrap();
+        assert_eq!(name_b, "write_file");
+        assert_eq!(args_b.get("path").unwrap().as_str().unwrap(), "foo.txt");
     }
 
     #[test]

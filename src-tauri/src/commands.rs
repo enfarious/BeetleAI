@@ -1979,11 +1979,14 @@ fn call_openai_compat(
     tools: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let mut payload = serde_json::json!({
-        "model": settings.model,
-        "messages": messages,
-        "temperature": 0.7,
-        "stream": true
-    });
+    "model": settings.model,
+    "messages": messages,
+    "temperature": 0.7,
+    // Hard ceiling on a single response: a ruminating reasoning model can
+        // otherwise circle ("wait, what if...") for minutes on slow hardware.
+            "max_tokens": 4096,
+            "stream": true
+        });
 
     if let Some(ref t) = tools {
         if let Some(obj) = payload.as_object_mut() {
@@ -2115,7 +2118,9 @@ fn call_ollama_native(
     let mut payload = serde_json::json!({
         "model": settings.model,
         "messages": messages,
-        "stream": true
+        "stream": true,
+        // Same single-response ceiling as the other providers (Ollama's name for it).
+        "options": { "num_predict": 4096 }
     });
     if let Some(ref t) = tools {
         if let Some(obj) = payload.as_object_mut() {
@@ -3440,6 +3445,15 @@ pub async fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Res
     if git::is_git_repo(&repo_path) {
         let base_branch =
             git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
+        // A cancelled or rejected run's branch has been deleted by cleanup; the
+        // card may still reference the run_id. That's a normal state, not an error.
+        let branch_name = format!("harness/run-{}", run_id);
+        if !git::branch_exists(&repo_path, &branch_name) {
+            return Ok(
+                "No diff available: this run's branch no longer exists (the run was cancelled, rejected, or already merged)."
+                    .to_string(),
+            );
+        }
         match git::get_diff(&repo_path, &run_id, &base_branch) {
             Ok(diff) => {
                 if diff.trim().is_empty() {

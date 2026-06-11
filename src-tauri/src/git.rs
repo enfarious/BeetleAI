@@ -146,6 +146,20 @@ pub fn prune_worktrees<P: AsRef<Path>>(repo_path: P) -> Result<(), String> {
     Ok(())
 }
 
+/// Check whether a local branch exists.
+pub fn branch_exists<P: AsRef<Path>>(repo_path: P, branch_name: &str) -> bool {
+    run_git_cmd(
+        repo_path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", branch_name),
+        ],
+    )
+    .is_ok()
+}
+
 /// Get the current active branch name
 pub fn get_current_branch<P: AsRef<Path>>(repo_path: P) -> Result<String, String> {
     run_git_cmd(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"])

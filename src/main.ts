@@ -161,6 +161,14 @@ const mockInvoke = async (cmd: string, args?: any): Promise<any> => {
         name: args.name, 
         path: args.path 
       };
+    case "update_project":
+      return {
+        id: args.newName.toLowerCase().replace(/ /g, "_"),
+        name: args.newName,
+        path: args.newPath
+      };
+    case "delete_project":
+      return null;
     case "get_settings":
       return {
         provider: "custom",
@@ -399,6 +407,7 @@ type ViewerState =
   | { kind: "file"; path: string; name: string }
   | { kind: "diff"; runId: string }
   | { kind: "new_project" }
+  | { kind: "edit_project" }
   | { kind: "card_detail"; cardId: string };
 
 interface LlmSettings {
@@ -429,6 +438,7 @@ let activeStreams = new Map<string, {
 // DOM References
 const projectSelect = document.getElementById("project-select") as HTMLSelectElement;
 const btnNewProjectToggle = document.getElementById("btn-new-project-toggle") as HTMLButtonElement;
+const btnEditProjectToggle = document.getElementById("btn-edit-project-toggle") as HTMLButtonElement;
 const repoWorkspaceSection = document.getElementById("repo-workspace-section") as HTMLDivElement;
 const designDocsSection = document.getElementById("design-docs-section") as HTMLDivElement;
 const designDocsList = document.getElementById("design-docs-list") as HTMLDivElement;
@@ -800,6 +810,15 @@ function setupEventListeners() {
   // Project creation toggle
   btnNewProjectToggle.addEventListener("click", () => {
     pushView({ kind: "new_project" });
+  });
+
+  // Project edit/remove toggle
+  btnEditProjectToggle.addEventListener("click", () => {
+    if (!currentProject || !projectSelect.value) {
+      showToast("Select a project to edit first", "info");
+      return;
+    }
+    pushView({ kind: "edit_project" });
   });
 
   // Settings Modal actions
@@ -2402,6 +2421,11 @@ async function renderRightPanel() {
       renderNewProjectForm();
       break;
 
+    case "edit_project":
+      viewerTitle.textContent = "Edit Project";
+      renderEditProjectForm();
+      break;
+
     case "card_detail":
       viewerTitle.textContent = "Card Details";
       const card = cardsList.find((c) => c.id === currentView.cardId);
@@ -3028,6 +3052,92 @@ function renderNewProjectForm() {
       await selectProject(newProj);
     } catch (err) {
       showToast("Failed to create project: " + err, "error");
+    }
+  });
+}
+
+function renderEditProjectForm() {
+  const proj = currentProject;
+  if (!proj) {
+    viewerContainer.innerHTML = `<div class="empty-state">No project selected</div>`;
+    return;
+  }
+  const originalPath = proj.path;
+
+  viewerContainer.innerHTML = `
+    <div class="new-project-view">
+      <form id="edit-project-form">
+        <div class="form-group">
+          <label for="edit-proj-name">Project Name</label>
+          <input type="text" id="edit-proj-name" class="form-input" required />
+        </div>
+        <div class="form-group">
+          <label for="edit-proj-path">Local Directory Path</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="edit-proj-path" class="form-input" required style="flex: 1;" />
+            <button type="button" class="btn btn-secondary" id="btn-edit-proj-path-browse" style="flex: 0; white-space: nowrap;">Browse…</button>
+          </div>
+          <span style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">Changing the path re-points this project's cards and long-term memories to the new location. The directory must already exist.</span>
+        </div>
+        <div style="margin-top: 24px; display: flex; gap: 12px; align-items: center;">
+          <button type="button" class="btn btn-danger" id="btn-edit-project-delete">Remove Project</button>
+          <span style="flex: 1;"></span>
+          <button type="button" class="btn btn-secondary" id="btn-edit-project-cancel">Cancel</button>
+          <button type="submit" class="btn btn-primary">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  `;
+
+  const nameInput = document.getElementById("edit-proj-name") as HTMLInputElement;
+  const pathInput = document.getElementById("edit-proj-path") as HTMLInputElement;
+  nameInput.value = proj.name;
+  pathInput.value = proj.path;
+
+  (document.getElementById("btn-edit-proj-path-browse") as HTMLButtonElement).addEventListener("click", async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Select Project Directory",
+    });
+    if (typeof selected === "string" && selected) {
+      pathInput.value = selected;
+    }
+  });
+
+  (document.getElementById("btn-edit-project-cancel") as HTMLButtonElement).addEventListener("click", () => {
+    switchMode("kanban");
+  });
+
+  (document.getElementById("btn-edit-project-delete") as HTMLButtonElement).addEventListener("click", async () => {
+    const ok = await showConfirm(
+      `Remove project "${proj.name}" from BeetleAI? Its cards will be deleted. The repository on disk is untouched, and its memories are kept — they return if you re-add the project at the same path.`,
+      "Remove Project"
+    );
+    if (!ok) return;
+    try {
+      await invoke("delete_project", { path: originalPath });
+      showToast(`Project "${proj.name}" removed`, "success");
+      currentProject = null;
+      await loadProjects();
+    } catch (err) {
+      showToast("Failed to remove project: " + err, "error");
+    }
+  });
+
+  (document.getElementById("edit-project-form") as HTMLFormElement).addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const newName = nameInput.value.trim();
+    const newPath = pathInput.value.trim();
+    if (!newName || !newPath) return;
+    try {
+      const updated = await invoke<Project>("update_project", { path: originalPath, newName, newPath });
+      showToast(`Project "${updated.name}" updated`, "success");
+      await loadProjects();
+      projectSelect.value = updated.path;
+      await selectProject(updated);
+    } catch (err) {
+      showToast("Failed to update project: " + err, "error");
     }
   });
 }

@@ -215,6 +215,91 @@ fn repo_path_for_run(state: &AppState, run_id: &str) -> Option<PathBuf> {
         .map(|c| clean_project_path(&c.project_path))
 }
 
+/// Resolve the long-term-memory scope for a tool call: the project the work
+/// belongs to. Runs resolve through their card's project_path; chat modes
+/// (design/code copilot) have no card and pass the project root directly as
+/// the worktree path. Returns (project_path, card_id).
+fn memory_scope(
+    app_handle: &tauri::AppHandle,
+    worktree_path: &Path,
+    run_id: &str,
+) -> (String, Option<String>) {
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        let cards = state.cards.lock().unwrap();
+        if let Some(card) = cards.iter().find(|c| c.run_id.as_deref() == Some(run_id)) {
+            return (
+                clean_project_path(&card.project_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                Some(card.id.clone()),
+            );
+        }
+    }
+    (
+        clean_project_path(worktree_path)
+            .to_string_lossy()
+            .into_owned(),
+        None,
+    )
+}
+
+fn insert_memory(
+    conn: &rusqlite::Connection,
+    project_path: &str,
+    topic: &str,
+    content: &str,
+    source: &str,
+    run_id: Option<&str>,
+    card_id: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO memories (project_path, topic, content, source, run_id, card_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        (
+            project_path,
+            topic,
+            content,
+            source,
+            run_id,
+            card_id,
+            chrono::Utc::now().to_rfc3339(),
+        ),
+    )?;
+    Ok(())
+}
+
+/// Recover the task_complete summary for a run from the persisted logs.
+/// Only successful completions count; returns None if the run never
+/// completed cleanly (in which case no memory is written).
+fn latest_run_summary(conn: &rusqlite::Connection, run_id: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload FROM logs WHERE run_id = ?1 AND event_type = 'tool_result' ORDER BY id DESC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([run_id], |row| row.get::<_, String>(0))
+        .ok()?;
+    for payload in rows.flatten() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        if val.get("name").and_then(|n| n.as_str()) != Some("task_complete") {
+            continue;
+        }
+        let result = val.get("result").and_then(|r| r.as_str()).unwrap_or("");
+        if !result.starts_with("Success") {
+            continue;
+        }
+        if let Some(idx) = result.find("\nSummary: ") {
+            let summary = result[idx + "\nSummary: ".len()..].trim();
+            if !summary.is_empty() {
+                return Some(summary.to_string());
+            }
+        }
+    }
+    None
+}
+
 use rusqlite::OptionalExtension;
 
 fn get_db_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -450,6 +535,30 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             event_type TEXT NOT NULL,
             payload TEXT NOT NULL
         );",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Long-term project memory: explicit `remember` calls from the agent plus
+    // summaries auto-ingested when a run is ACCEPTED (never on rejection —
+    // memory writeback shares the same gate as code writeback).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path TEXT NOT NULL,
+            topic TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            run_id TEXT,
+            card_id TEXT,
+            created_at TEXT NOT NULL
+        );",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_project ON memories (project_path);",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -842,6 +951,167 @@ pub async fn create_project(
     Ok(new_project)
 }
 
+/// Update a registered project's name and/or path, keyed by its CURRENT path
+/// (the unique key create_project enforces). A path change cascades to the
+/// project's cards and long-term memories so nothing is orphaned — this is
+/// the supported way to fix a project that was registered pointing at the
+/// wrong directory.
+#[tauri::command]
+pub async fn update_project(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    new_name: String,
+    new_path: String,
+) -> Result<Project, String> {
+    let new_name = new_name.trim().to_string();
+    let new_path = new_path.trim().to_string();
+    if new_name.is_empty() || new_path.is_empty() {
+        return Err("Name and path are required.".to_string());
+    }
+    if !Path::new(&new_path).exists() {
+        return Err("New path does not exist on disk. Create the directory first, or use New Project to scaffold one.".to_string());
+    }
+
+    let old_clean = clean_project_path(&path);
+    let new_clean = clean_project_path(&new_path);
+    let path_changed = old_clean != new_clean;
+
+    let mut config = load_config(&app_handle);
+    let idx = config
+        .projects
+        .iter()
+        .position(|p| clean_project_path(&p.path) == old_clean)
+        .ok_or_else(|| "Project not found.".to_string())?;
+
+    if path_changed
+        && config
+            .projects
+            .iter()
+            .enumerate()
+            .any(|(i, p)| i != idx && clean_project_path(&p.path) == new_clean)
+    {
+        return Err("Another project is already registered at that path.".to_string());
+    }
+
+    // Repointing a project under a live run is exactly the class of path bug
+    // this app has had enough of. Refuse until the run is finished/cancelled.
+    if path_changed {
+        let cards = state.cards.lock().unwrap();
+        let active = state.active_runs.lock().unwrap();
+        let has_active = cards.iter().any(|c| {
+            clean_project_path(&c.project_path) == old_clean
+                && c.run_id
+                    .as_deref()
+                    .map(|r| active.contains(r))
+                    .unwrap_or(false)
+        });
+        if has_active {
+            return Err("A run is active on this project. Cancel or finish it before changing the project path.".to_string());
+        }
+    }
+
+    config.projects[idx].name = new_name;
+    config.projects[idx].path = new_path.clone();
+    let updated = config.projects[idx].clone();
+    save_config(&app_handle, &config)?;
+
+    if path_changed {
+        // Cascade to cards: update the in-memory mirror (cleaned comparison so
+        // separator drift can't strand a card), then persist each touched id.
+        let changed_ids: Vec<String> = {
+            let mut cards = state.cards.lock().unwrap();
+            let mut ids = Vec::new();
+            for c in cards.iter_mut() {
+                if clean_project_path(&c.project_path) == old_clean {
+                    c.project_path = new_path.clone();
+                    ids.push(c.id.clone());
+                }
+            }
+            ids
+        };
+        if let Ok(conn) = get_db_conn(&app_handle) {
+            for cid in &changed_ids {
+                let _ = conn.execute(
+                    "UPDATE cards SET project_path = ?1 WHERE id = ?2",
+                    (&new_path, cid),
+                );
+            }
+            // Cascade to long-term memories (stored under the cleaned path).
+            let old_scope = old_clean.to_string_lossy().into_owned();
+            let new_scope = new_clean.to_string_lossy().into_owned();
+            let _ = conn.execute(
+                "UPDATE memories SET project_path = ?1 WHERE project_path = ?2",
+                (&new_scope, &old_scope),
+            );
+        }
+    }
+
+    Ok(updated)
+}
+
+/// Unregister a project, keyed by path. Deletes the project's cards and their
+/// todo items. Deliberately NOT touched: the repository on disk, and the
+/// project's long-term memories — memories are keyed by path, so
+/// re-registering the project at the same path restores them intact.
+#[tauri::command]
+pub async fn delete_project(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let old_clean = clean_project_path(&path);
+
+    let mut config = load_config(&app_handle);
+    let idx = config
+        .projects
+        .iter()
+        .position(|p| clean_project_path(&p.path) == old_clean)
+        .ok_or_else(|| "Project not found.".to_string())?;
+
+    {
+        let cards = state.cards.lock().unwrap();
+        let active = state.active_runs.lock().unwrap();
+        let has_active = cards.iter().any(|c| {
+            clean_project_path(&c.project_path) == old_clean
+                && c.run_id
+                    .as_deref()
+                    .map(|r| active.contains(r))
+                    .unwrap_or(false)
+        });
+        if has_active {
+            return Err(
+                "A run is active on this project. Cancel or finish it before removing the project."
+                    .to_string(),
+            );
+        }
+    }
+
+    config.projects.remove(idx);
+    save_config(&app_handle, &config)?;
+
+    let removed_ids: Vec<String> = {
+        let mut cards = state.cards.lock().unwrap();
+        let ids: Vec<String> = cards
+            .iter()
+            .filter(|c| clean_project_path(&c.project_path) == old_clean)
+            .map(|c| c.id.clone())
+            .collect();
+        cards.retain(|c| clean_project_path(&c.project_path) != old_clean);
+        ids
+    };
+    if let Ok(conn) = get_db_conn(&app_handle) {
+        for cid in &removed_ids {
+            // Explicit todo_items delete: FK cascade depends on a per-connection
+            // pragma we don't want to rely on here.
+            let _ = conn.execute("DELETE FROM todo_items WHERE card_id = ?1", [cid]);
+            let _ = conn.execute("DELETE FROM cards WHERE id = ?1", [cid]);
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_settings(app_handle: tauri::AppHandle) -> LlmSettings {
     let config = load_config(&app_handle);
@@ -849,7 +1119,10 @@ pub async fn get_settings(app_handle: tauri::AppHandle) -> LlmSettings {
 }
 
 #[tauri::command]
-pub async fn save_settings(app_handle: tauri::AppHandle, settings: LlmSettings) -> Result<(), String> {
+pub async fn save_settings(
+    app_handle: tauri::AppHandle,
+    settings: LlmSettings,
+) -> Result<(), String> {
     let mut config = load_config(&app_handle);
     config.settings = settings;
     save_config(&app_handle, &config)
@@ -1053,13 +1326,17 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "list_dir",
-                    "description": "Lists all files and folders under a relative path.",
+                    "description": "Lists files and folders under a relative path as an indented tree. Pass depth 2-3 to map nested structure in one call instead of listing directories one at a time.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
                                 "description": "Relative path to list (use \"\" for project root)"
+                            },
+                            "depth": {
+                                "type": "integer",
+                                "description": "Optional recursion depth 1-4 (default 1). Use 2 or 3 to see nested folders in one call."
                             }
                         },
                         "required": ["path"],
@@ -1177,20 +1454,208 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "search_grep",
-                    "description": "Searches for matching lines containing the query inside files under a path or in a specific file. Returns line numbers and contents.",
+                    "description": "Searches file contents for a substring (case-insensitive by default) under a path or in a specific file. Results are grouped by file with line numbers. Pass context to include surrounding lines around each match.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "The exact string query to find"
+                                "description": "The substring to find"
                             },
                             "path": {
                                 "type": "string",
                                 "description": "Optional relative path to search within (specific file or folder). Defaults to project root if omitted."
+                            },
+                            "context": {
+                                "type": "integer",
+                                "description": "Optional context lines 0-5 (default 0). Use 2 to see how a match is used without a follow-up read_file."
+                            },
+                            "case_sensitive": {
+                                "type": "boolean",
+                                "description": "Optional; defaults to false (case-insensitive matching)."
                             }
                         },
                         "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "find_file" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "find_file",
+                    "description": "Finds files by name. Matches a case-insensitive fragment of the filename and returns matching relative paths. The fastest way to locate a file you know (part of) the name of.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Filename or fragment to match, e.g. \"commands.rs\" or \"config\""
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Optional relative folder to search within. Defaults to project root."
+                            }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "find_symbol" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "find_symbol",
+                    "description": "Finds where a function, struct, class, enum, or other declaration is DEFINED. Returns file:line: signature for each definition site. Prefer this over search_grep when looking for a definition rather than usages.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "The symbol name to find, e.g. \"execute_tool\""
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Optional relative path (file or folder) to search within. Defaults to project root."
+                            }
+                        },
+                        "required": ["name"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "remember" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "remember",
+                    "description": "Saves a durable insight to this project's long-term memory, shared across runs and chat modes. Use for things worth keeping: how a subsystem works, a decision and its reason, a pitfall discovered.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "topic": {
+                                "type": "string",
+                                "description": "Short label for the memory, e.g. \"run engine timeouts\""
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The insight to keep. Write it for a future agent with no context."
+                            }
+                        },
+                        "required": ["topic", "content"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "recall" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "recall",
+                    "description": "Searches this project's long-term memory by keyword (topic and content, case-insensitive) and returns the most recent matches. Call with an empty query to see the latest memories. Check memory before exploring from scratch.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Keyword to search for. Empty returns the most recent memories."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Optional max results 1-10 (default 5)."
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "list_cards" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "list_cards",
+                    "description": "Lists ALL kanban cards for this project, grouped by status, with ids and todo progress. Use it to see the board before filing or editing cards. (read_card shows only YOUR assigned card.)",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "confirm": {
+                                "type": "boolean",
+                                "description": "Optional confirmation flag; defaults to true"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "create_card" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "create_card",
+                    "description": "Files a new kanban card in this project's backlog for the developer to review and schedule. Use it to capture follow-up work: bugs you discover outside your current scope, refactors worth doing, ideas from design discussions. Filing a card is ALWAYS better than silently expanding your current task.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "Short, specific card title"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "What the work is and why it matters. Write it for an agent with no context."
+                            },
+                            "todos": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional list of todo items breaking the work into steps"
+                            }
+                        },
+                        "required": ["title", "description"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "update_card" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "update_card",
+                    "description": "Edits a card in this project's backlog or todo column: change its title or description, or append a todo item. Cards that are running, in review, or done cannot be edited.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "card_id": {
+                                "type": "string",
+                                "description": "Card id from list_cards"
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Optional new title"
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Optional new description (replaces the old one)"
+                            },
+                            "add_todo": {
+                                "type": "string",
+                                "description": "Optional todo item to append to the card"
+                            }
+                        },
+                        "required": ["card_id"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "delete_card" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "delete_card",
+                    "description": "Deletes a card from this project's backlog or todo column. Cards with any run history, or that are running/in review/done, cannot be deleted.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "card_id": {
+                                "type": "string",
+                                "description": "Card id from list_cards"
+                            }
+                        },
+                        "required": ["card_id"],
                         "additionalProperties": false
                     }
                 }
@@ -2554,6 +3019,14 @@ pub async fn send_design_chat(
                 "web_search",
                 "send_notification",
                 "search_grep",
+                "find_file",
+                "find_symbol",
+                "remember",
+                "recall",
+                "list_cards",
+                "create_card",
+                "update_card",
+                "delete_card",
                 "patch_file",
             ]);
 
@@ -2617,7 +3090,22 @@ pub async fn send_design_chat(
                 );
             }
 
-            if let Some((tool_name, args)) = parse_tool_call(&remaining) {
+            if let Some((tool_name, args, preamble)) = parse_tool_call_spanned(&remaining) {
+                // Surface the prose the model wrote before its tool call —
+                // previously this commentary was silently clobbered.
+                if !preamble.is_empty() {
+                    append_design_event(
+                        &app_handle_clone,
+                        &state,
+                        &log_key_clone,
+                        RunEvent {
+                            run_id: log_key_clone.clone(),
+                            event_type: "message".to_string(),
+                            payload: serde_json::json!({ "role": "agent", "content": preamble })
+                                .to_string(),
+                        },
+                    );
+                }
                 append_design_event(
                     &app_handle_clone,
                     &state,
@@ -2794,6 +3282,14 @@ pub async fn send_code_chat(
                 "run_command",
                 "web_search",
                 "search_grep",
+                "find_file",
+                "find_symbol",
+                "remember",
+                "recall",
+                "list_cards",
+                "create_card",
+                "update_card",
+                "delete_card",
                 "patch_file",
             ]);
 
@@ -2857,7 +3353,22 @@ pub async fn send_code_chat(
                 );
             }
 
-            if let Some((tool_name, args)) = parse_tool_call(&remaining) {
+            if let Some((tool_name, args, preamble)) = parse_tool_call_spanned(&remaining) {
+                // Surface the prose the model wrote before its tool call —
+                // previously this commentary was silently clobbered.
+                if !preamble.is_empty() {
+                    append_code_event(
+                        &app_handle_clone,
+                        &state,
+                        &log_key_clone,
+                        RunEvent {
+                            run_id: log_key_clone.clone(),
+                            event_type: "message".to_string(),
+                            payload: serde_json::json!({ "role": "agent", "content": preamble })
+                                .to_string(),
+                        },
+                    );
+                }
                 append_code_event(
                     &app_handle_clone,
                     &state,
@@ -2974,6 +3485,24 @@ pub async fn list_cards(
         .collect())
 }
 
+/// Generate a unique card id. The old `card_{len+1}` scheme collided after
+/// deletions (len shrinks, the next id re-mints an existing one, and the DB
+/// insert fails silently); timestamp + uniqueness probe cannot.
+fn new_card_id(cards: &[Card]) -> String {
+    let base = format!("card_{}", chrono::Local::now().format("%Y%m%d%H%M%S%3f"));
+    if !cards.iter().any(|c| c.id == base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{}_{}", base, n);
+        if !cards.iter().any(|c| c.id == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 #[tauri::command]
 pub async fn create_card(
     app_handle: tauri::AppHandle,
@@ -2986,7 +3515,7 @@ pub async fn create_card(
     let mut cards = state.cards.lock().unwrap();
     let initial_status = status.unwrap_or_else(|| "backlog".to_string());
     let new_card = Card {
-        id: format!("card_{}", cards.len() + 1),
+        id: new_card_id(&cards),
         project_path: project_path.clone(),
         title,
         description,
@@ -3257,7 +3786,10 @@ pub async fn abort_chat(
 }
 
 #[tauri::command]
-pub async fn is_run_active(state: tauri::State<'_, AppState>, run_id: String) -> Result<bool, String> {
+pub async fn is_run_active(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<bool, String> {
     let active = state.active_runs.lock().unwrap();
     Ok(active.contains(&run_id))
 }
@@ -3368,6 +3900,24 @@ pub async fn accept_run(
             let base_branch =
                 git::get_current_branch(&repo_path).unwrap_or_else(|_| "main".to_string());
             git::merge_worktree(&repo_path, &run_id, &base_branch)?;
+        }
+
+        // Memory writeback happens only here, on accept: a reviewed, merged run
+        // is the only kind whose summary deserves to become part of the
+        // project's long-term memory. Rejected runs are never remembered.
+        if let Ok(conn) = get_db_conn(&app_handle) {
+            if let Some(summary) = latest_run_summary(&conn, &run_id) {
+                let scope = repo_path.to_string_lossy().into_owned();
+                let _ = insert_memory(
+                    &conn,
+                    &scope,
+                    &format!("Completed: {}", card.title),
+                    &summary,
+                    "run_accept",
+                    Some(&run_id),
+                    Some(&card.id),
+                );
+            }
         }
 
         let mut logs = state.run_logs.lock().unwrap();
@@ -3502,7 +4052,10 @@ pub async fn send_chat(
 }
 
 #[tauri::command]
-pub async fn read_diff(state: tauri::State<'_, AppState>, run_id: String) -> Result<String, String> {
+pub async fn read_diff(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<String, String> {
     // If the run's card can't be found, there is no correct repo to diff against —
     // fail loudly rather than silently diffing the app's own working directory.
     let repo_path = repo_path_for_run(&state, &run_id).ok_or_else(|| {
@@ -4108,8 +4661,8 @@ fn construct_agent_system_prompt(
          1. `read_file(path: String, start_line?: Int, end_line?: Int)`: Reads file content. For large files, call outline_file first, then read only the line range you need. Output is line-numbered and capped — don't read whole large files when a range will do.\n\
          2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
          3. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed).\n\
-         4. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
-         5. `search_grep(query: String, path?: String)`: Searches file contents for a substring across the whole repo (or under a path). Use this to find where symbols, strings, or config values live — do NOT use shell grep.\n\
+         4. `list_dir(path: String, depth?: Int)`: Lists files and folders under a relative path as an indented tree (use \"\" for root). Pass depth 2 or 3 to map nested structure in ONE call instead of listing directories one at a time.\n\
+         5. `search_grep(query: String, path?: String, context?: Int, case_sensitive?: Bool)`: Searches file contents for a substring (case-insensitive by default) across the repo or under a path. Results are grouped by file with line numbers. Pass context: 2 to see surrounding lines without a follow-up read_file. Do NOT use shell grep.\n\
          6. `git_status()`: Runs `git status` in the sandbox.\n\
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
          8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
@@ -4119,8 +4672,16 @@ fn construct_agent_system_prompt(
          12. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
          13. `read_card()`: Shows YOUR current card: title, description, status, and its todo list with indices. Read it at the start of a run and use the todos as your work plan.\n\
          14. `set_todo(index: int, completed: bool)`: Checks off a todo on your card (index from read_card). Mark items complete as you finish them so progress is visible.\n\
-         15. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status. Before calling it, read_card and confirm every todo is checked — or explain why not in your summary.\n\n\
-         Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
+         15. `task_complete(summary: String)`: Ends the loop, summarizes your work, and puts the card in \"Review\" status. Before calling it, read_card and confirm every todo is checked — or explain why not in your summary.\n\
+         16. `find_file(name: String, path?: String)`: Finds files by name. Give a fragment of the filename (case-insensitive) and get matching relative paths back. The fastest way to locate a file you know exists.\n\
+         17. `find_symbol(name: String, path?: String)`: Finds where a function, struct, class, or other declaration is DEFINED. Returns file:line: signature. Faster and more precise than search_grep when you want a definition rather than usages.\n\
+         18. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared across runs and chat modes. Use it when you learn something worth keeping: how a subsystem works, a decision made, a pitfall discovered.\n\
+         19. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword and returns the most recent matches (empty query = latest memories). Past runs may have already mapped the territory — check before exploring from scratch.\n\
+         20. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
+         21. `create_card(title: String, description: String, todos?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
+         22. `update_card(card_id: String, title?: String, description?: String, add_todo?: String)`: Edits a backlog/todo card or appends a todo to it.\n\
+         23. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     )
 }
@@ -4227,7 +4788,7 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
-const KNOWN_TOOLS: [&str; 15] = [
+const KNOWN_TOOLS: [&str; 23] = [
     "read_file",
     "outline_file",
     "write_file",
@@ -4235,6 +4796,14 @@ const KNOWN_TOOLS: [&str; 15] = [
     "replace_lines",
     "list_dir",
     "search_grep",
+    "find_file",
+    "find_symbol",
+    "remember",
+    "recall",
+    "list_cards",
+    "create_card",
+    "update_card",
+    "delete_card",
     "git_status",
     "git_diff",
     "run_command",
@@ -4268,8 +4837,7 @@ fn parse_function_syntax(s: &str) -> Option<(String, serde_json::Value)> {
         return None;
     }
     let args_str = t[open + 1..close].trim();
-    let args = parse_fn_args_strict(args_str)
-        .or_else(|| parse_fn_args_greedy_content(args_str))?;
+    let args = parse_fn_args_strict(args_str).or_else(|| parse_fn_args_greedy_content(args_str))?;
     Some((name.to_string(), serde_json::Value::Object(args)))
 }
 
@@ -4298,9 +4866,7 @@ fn parse_fn_scalar_value(val_str: &str) -> serde_json::Value {
 /// Strict pass: comma-split at top level respecting (well-escaped) quoted
 /// strings. Returns None if any part fails to parse cleanly — which happens
 /// when a content payload contains unescaped quotes; the greedy pass rescues.
-fn parse_fn_args_strict(
-    args_str: &str,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
+fn parse_fn_args_strict(args_str: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut args = serde_json::Map::new();
     if args_str.is_empty() {
         return Some(args);
@@ -4352,7 +4918,10 @@ fn parse_fn_args_strict(
         if !fn_ident_ok(key) {
             return None;
         }
-        args.insert(key.to_string(), parse_fn_scalar_value(part[sep + 1..].trim()));
+        args.insert(
+            key.to_string(),
+            parse_fn_scalar_value(part[sep + 1..].trim()),
+        );
     }
     Some(args)
 }
@@ -4367,7 +4936,10 @@ fn parse_fn_args_lenient(s: &str, args: &mut serde_json::Map<String, serde_json:
         if let Some(sep) = part.find(|c| c == '=' || c == ':') {
             let key = part[..sep].trim();
             if fn_ident_ok(key) {
-                args.insert(key.to_string(), parse_fn_scalar_value(part[sep + 1..].trim()));
+                args.insert(
+                    key.to_string(),
+                    parse_fn_scalar_value(part[sep + 1..].trim()),
+                );
             }
         }
     }
@@ -4479,12 +5051,40 @@ fn parse_qwen_syntax(s: &str) -> Option<(String, serde_json::Value)> {
     Some((name.to_string(), args))
 }
 
-fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
+/// Prose the model wrote before its tool-call syntax. Returns empty for
+/// syntax debris (stray punctuation, lone backticks); caps length so a
+/// pathological preamble can't bloat the transcript or the history budget.
+fn clean_tool_preamble(text: &str) -> String {
+    let t = text.trim();
+    if !t.chars().any(|c| c.is_alphanumeric()) {
+        return String::new();
+    }
+    const MAX: usize = 4000;
+    if t.chars().count() > MAX {
+        let truncated: String = t.chars().take(MAX).collect();
+        format!("{}\n...[truncated]", truncated)
+    } else {
+        t.to_string()
+    }
+}
+
+/// Like parse_tool_call_at, but operates on the raw response and returns the
+/// prose the model emitted BEFORE the tool-call syntax, so the loop can
+/// surface it instead of clobbering it.
+fn parse_tool_call_spanned(response: &str) -> Option<(String, serde_json::Value, String)> {
     let mut response_cleaned = response.trim();
     if response_cleaned.ends_with("<tool_call|>") {
         response_cleaned = response_cleaned.trim_end_matches("<tool_call|>").trim();
     }
+    let (name, args, start) = parse_tool_call_at(response_cleaned)?;
+    let preamble = clean_tool_preamble(&response_cleaned[..start]);
+    Some((name, args, preamble))
+}
 
+/// Core tool-call detection. Returns (name, args, offset) where offset is the
+/// byte position in `response_cleaned` where the tool-call syntax begins —
+/// everything before it is the model's preamble prose.
+fn parse_tool_call_at(response_cleaned: &str) -> Option<(String, serde_json::Value, usize)> {
     for len in (2..=5).rev() {
         let bt = "`".repeat(len);
         let mut start_search = 0;
@@ -4497,8 +5097,8 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
                 let block_str = &after_start[..end_idx];
                 let trimmed_block = strip_lang_prefix(block_str);
 
-                if let Some(parsed) = try_parse_json(trimmed_block) {
-                    return Some(parsed);
+                if let Some((name, args)) = try_parse_json(trimmed_block) {
+                    return Some((name, args, absolute_start));
                 }
             }
             start_search = absolute_start + len;
@@ -4519,7 +5119,8 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
     for opener in TAG_OPENERS {
         let mut search = 0;
         while let Some(idx) = response_cleaned[search..].find(opener) {
-            let start = search + idx + opener.len();
+            let opener_pos = search + idx;
+            let start = opener_pos + opener.len();
             let rest = &response_cleaned[start..];
             let end = rest
                 .find("</tool_call>")
@@ -4531,21 +5132,21 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
                 None => rest,
             };
             let inner = inner.trim();
-            if let Some(parsed) = try_parse_json(inner) {
-                return Some(parsed);
+            if let Some((name, args)) = try_parse_json(inner) {
+                return Some((name, args, opener_pos));
             }
-            if let Some(parsed) = parse_function_syntax(inner) {
-                return Some(parsed);
+            if let Some((name, args)) = parse_function_syntax(inner) {
+                return Some((name, args, opener_pos));
             }
-            if let Some(parsed) = parse_qwen_syntax(inner) {
-                return Some(parsed);
+            if let Some((name, args)) = parse_qwen_syntax(inner) {
+                return Some((name, args, opener_pos));
             }
             search = start;
         }
     }
 
-    if let Some(parsed) = try_parse_json(response_cleaned) {
-        return Some(parsed);
+    if let Some((name, args)) = try_parse_json(response_cleaned) {
+        return Some((name, args, 0));
     }
 
     // Bare function-call syntax in the response body (e.g. `list_dir(path="src")`),
@@ -4555,24 +5156,27 @@ fn parse_tool_call(response: &str) -> Option<(String, serde_json::Value)> {
         if let Some(idx) = response_cleaned.find(&pat) {
             if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..]) {
                 if name == tool {
-                    return Some((name, args));
+                    return Some((name, args, idx));
                 }
             }
         }
-        // Bare Qwen/Hermes-style JSON calls in the response body (e.g. `list_dir{"path": "src"}` or `call:list_dir{"path": "src"}`)
-        let pat_brace = format!("{}{{", tool);
-        if let Some(idx) = response_cleaned.find(&pat_brace) {
-            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
-                if name == tool {
-                    return Some((name, args));
-                }
-            }
-        }
+        // The `call:`-prefixed form must be checked BEFORE the bare brace form:
+        // the bare pattern is a substring of it, and matching the bare form first
+        // would leave a dangling "call:" classified as preamble prose.
         let pat_prefix = format!("call:{}{{", tool);
         if let Some(idx) = response_cleaned.find(&pat_prefix) {
             if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
                 if name == tool {
-                    return Some((name, args));
+                    return Some((name, args, idx));
+                }
+            }
+        }
+        // Bare Qwen/Hermes-style JSON calls in the response body (e.g. `list_dir{"path": "src"}`)
+        let pat_brace = format!("{}{{", tool);
+        if let Some(idx) = response_cleaned.find(&pat_brace) {
+            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
+                if name == tool {
+                    return Some((name, args, idx));
                 }
             }
         }
@@ -4693,6 +5297,67 @@ fn perform_web_search(query: &str) -> String {
         }
 }
 
+/// Declaration starters shared by outline_file and find_symbol. Checked against
+/// the leading token of each trimmed line.
+const DECL_STARTERS: [&str; 28] = [
+    "fn ",
+    "pub fn ",
+    "async fn ",
+    "pub async fn ",
+    "struct ",
+    "pub struct ",
+    "enum ",
+    "pub enum ",
+    "trait ",
+    "pub trait ",
+    "impl ",
+    "type ",
+    "pub type ",
+    "const ",
+    "pub const ",
+    "static ",
+    "pub static ",
+    "class ",
+    "def ",
+    "function ",
+    "export function ",
+    "export default ",
+    "interface ",
+    "export interface ",
+    "export class ",
+    "export const ",
+    "mod ",
+    "pub mod ",
+];
+
+/// Shared ignore rule for repository walks: hidden entries plus dependency and
+/// build-output folders. Keep this the single source of truth so list_dir,
+/// search_grep, find_file, and find_symbol all see the same world.
+fn is_ignored_entry(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules" || name == "target" || name == "dist"
+}
+
+/// Recursively collect non-ignored files under `dir`.
+fn collect_files(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if is_ignored_entry(&name) {
+            continue;
+        }
+        if p.is_dir() {
+            collect_files(&p, files);
+        } else {
+            files.push(p);
+        }
+    }
+}
+
 /// Produce a structural outline of a file instead of its full contents: markdown
 /// headings, or code declarations (fn/struct/enum/trait/impl/class/def/type/const),
 /// each with its line number. Lets the agent survey a large file cheaply and then
@@ -4721,37 +5386,7 @@ fn outline_file_impl(worktree_path: &Path, path: &str) -> String {
         } else {
             // Match common declaration keywords across languages. We check the
             // leading token after optional visibility/qualifier words.
-            let starters = [
-                "fn ",
-                "pub fn ",
-                "async fn ",
-                "pub async fn ",
-                "struct ",
-                "pub struct ",
-                "enum ",
-                "pub enum ",
-                "trait ",
-                "pub trait ",
-                "impl ",
-                "type ",
-                "pub type ",
-                "const ",
-                "pub const ",
-                "static ",
-                "pub static ",
-                "class ",
-                "def ",
-                "function ",
-                "export function ",
-                "export default ",
-                "interface ",
-                "export interface ",
-                "export class ",
-                "export const ",
-                "mod ",
-                "pub mod ",
-            ];
-            if starters.iter().any(|s| trimmed.starts_with(s)) {
+            if DECL_STARTERS.iter().any(|s| trimmed.starts_with(s)) {
                 // Trim trailing body opener for readability.
                 let sig = trimmed
                     .split(|c| c == '{' || c == ';')
@@ -4825,101 +5460,274 @@ fn read_file_range_impl(
     }
 }
 
-fn search_grep_impl(worktree_path: &Path, query: &str, path_opt: &str) -> String {
+/// Substring search across the repo (or a path), case-insensitive by default.
+/// Output is grouped per file with line numbers; optional context lines surround
+/// each match (the matching line marked with '>'). Caps: 10 matches shown per
+/// file, 50 total, so one noisy file can't eat the whole context budget.
+fn search_grep_impl(
+    worktree_path: &Path,
+    query: &str,
+    path_opt: &str,
+    context: usize,
+    case_sensitive: bool,
+) -> String {
+    const MAX_TOTAL: usize = 50;
+    const MAX_PER_FILE: usize = 10;
     let worktree_abs = clean_project_path(worktree_path);
     let target = match verify_sandbox(&worktree_abs, path_opt) {
         Ok(p) => p,
         Err(e) => return format!("Error: {}", e),
     };
-
-    let mut results = Vec::new();
-    let mut count = 0;
-    let max_results = 50;
-
-    if target.is_file() {
-        match fs::read_to_string(&target) {
-            Ok(content) => {
-                for (idx, line) in content.lines().enumerate() {
-                    if line.contains(query) {
-                        results.push(format!("{}:{}: {}", path_opt, idx + 1, line));
-                        count += 1;
-                        if count >= max_results {
-                            results.push(format!("... truncated after {} results", max_results));
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => return format!("Error reading file: {}", e),
-        }
+    let needle = if case_sensitive {
+        query.to_string()
     } else {
-        fn visit_dirs(
-            dir: &Path,
-            query: &str,
-            worktree_abs: &Path,
-            results: &mut Vec<String>,
-            count: &mut usize,
-            max_results: usize,
-        ) -> std::io::Result<()> {
-            if dir.is_dir() {
-                for entry in fs::read_dir(dir)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    if name.starts_with('.')
-                        || name == "node_modules"
-                        || name == "target"
-                        || name == "dist"
-                        || name == ".harness"
-                    {
-                        continue;
-                    }
-                    if path.is_dir() {
-                        visit_dirs(&path, query, worktree_abs, results, count, max_results)?;
-                        if *count >= max_results {
-                            break;
-                        }
-                    } else {
-                        if let Ok(content) = fs::read_to_string(&path) {
-                            let rel_path = path
-                                .strip_prefix(worktree_abs)
-                                .unwrap_or(&path)
-                                .to_string_lossy()
-                                .into_owned();
-                            for (idx, line) in content.lines().enumerate() {
-                                if line.contains(query) {
-                                    results.push(format!("{}:{}: {}", rel_path, idx + 1, line));
-                                    *count += 1;
-                                    if *count >= max_results {
-                                        results.push(format!(
-                                            "... truncated after {} results",
-                                            max_results
-                                        ));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        query.to_lowercase()
+    };
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    if target.is_file() {
+        files.push(target.clone());
+    } else {
+        collect_files(&target, &mut files);
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut truncated = false;
+
+    'files: for file in &files {
+        let Ok(content) = fs::read_to_string(file) else {
+            continue;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let mut hits: Vec<usize> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            let matched = if case_sensitive {
+                line.contains(&needle)
+            } else {
+                line.to_lowercase().contains(&needle)
+            };
+            if matched {
+                hits.push(idx);
             }
-            Ok(())
         }
-        if let Err(e) = visit_dirs(
-            &target,
-            query,
-            &worktree_abs,
-            &mut results,
-            &mut count,
-            max_results,
-        ) {
-            return format!("Error searching directory: {}", e);
+        if hits.is_empty() {
+            continue;
+        }
+        let rel = file
+            .strip_prefix(&worktree_abs)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .into_owned();
+        out.push(format!(
+            "== {} ({} match{})",
+            rel,
+            hits.len(),
+            if hits.len() == 1 { "" } else { "es" }
+        ));
+        for (n, &hit) in hits.iter().enumerate() {
+            if n >= MAX_PER_FILE {
+                out.push(format!(
+                    "   ... {} more match(es) in this file — search it directly for the rest",
+                    hits.len() - MAX_PER_FILE
+                ));
+                break;
+            }
+            if total >= MAX_TOTAL {
+                truncated = true;
+                break 'files;
+            }
+            if context == 0 {
+                out.push(format!("{}: {}", hit + 1, lines[hit]));
+            } else {
+                let from = hit.saturating_sub(context);
+                let to = (hit + context).min(lines.len().saturating_sub(1));
+                for i in from..=to {
+                    let marker = if i == hit { ">" } else { " " };
+                    out.push(format!("{}{}: {}", marker, i + 1, lines[i]));
+                }
+                out.push("--".to_string());
+            }
+            total += 1;
         }
     }
-    if results.is_empty() {
-        "No matches found".to_string()
+
+    if truncated {
+        out.push(format!(
+            "... truncated after {} matches. Narrow the query or pass a path.",
+            MAX_TOTAL
+        ));
+    }
+    if out.is_empty() {
+        format!(
+            "No matches found for \"{}\"{}",
+            query,
+            if case_sensitive {
+                " (case-sensitive — try case_sensitive: false)"
+            } else {
+                ""
+            }
+        )
     } else {
-        results.join("\n")
+        out.join("\n")
+    }
+}
+
+/// Depth-limited tree listing. Folders end with '/', children indented two
+/// spaces per level. Capped so a giant repo can't blow the context budget.
+fn list_dir_impl(target: &Path, depth: usize) -> String {
+    const MAX_ENTRIES: usize = 200;
+    fn walk(dir: &Path, level: usize, depth: usize, out: &mut Vec<String>, count: &mut usize) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| {
+            let p = e.path();
+            (
+                !p.is_dir(),
+                p.file_name().unwrap_or_default().to_ascii_lowercase(),
+            )
+        });
+        for entry in entries {
+            if *count >= MAX_ENTRIES {
+                return;
+            }
+            let p = entry.path();
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            if is_ignored_entry(&name) {
+                continue;
+            }
+            let indent = "  ".repeat(level);
+            if p.is_dir() {
+                out.push(format!("{}{}/", indent, name));
+                *count += 1;
+                if level + 1 < depth {
+                    walk(&p, level + 1, depth, out, count);
+                }
+            } else {
+                out.push(format!("{}{}", indent, name));
+                *count += 1;
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    walk(target, 0, depth, &mut out, &mut count);
+    if out.is_empty() {
+        return "Directory is empty".to_string();
+    }
+    if count >= MAX_ENTRIES {
+        out.push(format!(
+            "... truncated at {} entries. List a subdirectory or use a lower depth for more.",
+            MAX_ENTRIES
+        ));
+    }
+    out.join("\n")
+}
+
+/// Find files whose name contains a case-insensitive fragment. Returns relative
+/// paths, one per line.
+fn find_file_impl(worktree_path: &Path, name_query: &str, path_opt: &str) -> String {
+    const MAX_RESULTS: usize = 50;
+    let worktree_abs = clean_project_path(worktree_path);
+    let target = match verify_sandbox(&worktree_abs, path_opt) {
+        Ok(p) => p,
+        Err(e) => return format!("Error: {}", e),
+    };
+    let needle = name_query.to_lowercase();
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(&target, &mut files);
+    let mut out: Vec<String> = Vec::new();
+    for file in &files {
+        let fname = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
+        if fname.contains(&needle) {
+            let rel = file
+                .strip_prefix(&worktree_abs)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .into_owned();
+            out.push(rel);
+            if out.len() >= MAX_RESULTS {
+                out.push(format!(
+                    "... truncated at {} results. Use a more specific name.",
+                    MAX_RESULTS
+                ));
+                break;
+            }
+        }
+    }
+    if out.is_empty() {
+        format!(
+            "No files matching \"{}\" found. Try a shorter fragment of the name, or list_dir with depth to browse.",
+            name_query
+        )
+    } else {
+        out.join("\n")
+    }
+}
+
+/// Find where a symbol is declared: scans non-ignored files for declaration
+/// lines (same starters as outline_file) containing the symbol name, and
+/// returns file:line: signature for each.
+fn find_symbol_impl(worktree_path: &Path, symbol: &str, path_opt: &str) -> String {
+    const MAX_RESULTS: usize = 30;
+    let worktree_abs = clean_project_path(worktree_path);
+    let target = match verify_sandbox(&worktree_abs, path_opt) {
+        Ok(p) => p,
+        Err(e) => return format!("Error: {}", e),
+    };
+    let mut files: Vec<PathBuf> = Vec::new();
+    if target.is_file() {
+        files.push(target.clone());
+    } else {
+        collect_files(&target, &mut files);
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut count = 0usize;
+    'files: for file in &files {
+        let Ok(content) = fs::read_to_string(file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(&worktree_abs)
+            .unwrap_or(file)
+            .to_string_lossy()
+            .into_owned();
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if DECL_STARTERS.iter().any(|s| trimmed.starts_with(s)) && trimmed.contains(symbol) {
+                let sig = trimmed
+                    .split(|c| c == '{' || c == ';')
+                    .next()
+                    .unwrap_or(trimmed)
+                    .trim_end();
+                out.push(format!("{}:{}: {}", rel, idx + 1, sig));
+                count += 1;
+                if count >= MAX_RESULTS {
+                    out.push(format!("... truncated at {} results.", MAX_RESULTS));
+                    break 'files;
+                }
+            }
+        }
+    }
+    if out.is_empty() {
+        format!(
+            "No declarations matching \"{}\" found. It may be defined in a pattern this tool doesn't recognize — try search_grep.",
+            symbol
+        )
+    } else {
+        format!(
+            "Declarations matching \"{}\" (file:line: signature). Use read_file with the line number to inspect:\n{}",
+            symbol,
+            out.join("\n")
+        )
     }
 }
 
@@ -5026,7 +5834,10 @@ fn run_verification(worktree_path: &Path) -> Result<String, String> {
             Err(format!("{} FAILED:\n{}", label, head))
         }
         // Tool missing on PATH etc. — don't hard-block completion on environment problems.
-        Err(e) => Ok(format!("could not run {} ({}); verification skipped", label, e)),
+        Err(e) => Ok(format!(
+            "could not run {} ({}); verification skipped",
+            label, e
+        )),
     }
 }
 
@@ -5120,38 +5931,16 @@ fn execute_tool(
         }
         "list_dir" => {
             let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let depth = args
+                .get("depth")
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).clamp(1, 4))
+                .unwrap_or(1);
             let target = match verify_sandbox(worktree_path, path) {
                 Ok(p) => p,
                 Err(e) => return format!("Error: {}", e),
             };
-            match fs::read_dir(target) {
-                Ok(rd) => {
-                    let mut entries = Vec::new();
-                    for entry in rd.flatten() {
-                        let p = entry.path();
-                        let name = p
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned();
-                        if name.starts_with('.') || name == "node_modules" || name == "target" {
-                            continue;
-                        }
-                        let is_dir = p.is_dir();
-                        entries.push(format!(
-                            "{} ({})",
-                            name,
-                            if is_dir { "folder" } else { "file" }
-                        ));
-                    }
-                    if entries.is_empty() {
-                        "Directory is empty".to_string()
-                    } else {
-                        entries.join("\n")
-                    }
-                }
-                Err(e) => format!("Error listing directory: {}", e),
-            }
+            list_dir_impl(&target, depth)
         }
         "git_status" => match run_git_command(worktree_path, &["status"]) {
             Ok(out) => out,
@@ -5228,7 +6017,370 @@ fn execute_tool(
                 None => return "Error: Missing query argument".to_string(),
             };
             let path_opt = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
-            search_grep_impl(worktree_path, query, path_opt)
+            let context = args
+                .get("context")
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).min(5))
+                .unwrap_or(0);
+            let case_sensitive = args
+                .get("case_sensitive")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            search_grep_impl(worktree_path, query, path_opt, context, case_sensitive)
+        }
+        "find_file" => {
+            let name = match args.get("name").and_then(|n| n.as_str()) {
+                Some(n) => n,
+                None => return "Error: Missing name argument".to_string(),
+            };
+            let path_opt = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            find_file_impl(worktree_path, name, path_opt)
+        }
+        "find_symbol" => {
+            let name = match args.get("name").and_then(|n| n.as_str()) {
+                Some(n) => n,
+                None => return "Error: Missing name argument".to_string(),
+            };
+            let path_opt = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            find_symbol_impl(worktree_path, name, path_opt)
+        }
+        "remember" => {
+            const USAGE: &str = " Usage: remember(topic: String, content: String) — a short topic label and the insight worth keeping.";
+            let topic = match args.get("topic").and_then(|t| t.as_str()) {
+                Some(t) if !t.trim().is_empty() => t.trim(),
+                _ => return format!("Error: Missing 'topic' argument.{}", USAGE),
+            };
+            let content = match args.get("content").and_then(|c| c.as_str()) {
+                Some(c) if !c.trim().is_empty() => c.trim(),
+                _ => return format!("Error: Missing 'content' argument.{}", USAGE),
+            };
+            let topic: String = topic.chars().take(120).collect();
+            let content: String = content.chars().take(2000).collect();
+            let (scope, card_id) = memory_scope(app_handle, worktree_path, run_id);
+            match get_db_conn(app_handle) {
+                Ok(conn) => match insert_memory(
+                    &conn,
+                    &scope,
+                    &topic,
+                    &content,
+                    "agent",
+                    Some(run_id),
+                    card_id.as_deref(),
+                ) {
+                    Ok(_) => format!(
+                        "Success: remembered under topic '{}'. This memory persists across runs and chat modes for this project.",
+                        topic
+                    ),
+                    Err(e) => format!("Error saving memory: {}", e),
+                },
+                Err(e) => format!("Error: {}", e),
+            }
+        }
+        "recall" => {
+            let query = args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .trim();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).clamp(1, 10))
+                .unwrap_or(5);
+            let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
+            let conn = match get_db_conn(app_handle) {
+                Ok(c) => c,
+                Err(e) => return format!("Error: {}", e),
+            };
+            let result: Result<Vec<(String, String, String, String)>, rusqlite::Error> = (|| {
+                let mut rows = Vec::new();
+                if query.is_empty() {
+                    let mut stmt = conn.prepare(
+                        "SELECT topic, content, source, created_at FROM memories WHERE project_path = ?1 ORDER BY id DESC LIMIT ?2",
+                    )?;
+                    let it = stmt.query_map((&scope, limit as i64), |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?;
+                    for r in it {
+                        rows.push(r?);
+                    }
+                } else {
+                    let escaped = query
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_");
+                    let pattern = format!("%{}%", escaped);
+                    let mut stmt = conn.prepare(
+                        "SELECT topic, content, source, created_at FROM memories WHERE project_path = ?1 AND (topic LIKE ?2 ESCAPE '\\' OR content LIKE ?2 ESCAPE '\\') ORDER BY id DESC LIMIT ?3",
+                    )?;
+                    let it = stmt.query_map((&scope, &pattern, limit as i64), |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                    })?;
+                    for r in it {
+                        rows.push(r?);
+                    }
+                }
+                Ok(rows)
+            })();
+            let rows = match result {
+                Ok(r) => r,
+                Err(e) => return format!("Error reading memories: {}", e),
+            };
+            if rows.is_empty() {
+                if query.is_empty() {
+                    "No memories stored for this project yet. Use remember(topic, content) to save durable insights."
+                        .to_string()
+                } else {
+                    format!(
+                        "No memories matching \"{}\" for this project. Try a broader keyword, or call recall with an empty query for the most recent memories.",
+                        query
+                    )
+                }
+            } else {
+                let mut out = vec![format!(
+                    "{} memor{} (newest first):",
+                    rows.len(),
+                    if rows.len() == 1 { "y" } else { "ies" }
+                )];
+                for (topic, content, source, created_at) in rows {
+                    let date = created_at.split('T').next().unwrap_or("").to_string();
+                    out.push(format!("[{} | {}] {}: {}", date, source, topic, content));
+                }
+                out.join("\n")
+            }
+        }
+        "list_cards" => {
+            let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
+            let scope_clean = PathBuf::from(&scope);
+            let state_handle = match app_handle.try_state::<AppState>() {
+                Some(s) => s,
+                None => return "Error: app state unavailable".to_string(),
+            };
+            let cards = state_handle.cards.lock().unwrap();
+            let mut out: Vec<String> = Vec::new();
+            for status in ["backlog", "todo", "running", "blocked", "review", "done", "failed"] {
+                let group: Vec<&Card> = cards
+                    .iter()
+                    .filter(|c| {
+                        c.status == status
+                            && clean_project_path(&c.project_path) == scope_clean
+                    })
+                    .collect();
+                if group.is_empty() {
+                    continue;
+                }
+                out.push(format!("{}:", status.to_uppercase()));
+                for c in group {
+                    let done = c.todo_list.iter().filter(|t| t.completed).count();
+                    out.push(format!(
+                        "  [{}] {} (todos {}/{})",
+                        c.id,
+                        c.title,
+                        done,
+                        c.todo_list.len()
+                    ));
+                }
+            }
+            if out.is_empty() {
+                "No cards exist for this project yet. Use create_card to file work.".to_string()
+            } else {
+                out.join("\n")
+            }
+        }
+        "create_card" => {
+            const USAGE: &str = " Usage: create_card(title: String, description: String, todos?: [String]) — files a new card in the backlog.";
+            let title = match args.get("title").and_then(|t| t.as_str()) {
+                Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+                _ => return format!("Error: Missing 'title' argument.{}", USAGE),
+            };
+            let description = args
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let todos: Vec<String> = args
+                .get("todos")
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
+            let scope_clean = PathBuf::from(&scope);
+            let state_handle = match app_handle.try_state::<AppState>() {
+                Some(s) => s,
+                None => return "Error: app state unavailable".to_string(),
+            };
+            let mut cards = state_handle.cards.lock().unwrap();
+            // Reuse the raw project_path of a sibling card so the UI's raw-equality
+            // filter sees the new card; fall back to the cleaned scope string.
+            let project_path = cards
+                .iter()
+                .find(|c| clean_project_path(&c.project_path) == scope_clean)
+                .map(|c| c.project_path.clone())
+                .unwrap_or_else(|| scope.clone());
+            let id = new_card_id(&cards);
+            let new_card = Card {
+                id: id.clone(),
+                project_path,
+                title,
+                description,
+                status: "backlog".to_string(),
+                run_id: None,
+                assignee: None,
+                todo_list: todos
+                    .iter()
+                    .map(|t| TodoItem {
+                        text: t.clone(),
+                        completed: false,
+                    })
+                    .collect(),
+            };
+            cards.push(new_card.clone());
+            if let Ok(conn) = get_db_conn(app_handle) {
+                let _ = conn.execute(
+                    "INSERT INTO cards (id, project_path, title, description, status, run_id, assignee) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (&new_card.id, &new_card.project_path, &new_card.title, &new_card.description, &new_card.status, &new_card.run_id, &new_card.assignee),
+                );
+                for (idx, item) in new_card.todo_list.iter().enumerate() {
+                    let _ = conn.execute(
+                        "INSERT INTO todo_items (card_id, idx, text, completed) VALUES (?1, ?2, ?3, ?4)",
+                        (&new_card.id, idx as i32, &item.text, 0),
+                    );
+                }
+            }
+            let _ = app_handle.emit("run-updated", serde_json::json!({ "run_id": run_id }));
+            format!(
+                "Success: card '{}' filed in the backlog with id {} ({} todo item{}). The developer will review and schedule it.",
+                new_card.title,
+                id,
+                new_card.todo_list.len(),
+                if new_card.todo_list.len() == 1 { "" } else { "s" }
+            )
+        }
+        "update_card" => {
+            const USAGE: &str = " Usage: update_card(card_id: String, title?: String, description?: String, add_todo?: String) — card_id comes from list_cards; only backlog/todo cards can be edited.";
+            let card_id = match args.get("card_id").and_then(|c| c.as_str()) {
+                Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+                _ => return format!("Error: Missing 'card_id' argument.{}", USAGE),
+            };
+            let new_title = args.get("title").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let new_desc = args.get("description").and_then(|d| d.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let add_todo = args.get("add_todo").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            if new_title.is_none() && new_desc.is_none() && add_todo.is_none() {
+                return format!("Error: nothing to update — provide title, description, or add_todo.{}", USAGE);
+            }
+            let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
+            let scope_clean = PathBuf::from(&scope);
+            let state_handle = match app_handle.try_state::<AppState>() {
+                Some(s) => s,
+                None => return "Error: app state unavailable".to_string(),
+            };
+            let mut cards = state_handle.cards.lock().unwrap();
+            let card = match cards.iter_mut().find(|c| {
+                c.id == card_id && clean_project_path(&c.project_path) == scope_clean
+            }) {
+                Some(c) => c,
+                None => {
+                    return format!(
+                        "Error: no card with id '{}' in this project. Call list_cards to see valid ids.",
+                        card_id
+                    )
+                }
+            };
+            if card.status != "backlog" && card.status != "todo" {
+                return format!(
+                    "Error: card '{}' is in status '{}' — only backlog or todo cards can be edited.",
+                    card.title, card.status
+                );
+            }
+            if let Some(t) = &new_title {
+                card.title = t.clone();
+            }
+            if let Some(d) = &new_desc {
+                card.description = d.clone();
+            }
+            let mut todo_added = false;
+            if let Some(todo_text) = &add_todo {
+                card.todo_list.push(TodoItem {
+                    text: todo_text.clone(),
+                    completed: false,
+                });
+                todo_added = true;
+            }
+            let card_title = card.title.clone();
+            let card_desc = card.description.clone();
+            let card_id_db = card.id.clone();
+            let todo_idx = card.todo_list.len().saturating_sub(1);
+            let todo_text_db = add_todo.clone();
+            if let Ok(conn) = get_db_conn(app_handle) {
+                let _ = conn.execute(
+                    "UPDATE cards SET title = ?1, description = ?2 WHERE id = ?3",
+                    (&card_title, &card_desc, &card_id_db),
+                );
+                if todo_added {
+                    if let Some(text) = &todo_text_db {
+                        let _ = conn.execute(
+                            "INSERT INTO todo_items (card_id, idx, text, completed) VALUES (?1, ?2, ?3, ?4)",
+                            (&card_id_db, todo_idx as i32, text, 0),
+                        );
+                    }
+                }
+            }
+            let _ = app_handle.emit("run-updated", serde_json::json!({ "run_id": run_id }));
+            format!("Success: card '{}' updated.", card_title)
+        }
+        "delete_card" => {
+            const USAGE: &str = " Usage: delete_card(card_id: String) — card_id comes from list_cards; only backlog/todo cards with no run history can be deleted.";
+            let card_id = match args.get("card_id").and_then(|c| c.as_str()) {
+                Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+                _ => return format!("Error: Missing 'card_id' argument.{}", USAGE),
+            };
+            let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
+            let scope_clean = PathBuf::from(&scope);
+            let state_handle = match app_handle.try_state::<AppState>() {
+                Some(s) => s,
+                None => return "Error: app state unavailable".to_string(),
+            };
+            let mut cards = state_handle.cards.lock().unwrap();
+            let pos = match cards.iter().position(|c| {
+                c.id == card_id && clean_project_path(&c.project_path) == scope_clean
+            }) {
+                Some(p) => p,
+                None => {
+                    return format!(
+                        "Error: no card with id '{}' in this project. Call list_cards to see valid ids.",
+                        card_id
+                    )
+                }
+            };
+            {
+                let card = &cards[pos];
+                if card.status != "backlog" && card.status != "todo" {
+                    return format!(
+                        "Error: card '{}' is in status '{}' — only backlog or todo cards can be deleted.",
+                        card.title, card.status
+                    );
+                }
+                if card.run_id.is_some() {
+                    return format!(
+                        "Error: card '{}' has run history and cannot be deleted.",
+                        card.title
+                    );
+                }
+            }
+            let removed = cards.remove(pos);
+            if let Ok(conn) = get_db_conn(app_handle) {
+                let _ = conn.execute("DELETE FROM todo_items WHERE card_id = ?1", [&removed.id]);
+                let _ = conn.execute("DELETE FROM cards WHERE id = ?1", [&removed.id]);
+            }
+            let _ = app_handle.emit("run-updated", serde_json::json!({ "run_id": run_id }));
+            format!("Success: card '{}' deleted.", removed.title)
         }
         "patch_file" => {
             let path = match args.get("path").and_then(|p| p.as_str()) {
@@ -5332,7 +6484,7 @@ fn execute_tool(
             }
         }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -5454,6 +6606,14 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "send_notification",
                 "task_complete",
                 "search_grep",
+                "find_file",
+                "find_symbol",
+                "remember",
+                "recall",
+                "list_cards",
+                "create_card",
+                "update_card",
+                "delete_card",
                 "patch_file",
                 "replace_lines",
                 "read_card",
@@ -5510,7 +6670,25 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
             }
 
-            if let Some((tool_name, args)) = parse_tool_call(&remaining) {
+            if let Some((tool_name, args, preamble)) = parse_tool_call_spanned(&remaining) {
+                // Surface the prose the model wrote before its tool call —
+                // previously this commentary was silently clobbered.
+                if !preamble.is_empty() {
+                    append_run_event(
+                        &app_handle_clone,
+                        &state,
+                        &run_id_clone,
+                        RunEvent {
+                            run_id: run_id_clone.clone(),
+                            event_type: "message".to_string(),
+                            payload: serde_json::json!({
+                                "role": "agent",
+                                "content": preamble,
+                            })
+                            .to_string(),
+                        },
+                    );
+                }
                 append_run_event(
                     &app_handle_clone,
                     &state,
@@ -5747,7 +6925,13 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
          2. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed). Use this to update design documents under `design/`!\n\
          3. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
          4. `web_search(query: String)`: Searches the web for APIs, libraries, architectural patterns, and programming guides.\n\
-         5. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\n\
+         5. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
+         6. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with code chat and agent runs. Record design decisions and their reasons here.\n\
+         7. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before proposing from scratch.\n\
+         8. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
+         9. `create_card(title: String, description: String, todos?: [String])`: Files a new card in the backlog. When a design discussion produces actionable work, FILE IT as a card with a clear description and todos — that is how plans become runs.\n\
+         10. `update_card(card_id: String, title?: String, description?: String, add_todo?: String)`: Edits a backlog/todo card or appends a todo item.\n\
+         11. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your ideas, proposals, or questions.",
         doc_name, project_path.to_string_lossy()
     )
@@ -5778,7 +6962,13 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
          4. `git_status()`: Runs `git status` in the repository.\n\
          5. `git_diff()`: Runs `git diff` to view code changes.\n\
          6. `run_command(command: String)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests!\n\
-         7. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\n\
+         7. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\
+         8. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with design chat and agent runs. Record how subsystems work and pitfalls you discover.\n\
+         9. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
+         10. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
+         11. `create_card(title: String, description: String, todos?: [String])`: Files a new card in the backlog. If a fix you're discussing is bigger than the current conversation, file it as a card so it gets scheduled instead of forgotten.\n\
+         12. `update_card(card_id: String, title?: String, description?: String, add_todo?: String)`: Edits a backlog/todo card or appends a todo item.\n\
+         13. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your changes or asking questions.",
         target, project_path.to_string_lossy()
     )
@@ -5800,11 +6990,12 @@ Some introductory text.
 ```
 Some trailing text.
 "#;
-        let res = parse_tool_call(input);
+        let res = parse_tool_call_spanned(input);
         assert!(res.is_some());
-        let (name, args) = res.unwrap();
+        let (name, args, preamble) = res.unwrap();
         assert_eq!(name, "list_dir");
         assert_eq!(args.get("path").unwrap().as_str().unwrap(), "");
+        assert_eq!(preamble, "Some introductory text.");
     }
 
     #[test]
@@ -5827,11 +7018,12 @@ BeetleAI
 ``
 <tool_call|>
 "#;
-        let res = parse_tool_call(input);
+        let res = parse_tool_call_spanned(input);
         assert!(res.is_some());
-        let (name, args) = res.unwrap();
+        let (name, args, preamble) = res.unwrap();
         assert_eq!(name, "list_dir");
         assert_eq!(args.get("path").unwrap().as_str().unwrap(), "");
+        assert_eq!(preamble, "BeetleAI\nBeetleAI");
     }
 
     #[test]
@@ -5845,9 +7037,9 @@ BeetleAI
 }
 <tool_call|>
 "#;
-        let res = parse_tool_call(input);
+        let res = parse_tool_call_spanned(input);
         assert!(res.is_some());
-        let (name, args) = res.unwrap();
+        let (name, args, _preamble) = res.unwrap();
         assert_eq!(name, "read_file");
         assert_eq!(args.get("path").unwrap().as_str().unwrap(), "DesignDoc.md");
     }
@@ -5862,27 +7054,45 @@ BeetleAI
 }
 ```
 "#;
-        let res = parse_tool_call(input);
+        let res = parse_tool_call_spanned(input);
         assert!(res.is_some());
-        let (name, _) = res.unwrap();
+        let (name, _, preamble) = res.unwrap();
         assert_eq!(name, "git_status");
+        assert_eq!(preamble, "");
     }
 
     #[test]
     fn test_parse_tool_call_qwen_syntax() {
         let input = "<|tool_call>call:read_card{}<tool_call|>";
-        let res = parse_tool_call(input);
+        let res = parse_tool_call_spanned(input);
         assert!(res.is_some());
-        let (name, args) = res.unwrap();
+        let (name, args, _) = res.unwrap();
         assert_eq!(name, "read_card");
         assert!(args.is_object());
 
         let input_bare = "call:write_file{\"path\": \"foo.txt\", \"content\": \"bar\"}";
-        let res_bare = parse_tool_call(input_bare);
+        let res_bare = parse_tool_call_spanned(input_bare);
         assert!(res_bare.is_some());
-        let (name_b, args_b) = res_bare.unwrap();
+        let (name_b, args_b, preamble_b) = res_bare.unwrap();
         assert_eq!(name_b, "write_file");
         assert_eq!(args_b.get("path").unwrap().as_str().unwrap(), "foo.txt");
+        assert_eq!(preamble_b, "");
+    }
+
+    #[test]
+    fn test_tool_preamble_rescued_and_debris_dropped() {
+        // Real prose before the call is preserved.
+        let input = "I'll inspect the design doc first to confirm the section layout.\n```tool_call\n{\"name\": \"read_file\", \"args\": {\"path\": \"design/design.md\"}}\n```";
+        let (_, _, preamble) = parse_tool_call_spanned(input).unwrap();
+        assert_eq!(
+            preamble,
+            "I'll inspect the design doc first to confirm the section layout."
+        );
+
+        // Pure syntax debris (no alphanumerics) is treated as no preamble.
+        let input_debris = "\n> \n```tool_call\n{\"name\": \"git_status\", \"args\": {}}\n```";
+        let (_, _, preamble_d) = parse_tool_call_spanned(input_debris).unwrap();
+        assert_eq!(preamble_d, "");
     }
 
     #[test]
@@ -5967,16 +7177,30 @@ BeetleAI
         )
         .unwrap();
 
-        // 1. Test search_grep_impl recursively
-        let res_search = search_grep_impl(wt_path, "Rust", "");
+        // 1. Test search_grep_impl recursively (output is grouped by file)
+        let res_search = search_grep_impl(wt_path, "Rust", "", 0, false);
         let normalized = res_search.replace("\\", "/");
-        assert!(normalized.contains("file_a.txt:3: Rust is awesome!"));
-        assert!(normalized.contains("file_b.txt:3: Rust coding is great!"));
+        assert!(normalized.contains("== file_a.txt (1 match)"));
+        assert!(normalized.contains("3: Rust is awesome!"));
+        assert!(normalized.contains("== file_b.txt (1 match)"));
+        assert!(normalized.contains("3: Rust coding is great!"));
+
+        // 1b. Case-insensitive by default; case-sensitive on request.
+        let res_ci = search_grep_impl(wt_path, "rust", "", 0, false);
+        assert!(res_ci.contains("Rust is awesome!"));
+        let res_cs = search_grep_impl(wt_path, "rust", "", 0, true);
+        assert!(res_cs.starts_with("No matches found"));
+
+        // 1c. Context lines surround the hit, which is marked with '>'.
+        let res_ctx = search_grep_impl(wt_path, "large file", "file_a.txt", 1, false);
+        assert!(res_ctx.contains(" 1: Hello World!"));
+        assert!(res_ctx.contains(">2: This is a large file line."));
+        assert!(res_ctx.contains(" 3: Rust is awesome!"));
 
         // 2. Test search_grep_impl specific file
-        let res_search_file = search_grep_impl(wt_path, "large file", "file_a.txt");
+        let res_search_file = search_grep_impl(wt_path, "large file", "file_a.txt", 0, false);
         let normalized_file = res_search_file.replace("\\", "/");
-        assert!(normalized_file.contains("file_a.txt:2: This is a large file line."));
+        assert!(normalized_file.contains("2: This is a large file line."));
         assert!(!normalized_file.contains("file_b.txt"));
 
         // 3. Test patch_file_impl unique replacement

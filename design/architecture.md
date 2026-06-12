@@ -1,4 +1,4 @@
-# BeetleAI Design Document
+# Architecture
 
 ## 1. Vision & Mission
 BeetleAI is an **Agentic AI Workspace** designed to bridge the gap between high-level human intent and low-level technical execution. Unlike standard LLM interfaces, BeetleAI acts as a proactive collaborator capable of managing project documentation, executing code changes through supervised "runs," tracking tasks via integrated Kanban boards, and navigating complex file systems.

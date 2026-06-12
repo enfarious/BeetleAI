@@ -1572,3 +1572,130 @@ body.resizing-active .resizer {
     transform: translateX(24px);
   }
 }
+
+/* Card priority + labels */
+.card-priority-chip {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.card-priority-high {
+  color: var(--status-failed, #e5534b);
+}
+.card-priority-medium {
+  color: var(--text-muted);
+}
+.card-priority-low {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+.kanban-card-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 6px;
+}
+.card-label-chip {
+  font-size: 0.7rem;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+/* Board Pulse (left panel, kanban mode) */
+.pulse-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.pulse-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 8px 2px;
+}
+.pulse-stat-num {
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: var(--text-primary, inherit);
+}
+.pulse-num-high { color: var(--status-failed); }
+.pulse-num-active { color: var(--status-running); }
+.pulse-num-review { color: var(--status-review); }
+.pulse-stat-label {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.pulse-labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.pulse-label-chip {
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.pulse-label-chip:hover {
+  background: var(--accent-primary);
+  color: #fff;
+}
+.pulse-label-active {
+  background: var(--accent-primary);
+  color: #fff;
+}
+.pulse-memories {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.pulse-memory {
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.pulse-memory-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+}
+.pulse-memory-icon {
+  font-size: 0.75rem;
+  color: var(--status-done);
+}
+.pulse-memory-topic {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pulse-memory-content {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.pulse-memory-date {
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-top: 4px;
+}
+.pulse-memory-empty {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  padding: 8px 2px;
+  line-height: 1.4;
+}

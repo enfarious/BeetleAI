@@ -169,6 +169,8 @@ const mockInvoke = async (cmd: string, args?: any): Promise<any> => {
       };
     case "delete_project":
       return null;
+    case "list_memories":
+      return [];
     case "get_settings":
       return {
         provider: "custom",
@@ -386,6 +388,16 @@ interface Card {
   run_id: string | null;
   assignee: string | null;
   todo_list: TodoItem[];
+  priority?: string; // "low" | "medium" | "high" (backend defaults to medium)
+  labels?: string[];
+}
+
+interface MemoryEntry {
+  id: number;
+  topic: string;
+  content: string;
+  source: string;
+  created_at: string;
 }
 
 interface RunEvent {
@@ -421,6 +433,7 @@ interface LlmSettings {
 // App State
 let currentProject: Project | null = null;
 let cardsList: Card[] = [];
+let activeLabelFilter: string | null = null;
 let activeCard: Card | null = null;
 let viewerStack: ViewerState[] = [{ kind: "doc", docName: "design.md" }];
 let currentMode: "plan" | "kanban" | "code" = "plan";
@@ -441,6 +454,7 @@ const btnNewProjectToggle = document.getElementById("btn-new-project-toggle") as
 const btnEditProjectToggle = document.getElementById("btn-edit-project-toggle") as HTMLButtonElement;
 const repoWorkspaceSection = document.getElementById("repo-workspace-section") as HTMLDivElement;
 const designDocsSection = document.getElementById("design-docs-section") as HTMLDivElement;
+const projectPulseSection = document.getElementById("project-pulse-section") as HTMLDivElement;
 const designDocsList = document.getElementById("design-docs-list") as HTMLDivElement;
 const fileTreeContainer = document.getElementById("file-tree") as HTMLDivElement;
 const activeCardTitle = document.getElementById("active-card-title") as HTMLHeadingElement;
@@ -1210,17 +1224,21 @@ function switchMode(mode: "plan" | "kanban" | "code") {
   if (mode === "plan") {
     designDocsSection.style.display = "block";
     repoWorkspaceSection.style.display = "none";
+    projectPulseSection.style.display = "none";
     activeCard = null;
     loadDesignDocs();
   } else if (mode === "kanban") {
     designDocsSection.style.display = "none";
     repoWorkspaceSection.style.display = "none";
+    projectPulseSection.style.display = "block";
     activeCard = null;
     pushView({ kind: "kanban" });
     updateActiveCardUI();
+    renderProjectPulse();
   } else if (mode === "code") {
     designDocsSection.style.display = "none";
     repoWorkspaceSection.style.display = "block";
+    projectPulseSection.style.display = "none";
     const currentView = viewerStack[viewerStack.length - 1];
     if (currentView && currentView.kind === "file") {
       // Keep it
@@ -1352,6 +1370,9 @@ async function refreshState() {
     // Always update chat UI and right panel when refreshing state
     await updateActiveCardUI();
     renderRightPanel();
+    if (currentMode === "kanban") {
+      renderProjectPulse();
+    }
   } catch (err) {
     console.error("Error refreshing state:", err);
     // Safe client-side fallback if backend calls fail
@@ -2439,6 +2460,82 @@ async function renderRightPanel() {
 }
 
 // Render horizontal Kanban columns
+/// Board Pulse: stats, label filters, and the agent's recent memories for the
+/// active project. Lives in the left panel, kanban mode only.
+async function renderProjectPulse() {
+  const statsDiv = document.getElementById("pulse-stats");
+  const labelsDiv = document.getElementById("pulse-labels");
+  const memsDiv = document.getElementById("pulse-memories");
+  const memCount = document.getElementById("pulse-memory-count");
+  if (!statsDiv || !labelsDiv || !memsDiv) return;
+
+  // --- Board stats
+  const openCards = cardsList.filter(c => c.status === "backlog" || c.status === "todo");
+  const highOpen = openCards.filter(c => c.priority === "high").length;
+  const active = cardsList.filter(c => c.status === "running" || c.status === "blocked").length;
+  const review = cardsList.filter(c => c.status === "review").length;
+  statsDiv.innerHTML = `
+    <div class="pulse-stat"><span class="pulse-stat-num">${openCards.length}</span><span class="pulse-stat-label">open</span></div>
+    <div class="pulse-stat"><span class="pulse-stat-num${highOpen ? ' pulse-num-high' : ''}">${highOpen}</span><span class="pulse-stat-label">high pri</span></div>
+    <div class="pulse-stat"><span class="pulse-stat-num${active ? ' pulse-num-active' : ''}">${active}</span><span class="pulse-stat-label">running</span></div>
+    <div class="pulse-stat"><span class="pulse-stat-num${review ? ' pulse-num-review' : ''}">${review}</span><span class="pulse-stat-label">review</span></div>
+  `;
+
+  // --- Label filter chips (click to filter the board; click again to clear)
+  const labelCounts = new Map<string, number>();
+  for (const c of cardsList) {
+    for (const l of (c.labels || [])) {
+      labelCounts.set(l, (labelCounts.get(l) || 0) + 1);
+    }
+  }
+  if (labelCounts.size === 0) {
+    labelsDiv.innerHTML = "";
+  } else {
+    labelsDiv.innerHTML = [...labelCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([l, n]) =>
+        `<span class="card-label-chip pulse-label-chip${activeLabelFilter === l ? ' pulse-label-active' : ''}" data-label="${escapeHtml(l)}" title="Filter board by this label">${escapeHtml(l)} (${n})</span>`
+      ).join("");
+    labelsDiv.querySelectorAll(".pulse-label-chip").forEach(chip => {
+      chip.addEventListener("click", () => {
+        const l = (chip as HTMLElement).dataset.label || null;
+        activeLabelFilter = activeLabelFilter === l ? null : l;
+        renderProjectPulse();
+        const currentView = viewerStack[viewerStack.length - 1];
+        if (currentView && currentView.kind === "kanban") {
+          renderKanbanBoard();
+        }
+      });
+    });
+  }
+
+  // --- Agent memory feed
+  if (!currentProject) {
+    memsDiv.innerHTML = "";
+    return;
+  }
+  try {
+    const memories = await invoke<MemoryEntry[]>("list_memories", { projectPath: currentProject.path, limit: 8 });
+    if (memCount) memCount.textContent = memories.length ? `latest ${memories.length}` : "";
+    if (memories.length === 0) {
+      memsDiv.innerHTML = `<div class="pulse-memory-empty">Nothing remembered yet — accepted runs and remember() calls will appear here.</div>`;
+    } else {
+      memsDiv.innerHTML = memories.map(m => {
+        const date = (m.created_at || "").split("T")[0];
+        const icon = m.source === "run_accept" ? "✓" : "✎";
+        const iconTitle = m.source === "run_accept" ? "Auto-saved from an accepted run" : "Saved by the agent with remember()";
+        return `<div class="pulse-memory">
+          <div class="pulse-memory-top"><span class="pulse-memory-icon" title="${iconTitle}">${icon}</span><span class="pulse-memory-topic">${escapeHtml(m.topic)}</span></div>
+          <div class="pulse-memory-content">${escapeHtml(m.content)}</div>
+          <div class="pulse-memory-date">${date}</div>
+        </div>`;
+      }).join("");
+    }
+  } catch {
+    memsDiv.innerHTML = `<div class="pulse-memory-empty">Memory unavailable</div>`;
+  }
+}
+
 function renderKanbanBoard() {
   viewerContainer.innerHTML = "";
   const board = document.createElement("div");
@@ -2454,11 +2551,15 @@ function renderKanbanBoard() {
     { key: "failed", title: "Failed" },
   ];
 
+  const boardCards = activeLabelFilter
+    ? cardsList.filter((c) => (c.labels || []).includes(activeLabelFilter!))
+    : cardsList;
+
   columns.forEach((col) => {
     const colDiv = document.createElement("div");
     colDiv.className = "kanban-column";
 
-    const filtered = cardsList.filter((c) => c.status === col.key);
+    const filtered = boardCards.filter((c) => c.status === col.key);
 
     colDiv.innerHTML = `
       <div class="kanban-column-header">
@@ -2479,9 +2580,11 @@ function renderKanbanBoard() {
       cardDiv.innerHTML = `
         <div class="kanban-card-title">${formatPlainMarkdown(card.title)}</div>
         <div class="kanban-card-description">${formatPlainMarkdown(card.description)}</div>
+        ${(card.labels && card.labels.length) ? `<div class="kanban-card-labels">${card.labels.map(l => `<span class="card-label-chip">${escapeHtml(l)}</span>`).join("")}</div>` : ''}
         <div class="kanban-card-meta">
+          <span class="card-priority-chip card-priority-${card.priority || 'medium'}">${(card.priority || 'medium').toUpperCase()}</span>
           <span>ID: ${card.id}</span>
-          ${card.run_id ? `<span style="color: var(--accent-primary); font-weight: 500;">Run Active</span>` : ''}
+          ${card.status === "running" ? `<span style="color: var(--status-running); font-weight: 500;">Run Active</span>` : card.status === "blocked" ? `<span style="color: var(--status-blocked); font-weight: 500;">Run Blocked</span>` : ''}
         </div>
       `;
 
@@ -3238,6 +3341,16 @@ function renderCardDetail(card: Card) {
         <span class="card-detail-meta-label">Status</span>
         ${statusSelectHtml}
       </div>
+      <div class="card-detail-meta-item">
+        <span class="card-detail-meta-label">Priority</span>
+        <select class="card-detail-status-select" id="card-detail-priority-select-el">
+          ${["low", "medium", "high"].map(p => `<option value="${p}" ${(card.priority || "medium") === p ? 'selected' : ''}>${p.charAt(0).toUpperCase() + p.slice(1)}</option>`).join("")}
+        </select>
+      </div>
+      <div class="card-detail-meta-item">
+        <span class="card-detail-meta-label">Labels</span>
+        <input type="text" class="todo-item-add-input" id="card-detail-labels-el" placeholder="comma, separated, labels" value="${escapeHtml((card.labels || []).join(", "))}">
+      </div>
     </div>
 
     ${checklistHtml}
@@ -3257,6 +3370,20 @@ function renderCardDetail(card: Card) {
         await saveCardObject(card);
       }
     });
+  });
+
+  // Event listener: Priority select
+  const prioritySelect = detailDiv.querySelector("#card-detail-priority-select-el") as HTMLSelectElement | null;
+  prioritySelect?.addEventListener("change", async () => {
+    card.priority = prioritySelect.value;
+    await saveCardObject(card);
+  });
+
+  // Event listener: Labels input (comma separated), persisted on change
+  const labelsInput = detailDiv.querySelector("#card-detail-labels-el") as HTMLInputElement | null;
+  labelsInput?.addEventListener("change", async () => {
+    card.labels = labelsInput.value.split(",").map(s => s.trim()).filter(Boolean);
+    await saveCardObject(card);
   });
 
   // Event listener: Checklist item delete

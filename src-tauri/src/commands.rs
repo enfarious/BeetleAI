@@ -31,6 +31,23 @@ pub struct Card {
     pub run_id: Option<String>,
     pub assignee: Option<String>,
     pub todo_list: Vec<TodoItem>,
+    #[serde(default = "default_priority")]
+    pub priority: String, // "low" | "medium" | "high"
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+fn default_priority() -> String {
+    "medium".to_string()
+}
+
+/// Normalize free-form priority input to the three canonical levels.
+fn normalize_priority(p: &str) -> String {
+    match p.trim().to_lowercase().as_str() {
+        "low" | "l" | "minor" | "p3" => "low".to_string(),
+        "high" | "h" | "urgent" | "critical" | "p0" | "p1" => "high".to_string(),
+        _ => "medium".to_string(),
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -87,6 +104,8 @@ impl AppState {
                 status: "done".to_string(),
                 run_id: Some("run_card_1".to_string()),
                 assignee: Some("BeetleAI".to_string()),
+                priority: "medium".to_string(),
+                labels: Vec::new(),
                 todo_list: vec![
                     TodoItem { text: "Configure Tauri v2 project template".to_string(), completed: true },
                     TodoItem { text: "Build TypeScript sidebar navigation and panels".to_string(), completed: true },
@@ -101,6 +120,8 @@ impl AppState {
                 status: "review".to_string(),
                 run_id: Some("run_card_2".to_string()),
                 assignee: Some("BeetleAI".to_string()),
+                priority: "medium".to_string(),
+                labels: Vec::new(),
                 todo_list: vec![
                     TodoItem { text: "Implement git worktree creation helpers".to_string(), completed: true },
                     TodoItem { text: "Integrate file deletion and modification boundaries".to_string(), completed: true },
@@ -115,6 +136,8 @@ impl AppState {
                 status: "todo".to_string(),
                 run_id: None,
                 assignee: None,
+                priority: "medium".to_string(),
+                labels: Vec::new(),
                 todo_list: vec![
                     TodoItem { text: "Design database schema for cards and logs".to_string(), completed: false },
                     TodoItem { text: "Integrate SQLite driver and migrations".to_string(), completed: false },
@@ -129,6 +152,8 @@ impl AppState {
                 status: "backlog".to_string(),
                 run_id: None,
                 assignee: None,
+                priority: "medium".to_string(),
+                labels: Vec::new(),
                 todo_list: vec![
                     TodoItem { text: "Construct Tokio worker thread loop".to_string(), completed: false },
                     TodoItem { text: "Implement model response stream parsing".to_string(), completed: false },
@@ -338,6 +363,8 @@ fn seed_default_cards_for_project(
             status: "done".to_string(),
             run_id: Some(format!("run_{}_card_1", project_slug)),
             assignee: Some("BeetleAI".to_string()),
+            priority: "medium".to_string(),
+            labels: Vec::new(),
             todo_list: vec![
                 TodoItem { text: "Configure Tauri v2 project template".to_string(), completed: true },
                 TodoItem { text: "Build TypeScript sidebar navigation and panels".to_string(), completed: true },
@@ -352,6 +379,8 @@ fn seed_default_cards_for_project(
             status: "review".to_string(),
             run_id: Some(format!("run_{}_card_2", project_slug)),
             assignee: Some("BeetleAI".to_string()),
+            priority: "medium".to_string(),
+            labels: Vec::new(),
             todo_list: vec![
                 TodoItem { text: "Implement git worktree creation helpers".to_string(), completed: true },
                 TodoItem { text: "Integrate file deletion and modification boundaries".to_string(), completed: true },
@@ -366,6 +395,8 @@ fn seed_default_cards_for_project(
             status: "todo".to_string(),
             run_id: None,
             assignee: None,
+            priority: "medium".to_string(),
+            labels: Vec::new(),
             todo_list: vec![
                 TodoItem { text: "Design database schema for cards and logs".to_string(), completed: false },
                 TodoItem { text: "Integrate SQLite driver and migrations".to_string(), completed: false },
@@ -380,6 +411,8 @@ fn seed_default_cards_for_project(
             status: "backlog".to_string(),
             run_id: None,
             assignee: None,
+            priority: "medium".to_string(),
+            labels: Vec::new(),
             todo_list: vec![
                 TodoItem { text: "Construct Tokio worker thread loop".to_string(), completed: false },
                 TodoItem { text: "Implement model response stream parsing".to_string(), completed: false },
@@ -501,11 +534,24 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             description TEXT NOT NULL,
             status TEXT NOT NULL,
             run_id TEXT,
-            assignee TEXT
+            assignee TEXT,
+            priority TEXT NOT NULL DEFAULT 'medium',
+            labels TEXT NOT NULL DEFAULT '[]'
         );",
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    // Lightweight migrations for existing databases: SQLite's ALTER TABLE
+    // ADD COLUMN fails harmlessly when the column already exists.
+    let _ = conn.execute(
+        "ALTER TABLE cards ADD COLUMN priority TEXT NOT NULL DEFAULT 'medium'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE cards ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
 
     // Attempt migration to add project_path column to existing databases
     let _ = conn.execute(
@@ -680,7 +726,7 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
     let conn = get_db_conn(app_handle)?;
 
     let mut stmt = conn
-        .prepare("SELECT id, project_path, title, description, status, run_id, assignee FROM cards")
+        .prepare("SELECT id, project_path, title, description, status, run_id, assignee, priority, labels FROM cards")
         .map_err(|e| e.to_string())?;
     let card_rows = stmt
         .query_map([], |row| {
@@ -692,13 +738,15 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut cards = Vec::new();
     for card_res in card_rows {
-        let (id, project_path, title, description, status, run_id, assignee) =
+        let (id, project_path, title, description, status, run_id, assignee, priority, labels_json) =
             card_res.map_err(|e| e.to_string())?;
 
         let mut todo_stmt = conn
@@ -726,6 +774,8 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
             status,
             run_id,
             assignee,
+            priority: normalize_priority(&priority),
+            labels: serde_json::from_str(&labels_json).unwrap_or_default(),
             todo_list,
         });
     }
@@ -1110,6 +1160,49 @@ pub async fn delete_project(
     }
 
     Ok(())
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MemoryEntry {
+    pub id: i64,
+    pub topic: String,
+    pub content: String,
+    pub source: String,
+    pub created_at: String,
+}
+
+/// Read-only window into a project's long-term memory for the UI (the agent
+/// reads memory through its `recall` tool; this feeds the Board Pulse panel).
+#[tauri::command]
+pub async fn list_memories(
+    app_handle: tauri::AppHandle,
+    project_path: String,
+    limit: Option<u32>,
+) -> Result<Vec<MemoryEntry>, String> {
+    let scope = clean_project_path(&project_path)
+        .to_string_lossy()
+        .into_owned();
+    let limit = limit.unwrap_or(8).clamp(1, 50) as i64;
+    let conn = get_db_conn(&app_handle)?;
+    let mut stmt = conn
+        .prepare("SELECT id, topic, content, source, created_at FROM memories WHERE project_path = ?1 ORDER BY id DESC LIMIT ?2")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map((&scope, limit), |row| {
+            Ok(MemoryEntry {
+                id: row.get(0)?,
+                topic: row.get(1)?,
+                content: row.get(2)?,
+                source: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 #[tauri::command]
@@ -1605,6 +1698,16 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                                 "type": "array",
                                 "items": { "type": "string" },
                                 "description": "Optional list of todo items breaking the work into steps"
+                            },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high"],
+                                "description": "Optional priority (default medium)"
+                            },
+                            "labels": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional keyword labels for filtering, e.g. [\"parser\", \"bug\"]"
                             }
                         },
                         "required": ["title", "description"],
@@ -1635,6 +1738,15 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                             "add_todo": {
                                 "type": "string",
                                 "description": "Optional todo item to append to the card"
+                            },
+                            "priority": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high"],
+                                "description": "Optional new priority"
+                            },
+                            "add_label": {
+                                "type": "string",
+                                "description": "Optional keyword label to add to the card"
                             }
                         },
                         "required": ["card_id"],
@@ -1779,7 +1891,12 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
     const REASONING_MAX_CHARS: usize = 2000;
     // The most recent N results are kept fuller; everything older is trimmed hard.
     const RECENT_KEEP: usize = 2;
-    const RECENT_MAX_CHARS: usize = 6000;
+    // Must exceed the largest single tool-result cap (read_file's 8000 chars
+    // plus its truncation marker): tools append corrective guidance at the
+    // TAIL of capped output, and a head-keeping budget below that cap would
+    // behead the lesson before the model ever sees it. That exact failure
+    // taught an agent its read_file "didn't support line ranges".
+    const RECENT_MAX_CHARS: usize = 9000;
     const OLD_MAX_CHARS: usize = 800;
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -3522,6 +3639,8 @@ pub async fn create_card(
         status: initial_status,
         run_id: None,
         assignee: None,
+        priority: "medium".to_string(),
+        labels: Vec::new(),
         todo_list: Vec::new(),
     };
     cards.push(new_card.clone());
@@ -3574,11 +3693,14 @@ pub async fn save_card(
         c.todo_list = card.todo_list;
         c.status = card.status;
         c.project_path = card.project_path;
+        c.priority = normalize_priority(&card.priority);
+        c.labels = card.labels;
 
         if let Ok(conn) = get_db_conn(&app_handle) {
+            let labels_json = serde_json::to_string(&c.labels).unwrap_or_else(|_| "[]".to_string());
             let _ = conn.execute(
-                "UPDATE cards SET title = ?1, description = ?2, status = ?3, run_id = ?4, assignee = ?5, project_path = ?6 WHERE id = ?7",
-                (&c.title, &c.description, &c.status, &c.run_id, &c.assignee, &c.project_path, &c.id),
+                "UPDATE cards SET title = ?1, description = ?2, status = ?3, run_id = ?4, assignee = ?5, project_path = ?6, priority = ?7, labels = ?8 WHERE id = ?9",
+                (&c.title, &c.description, &c.status, &c.run_id, &c.assignee, &c.project_path, &c.priority, &labels_json, &c.id),
             );
 
             let _ = conn.execute("DELETE FROM todo_items WHERE card_id = ?1", [&c.id]);
@@ -4678,8 +4800,8 @@ fn construct_agent_system_prompt(
          18. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared across runs and chat modes. Use it when you learn something worth keeping: how a subsystem works, a decision made, a pitfall discovered.\n\
          19. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword and returns the most recent matches (empty query = latest memories). Past runs may have already mapped the territory — check before exploring from scratch.\n\
          20. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
-         21. `create_card(title: String, description: String, todos?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
-         22. `update_card(card_id: String, title?: String, description?: String, add_todo?: String)`: Edits a backlog/todo card or appends a todo to it.\n\
+         21. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
+         22. `update_card(card_id: String, title?: String, description?: String, priority?: String, add_todo?: String, add_label?: String)`: Edits a backlog/todo card.\n\
          23. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
@@ -6159,7 +6281,7 @@ fn execute_tool(
             let cards = state_handle.cards.lock().unwrap();
             let mut out: Vec<String> = Vec::new();
             for status in ["backlog", "todo", "running", "blocked", "review", "done", "failed"] {
-                let group: Vec<&Card> = cards
+                let mut group: Vec<&Card> = cards
                     .iter()
                     .filter(|c| {
                         c.status == status
@@ -6169,13 +6291,25 @@ fn execute_tool(
                 if group.is_empty() {
                     continue;
                 }
+                group.sort_by_key(|c| match c.priority.as_str() {
+                    "high" => 0u8,
+                    "low" => 2,
+                    _ => 1,
+                });
                 out.push(format!("{}:", status.to_uppercase()));
                 for c in group {
                     let done = c.todo_list.iter().filter(|t| t.completed).count();
+                    let labels = if c.labels.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {{{}}}", c.labels.join(", "))
+                    };
                     out.push(format!(
-                        "  [{}] {} (todos {}/{})",
+                        "  [{}] ({}) {}{} (todos {}/{})",
                         c.id,
+                        c.priority,
                         c.title,
+                        labels,
                         done,
                         c.todo_list.len()
                     ));
@@ -6210,6 +6344,22 @@ fn execute_tool(
                         .collect()
                 })
                 .unwrap_or_default();
+            let priority = args
+                .get("priority")
+                .and_then(|p| p.as_str())
+                .map(normalize_priority)
+                .unwrap_or_else(default_priority);
+            let labels: Vec<String> = args
+                .get("labels")
+                .and_then(|l| l.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
             let scope_clean = PathBuf::from(&scope);
             let state_handle = match app_handle.try_state::<AppState>() {
@@ -6233,6 +6383,8 @@ fn execute_tool(
                 status: "backlog".to_string(),
                 run_id: None,
                 assignee: None,
+                priority,
+                labels,
                 todo_list: todos
                     .iter()
                     .map(|t| TodoItem {
@@ -6243,9 +6395,11 @@ fn execute_tool(
             };
             cards.push(new_card.clone());
             if let Ok(conn) = get_db_conn(app_handle) {
+                let labels_json =
+                    serde_json::to_string(&new_card.labels).unwrap_or_else(|_| "[]".to_string());
                 let _ = conn.execute(
-                    "INSERT INTO cards (id, project_path, title, description, status, run_id, assignee) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    (&new_card.id, &new_card.project_path, &new_card.title, &new_card.description, &new_card.status, &new_card.run_id, &new_card.assignee),
+                    "INSERT INTO cards (id, project_path, title, description, status, run_id, assignee, priority, labels) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    (&new_card.id, &new_card.project_path, &new_card.title, &new_card.description, &new_card.status, &new_card.run_id, &new_card.assignee, &new_card.priority, &labels_json),
                 );
                 for (idx, item) in new_card.todo_list.iter().enumerate() {
                     let _ = conn.execute(
@@ -6272,8 +6426,10 @@ fn execute_tool(
             let new_title = args.get("title").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             let new_desc = args.get("description").and_then(|d| d.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             let add_todo = args.get("add_todo").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            if new_title.is_none() && new_desc.is_none() && add_todo.is_none() {
-                return format!("Error: nothing to update — provide title, description, or add_todo.{}", USAGE);
+            let new_priority = args.get("priority").and_then(|p| p.as_str()).map(normalize_priority);
+            let add_label = args.get("add_label").and_then(|l| l.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            if new_title.is_none() && new_desc.is_none() && add_todo.is_none() && new_priority.is_none() && add_label.is_none() {
+                return format!("Error: nothing to update — provide title, description, priority, add_todo, or add_label.{}", USAGE);
             }
             let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
             let scope_clean = PathBuf::from(&scope);
@@ -6305,6 +6461,14 @@ fn execute_tool(
             if let Some(d) = &new_desc {
                 card.description = d.clone();
             }
+            if let Some(p) = &new_priority {
+                card.priority = p.clone();
+            }
+            if let Some(label) = &add_label {
+                if !card.labels.contains(label) {
+                    card.labels.push(label.clone());
+                }
+            }
             let mut todo_added = false;
             if let Some(todo_text) = &add_todo {
                 card.todo_list.push(TodoItem {
@@ -6315,13 +6479,16 @@ fn execute_tool(
             }
             let card_title = card.title.clone();
             let card_desc = card.description.clone();
+            let card_priority = card.priority.clone();
+            let card_labels_json =
+                serde_json::to_string(&card.labels).unwrap_or_else(|_| "[]".to_string());
             let card_id_db = card.id.clone();
             let todo_idx = card.todo_list.len().saturating_sub(1);
             let todo_text_db = add_todo.clone();
             if let Ok(conn) = get_db_conn(app_handle) {
                 let _ = conn.execute(
-                    "UPDATE cards SET title = ?1, description = ?2 WHERE id = ?3",
-                    (&card_title, &card_desc, &card_id_db),
+                    "UPDATE cards SET title = ?1, description = ?2, priority = ?3, labels = ?4 WHERE id = ?5",
+                    (&card_title, &card_desc, &card_priority, &card_labels_json, &card_id_db),
                 );
                 if todo_added {
                     if let Some(text) = &todo_text_db {
@@ -6423,8 +6590,16 @@ fn execute_tool(
             match cards.iter().find(|c| c.run_id.as_deref() == Some(run_id)) {
                 Some(card) => {
                     let mut out = format!(
-                        "Card: {}\nStatus: {}\nDescription: {}\n\nTodo list:",
-                        card.title, card.status, card.description
+                        "Card: {}\nStatus: {}\nPriority: {}\nLabels: {}\nDescription: {}\n\nTodo list:",
+                        card.title,
+                        card.status,
+                        card.priority,
+                        if card.labels.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            card.labels.join(", ")
+                        },
+                        card.description
                     );
                     if card.todo_list.is_empty() {
                         out.push_str(" (empty)");
@@ -6921,17 +7096,22 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
          }}\n\
          ```\n\n\
          Tools available:\n\
-         1. `read_file(path: String)`: Reads file content relative to project root.\n\
-         2. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed). Use this to update design documents under `design/`!\n\
-         3. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
-         4. `web_search(query: String)`: Searches the web for APIs, libraries, architectural patterns, and programming guides.\n\
-         5. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
-         6. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with code chat and agent runs. Record design decisions and their reasons here.\n\
-         7. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before proposing from scratch.\n\
-         8. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
-         9. `create_card(title: String, description: String, todos?: [String])`: Files a new card in the backlog. When a design discussion produces actionable work, FILE IT as a card with a clear description and todos — that is how plans become runs.\n\
-         10. `update_card(card_id: String, title?: String, description?: String, add_todo?: String)`: Edits a backlog/todo card or appends a todo item.\n\
-         11. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         1. `read_file(path: String, start_line?: Int, end_line?: Int)`: Reads file content (line-numbered, output capped). For large files, call outline_file first, then read only the line range you need — don't read whole large files when a range will do.\n\
+         2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
+         3. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed). Use this to update design documents under `design/`!\n\
+         4. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file — safer than rewriting a whole file for small edits. The target must match byte-for-byte.\n\
+         5. `list_dir(path: String, depth?: Int)`: Lists files and folders as an indented tree (use \"\" for root). Pass depth 2 or 3 to map nested structure in one call.\n\
+         6. `search_grep(query: String, path?: String, context?: Int, case_sensitive?: Bool)`: Searches file contents for a substring (case-insensitive by default), grouped by file with line numbers. Pass context: 2 to see surrounding lines without a follow-up read.\n\
+         7. `find_file(name: String, path?: String)`: Finds files by name fragment (case-insensitive) and returns matching relative paths.\n\
+         8. `find_symbol(name: String, path?: String)`: Finds where a function, struct, class, or other declaration is DEFINED. Returns file:line: signature — then range-read around that line.\n\
+         9. `web_search(query: String)`: Searches the web for APIs, libraries, architectural patterns, and programming guides.\n\
+         10. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
+         11. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with code chat and agent runs. Record design decisions and their reasons here.\n\
+         12. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before proposing from scratch.\n\
+         13. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
+         14. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. When a design discussion produces actionable work, FILE IT as a card with a clear description, priority, and todos — that is how plans become runs.\n\
+         15. `update_card(card_id: String, title?: String, description?: String, priority?: String, add_todo?: String, add_label?: String)`: Edits a backlog/todo card.\n\
+         16. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your ideas, proposals, or questions.",
         doc_name, project_path.to_string_lossy()
     )
@@ -6956,19 +7136,24 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
          }}\n\
          ```\n\n\
          Tools available:\n\
-         1. `read_file(path: String)`: Reads file content relative to project root.\n\
-         2. `write_file(path: String, content: String)`: Writes/overwrites content to a source file.\n\
-         3. `list_dir(path: String)`: Lists all files and folders under a relative path (use \"\" for root).\n\
-         4. `git_status()`: Runs `git status` in the repository.\n\
-         5. `git_diff()`: Runs `git diff` to view code changes.\n\
-         6. `run_command(command: String)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests!\n\
-         7. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\
-         8. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with design chat and agent runs. Record how subsystems work and pitfalls you discover.\n\
-         9. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
-         10. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
-         11. `create_card(title: String, description: String, todos?: [String])`: Files a new card in the backlog. If a fix you're discussing is bigger than the current conversation, file it as a card so it gets scheduled instead of forgotten.\n\
-         12. `update_card(card_id: String, title?: String, description?: String, add_todo?: String)`: Edits a backlog/todo card or appends a todo item.\n\
-         13. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         1. `read_file(path: String, start_line?: Int, end_line?: Int)`: Reads file content (line-numbered, output capped). For large files, call outline_file first, then read only the line range you need — don't read whole large files when a range will do.\n\
+         2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
+         3. `write_file(path: String, content: String)`: Writes/overwrites content to a source file.\n\
+         4. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file — safer than rewriting a whole file for small edits. The target must match byte-for-byte.\n\
+         5. `list_dir(path: String, depth?: Int)`: Lists files and folders as an indented tree (use \"\" for root). Pass depth 2 or 3 to map nested structure in one call.\n\
+         6. `search_grep(query: String, path?: String, context?: Int, case_sensitive?: Bool)`: Searches file contents for a substring (case-insensitive by default), grouped by file with line numbers. Pass context: 2 to see surrounding lines without a follow-up read.\n\
+         7. `find_file(name: String, path?: String)`: Finds files by name fragment (case-insensitive) and returns matching relative paths.\n\
+         8. `find_symbol(name: String, path?: String)`: Finds where a function, struct, class, or other declaration is DEFINED. Returns file:line: signature — then range-read around that line.\n\
+         9. `git_status()`: Runs `git status` in the repository.\n\
+         10. `git_diff()`: Runs `git diff` to view code changes.\n\
+         11. `run_command(command: String)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests!\n\
+         12. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\
+         13. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with design chat and agent runs. Record how subsystems work and pitfalls you discover.\n\
+         14. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
+         15. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
+         16. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. If a fix you're discussing is bigger than the current conversation, file it as a card so it gets scheduled instead of forgotten.\n\
+         17. `update_card(card_id: String, title?: String, description?: String, priority?: String, add_todo?: String, add_label?: String)`: Edits a backlog/todo card.\n\
+         18. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your changes or asking questions.",
         target, project_path.to_string_lossy()
     )

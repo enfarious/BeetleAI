@@ -15,7 +15,8 @@
       {
         "title": "BeetleAI",
         "width": 1200,
-        "height": 700
+        "height": 700,
+        "dragDropEnabled": false
       }
     ],
     "security": {

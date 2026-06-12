@@ -121,6 +121,7 @@ pub fn run() {
             commands::create_project,
             commands::update_project,
             commands::delete_project,
+            commands::list_memories,
             commands::get_settings,
             commands::save_settings,
             commands::fetch_local_models,

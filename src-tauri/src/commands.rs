@@ -96,6 +96,16 @@ pub struct AppConfig {
     pub projects: Vec<Project>,
 }
 
+/// Per-file line-number drift within one run/chat session. `shift` is the
+/// net change in line count since the model last read the file; edits whose
+/// range reaches at-or-past `lowest_edit_line` while `shift != 0` are using
+/// stale coordinates and must be refused before they land on the wrong code.
+#[derive(Clone, Copy, Default)]
+pub struct LineShift {
+    pub shift: i64,
+    pub lowest_edit_line: usize,
+}
+
 pub struct AppState {
     pub cards: Mutex<Vec<Card>>,
     pub run_logs: Mutex<HashMap<String, Vec<RunEvent>>>,
@@ -107,6 +117,9 @@ pub struct AppState {
     /// endpoint keeps history server-side; chaining `previous_response_id` is
     /// what makes a thread continue instead of starting fresh every call.
     pub lmstudio_response_ids: Mutex<HashMap<String, String>>,
+    /// run/chat key → file key → line-number drift since last read. Guards
+    /// replace_lines against the classic two-edits-same-file stale-line bug.
+    pub line_shift_state: Mutex<HashMap<String, HashMap<String, LineShift>>>,
 }
 
 impl AppState {
@@ -125,6 +138,7 @@ impl AppState {
             active_runs: Mutex::new(std::collections::HashSet::new()),
             cancelled_runs: Mutex::new(std::collections::HashSet::new()),
             lmstudio_response_ids: Mutex::new(HashMap::new()),
+            line_shift_state: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2466,18 +2480,35 @@ fn convert_tools_to_anthropic(tools: &serde_json::Value) -> serde_json::Value {
 /// APPENDS to the streamed prose rather than replacing it — otherwise what the
 /// user saw streaming and what history stores diverge.
 ///
-/// The run loop executes one tool per step by design. If the model emitted
-/// parallel tool calls, the extras are dropped LOUDLY: logged, plus a note in
-/// the assistant message so the model sees on its next turn that the extra
-/// calls never ran (instead of silently assuming they succeeded and drifting).
+/// Re-encode natively-parsed tool calls (from the provider's structured
+/// tool_calls stream) into the canonical text protocol, appended to the
+/// response body. The loops then parse and execute them through the same
+/// battle-tested pipeline as text-protocol calls — one pipeline, two doors.
 fn bridge_tool_calls_into_text(full_response: &mut String, accumulated: &[ToolCallAccumulator]) {
-    if accumulated.is_empty() {
-        return;
-    }
-    if let Some(tc) = accumulated.first() {
+    // Every native call is re-encoded into the canonical text protocol so the
+    // battle-tested parsing/execution pipeline handles both paths identically.
+    // ALL calls are bridged — a model that files two cards in one breath
+    // loses neither (the loops iterate parse_tool_calls_all).
+    for tc in accumulated {
         let name = tc.name.clone().unwrap_or_default();
-        let args_parsed: serde_json::Value =
-            serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        if name.is_empty() {
+            continue;
+        }
+        // parse_json_relaxed, not strict serde: native-mode arguments can carry
+        // the same JS-flavored artifacts (backtick template literals, unquoted
+        // keys) as text-mode output, and silently degrading them to {} would
+        // teach the model its arguments were accepted when they were dropped.
+        let args_parsed = match parse_json_relaxed(&tc.arguments) {
+            Some(v) => v,
+            None => {
+                log_error(&format!(
+                    "Native tool call '{}': arguments failed strict AND relaxed JSON parsing; bridging with empty args. Raw: {}",
+                    name,
+                    &tc.arguments.chars().take(300).collect::<String>()
+                ));
+                serde_json::json!({})
+            }
+        };
         let formatted = format!(
             "```tool_call\n{{\n  \"name\": \"{}\",\n  \"args\": {}\n}}\n```",
             name, args_parsed
@@ -2486,22 +2517,6 @@ fn bridge_tool_calls_into_text(full_response: &mut String, accumulated: &[ToolCa
             full_response.push_str("\n\n");
         }
         full_response.push_str(&formatted);
-    }
-    if accumulated.len() > 1 {
-        let dropped: Vec<String> = accumulated[1..]
-            .iter()
-            .map(|tc| tc.name.clone().unwrap_or_else(|| "<unnamed>".to_string()))
-            .collect();
-        log_error(&format!(
-            "Model emitted {} tool calls in one response; only the first was kept. Dropped: {}",
-            accumulated.len(),
-            dropped.join(", ")
-        ));
-        full_response.push_str(&format!(
-            "\n\n[harness note: {} additional tool call(s) ({}) were NOT executed. Emit exactly one tool call per message.]",
-            dropped.len(),
-            dropped.join(", ")
-        ));
     }
 }
 
@@ -3365,7 +3380,9 @@ pub async fn send_design_chat(
                 );
             }
 
-            if let Some((tool_name, args, preamble)) = parse_tool_call_spanned(&remaining) {
+            let parsed_calls = parse_tool_calls_all(&remaining);
+            if !parsed_calls.is_empty() {
+                for (tool_name, args, preamble) in parsed_calls {
                 // Surface the prose the model wrote before its tool call —
                 // previously this commentary was silently clobbered.
                 if !preamble.is_empty() {
@@ -3424,6 +3441,7 @@ pub async fn send_design_chat(
                 );
 
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
             } else {
                 let payload = serde_json::json!({ "role": "agent", "content": remaining.clone() })
                     .to_string();
@@ -3629,7 +3647,9 @@ pub async fn send_code_chat(
                 );
             }
 
-            if let Some((tool_name, args, preamble)) = parse_tool_call_spanned(&remaining) {
+            let parsed_calls = parse_tool_calls_all(&remaining);
+            if !parsed_calls.is_empty() {
+                for (tool_name, args, preamble) in parsed_calls {
                 // Surface the prose the model wrote before its tool call —
                 // previously this commentary was silently clobbered.
                 if !preamble.is_empty() {
@@ -3688,6 +3708,7 @@ pub async fn send_code_chat(
                 );
 
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
             } else {
                 let payload = serde_json::json!({ "role": "agent", "content": remaining.clone() })
                     .to_string();
@@ -4943,7 +4964,7 @@ fn construct_agent_system_prompt(
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
          8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
          9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. The target must match byte-for-byte including quotes and whitespace; if the snippet contains quotes or escapes, use replace_lines instead.\n\
-         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error. WARNING: line numbers SHIFT after every successful edit — re-read the affected range before chaining another replace_lines.\n\
+         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error. Line numbers SHIFT after any edit that changes line count, and the harness REFUSES an edit made with stale numbers — to make several edits to one file in a row, work bottom-to-top (highest line numbers first; lines below an edit keep their numbers), or re-read between edits.\n\
          11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
          12. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
          13. `read_card()`: Shows YOUR current card: title, description, status, and its todo list with indices. Read it at the start of a run and use the todos as your work plan.\n\
@@ -5274,7 +5295,7 @@ fn extract_tool_args(val: &serde_json::Value) -> serde_json::Value {
 }
 
 fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(s) {
+    if let Some(val) = parse_json_relaxed(s) {
         if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
             let args = extract_tool_args(&val);
             return Some((name.to_string(), args));
@@ -5285,7 +5306,7 @@ fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
         if let Some(end_brace) = s.rfind('}') {
             if end_brace > start_brace {
                 let json_sub = &s[start_brace..=end_brace];
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_sub) {
+                if let Some(val) = parse_json_relaxed(json_sub) {
                     if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
                         let args = extract_tool_args(&val);
                         return Some((name.to_string(), args));
@@ -5303,6 +5324,131 @@ fn try_parse_json(s: &str) -> Option<(String, serde_json::Value)> {
     }
 
     None
+}
+
+/// Tolerant JSON parsing for model-emitted tool arguments. Small local models
+/// routinely emit relaxed JSON — unquoted keys ({path: ""}), single-quoted
+/// strings ({'path': ''}), trailing commas — which strict serde rejects. Try
+/// strict first; on failure, repair those three artifacts (touching nothing
+/// inside string literals) and try once more. The motivating field failure:
+/// `<|tool_call>call:list_dir{path: ""}<tool_call|>` parsed as prose because
+/// of one missing pair of key quotes.
+fn parse_json_relaxed(s: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(s) {
+        return Some(v);
+    }
+    serde_json::from_str(&repair_relaxed_json(s)).ok()
+}
+
+fn repair_relaxed_json(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 16);
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut str_delim = '"';
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            if c == '\\' && i + 1 < chars.len() {
+                let next = chars[i + 1];
+                if str_delim == '\'' && next == '\'' {
+                    // \' inside a single-quoted string: plain apostrophe in JSON.
+                    out.push('\'');
+                } else {
+                    out.push('\\');
+                    out.push(next);
+                }
+                i += 2;
+                continue;
+            }
+            if c == str_delim {
+                in_str = false;
+                out.push('"');
+            } else if c == '"' && str_delim == '\'' {
+                // Literal double quote inside a single-quoted string: escape it.
+                out.push('\\');
+                out.push('"');
+            } else {
+                out.push(c);
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                in_str = true;
+                str_delim = c;
+                out.push('"');
+                i += 1;
+            }
+            '`' => {
+                // JS template-literal habit: a backtick-delimited value. JSON
+                // has no backtick strings, and the payload may contain NESTED
+                // backticks (template literals inside the code being passed),
+                // so match greedily to the LAST backtick in the input and
+                // JSON-escape the span. Code payloads are typically the final
+                // argument, which makes greedy matching correct in practice.
+                if let Some(rel_close) = chars[i + 1..].iter().rposition(|&ch| ch == '`') {
+                    let close = i + 1 + rel_close;
+                    out.push('"');
+                    for &ch in &chars[i + 1..close] {
+                        match ch {
+                            '"' => out.push_str("\\\""),
+                            '\\' => out.push_str("\\\\"),
+                            '\n' => out.push_str("\\n"),
+                            '\r' => out.push_str("\\r"),
+                            '\t' => out.push_str("\\t"),
+                            cc if (cc as u32) < 0x20 => {
+                                out.push_str(&format!("\\u{:04x}", cc as u32))
+                            }
+                            cc => out.push(cc),
+                        }
+                    }
+                    out.push('"');
+                    i = close + 1;
+                } else {
+                    // Lone backtick: stray fence debris, drop it.
+                    i += 1;
+                }
+            }
+            ch if ch.is_ascii_alphabetic() || ch == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let ident: String = chars[start..i].iter().collect();
+                let mut j = i;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ':' {
+                    // Bare identifier used as an object key: quote it.
+                    out.push('"');
+                    out.push_str(&ident);
+                    out.push('"');
+                } else {
+                    // Bare value token (true/false/null): leave untouched.
+                    out.push_str(&ident);
+                }
+            }
+            ',' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if !(j < chars.len() && (chars[j] == '}' || chars[j] == ']')) {
+                    out.push(',');
+                }
+                // Trailing comma before a closer is dropped entirely.
+                i += 1;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn parse_qwen_syntax(s: &str) -> Option<(String, serde_json::Value)> {
@@ -5323,7 +5469,7 @@ fn parse_qwen_syntax(s: &str) -> Option<(String, serde_json::Value)> {
         return None;
     }
     let json_str = &t[brace..=close];
-    let args: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let args: serde_json::Value = parse_json_relaxed(json_str)?;
     Some((name.to_string(), args))
 }
 
@@ -5331,7 +5477,28 @@ fn parse_qwen_syntax(s: &str) -> Option<(String, serde_json::Value)> {
 /// syntax debris (stray punctuation, lone backticks); caps length so a
 /// pathological preamble can't bloat the transcript or the history budget.
 fn clean_tool_preamble(text: &str) -> String {
-    let t = text.trim();
+    let mut t = text.trim();
+    // Strip stray protocol fragments at the edges — leftover closers between
+    // back-to-back calls must not become ghost "prose" messages.
+    loop {
+        let before = t;
+        for tok in [
+            "</tool_call>",
+            "<|/tool_call|>",
+            "<tool_call|>",
+            "<|tool_call|>",
+            "<|tool_call>",
+            "<tool_call>",
+        ] {
+            t = t
+                .trim_start_matches(tok)
+                .trim_end_matches(tok)
+                .trim();
+        }
+        if t == before {
+            break;
+        }
+    }
     if !t.chars().any(|c| c.is_alphanumeric()) {
         return String::new();
     }
@@ -5346,21 +5513,82 @@ fn clean_tool_preamble(text: &str) -> String {
 
 /// Like parse_tool_call_at, but operates on the raw response and returns the
 /// prose the model emitted BEFORE the tool-call syntax, so the loop can
-/// surface it instead of clobbering it.
+/// surface it instead of clobbering it. Single-call convenience wrapper over
+/// parse_tool_calls_all — production loops iterate the full vec; this wrapper
+/// survives as the regression tests' API and compiles only with them.
+#[cfg(test)]
 fn parse_tool_call_spanned(response: &str) -> Option<(String, serde_json::Value, String)> {
-    let mut response_cleaned = response.trim();
-    if response_cleaned.ends_with("<tool_call|>") {
-        response_cleaned = response_cleaned.trim_end_matches("<tool_call|>").trim();
-    }
-    let (name, args, start) = parse_tool_call_at(response_cleaned)?;
-    let preamble = clean_tool_preamble(&response_cleaned[..start]);
-    Some((name, args, preamble))
+    parse_tool_calls_all(response).into_iter().next()
 }
 
-/// Core tool-call detection. Returns (name, args, offset) where offset is the
-/// byte position in `response_cleaned` where the tool-call syntax begins —
-/// everything before it is the model's preamble prose.
-fn parse_tool_call_at(response_cleaned: &str) -> Option<(String, serde_json::Value, usize)> {
+/// Parse ALL tool calls in a response, in order, each paired with the prose
+/// immediately preceding it. A model that emits two calls in one message
+/// loses neither. Strategy precedence (fences/tags before bare syntax) is
+/// kept WITHIN each scan segment — it protects prose like "I'll call
+/// list_dir(...)" from false-positives — so mixed-format multi-calls may
+/// resolve in strategy order rather than textual order; same-format
+/// multi-calls (the cases that occur in practice) resolve in order. Capped
+/// to guard against pathological output.
+fn parse_tool_calls_all(response: &str) -> Vec<(String, serde_json::Value, String)> {
+    const MAX_CALLS: usize = 5;
+    let mut out: Vec<(String, serde_json::Value, String)> = Vec::new();
+    let mut rest = response.trim();
+    while out.len() < MAX_CALLS && !rest.is_empty() {
+        match parse_tool_call_at(rest) {
+            Some((name, args, start, end)) => {
+                let preamble = clean_tool_preamble(&rest[..start]);
+                out.push((name, args, preamble));
+                rest = rest[end.min(rest.len())..].trim_start();
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Find the matching `close` delimiter for the `open` delimiter at byte
+/// `open_idx`, honoring single- and double-quoted strings and backslash
+/// escapes. ASCII delimiters never collide with UTF-8 continuation bytes, so
+/// byte-wise scanning is safe. Returns the byte index of the matching closer.
+fn find_matching_delim_bytes(s: &str, open_idx: usize, open: u8, close: u8) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut delim = b'"';
+    let mut i = open_idx;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == delim {
+                in_str = false;
+            }
+        } else if c == b'"' || c == b'\'' || c == b'`' {
+            in_str = true;
+            delim = c;
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Core tool-call detection. Returns (name, args, start, end): the byte span
+/// of the tool-call syntax in `response_cleaned`. Everything before `start`
+/// is the model's preamble prose; scanning resumes at `end` for multi-call
+/// responses.
+fn parse_tool_call_at(
+    response_cleaned: &str,
+) -> Option<(String, serde_json::Value, usize, usize)> {
     for len in (2..=5).rev() {
         let bt = "`".repeat(len);
         let mut start_search = 0;
@@ -5374,7 +5602,8 @@ fn parse_tool_call_at(response_cleaned: &str) -> Option<(String, serde_json::Val
                 let trimmed_block = strip_lang_prefix(block_str);
 
                 if let Some((name, args)) = try_parse_json(trimmed_block) {
-                    return Some((name, args, absolute_start));
+                    let call_end = absolute_start + len + end_idx + len;
+                    return Some((name, args, absolute_start, call_end));
                 }
             }
             start_search = absolute_start + len;
@@ -5392,37 +5621,52 @@ fn parse_tool_call_at(response_cleaned: &str) -> Option<(String, serde_json::Val
         "<tool call>",
         "<|tool call|>",
     ];
+    const TAG_CLOSERS: [&str; 4] = [
+        "</tool_call>",
+        "<|/tool_call|>",
+        "<tool_call|>",
+        "<|tool_call>",
+    ];
     for opener in TAG_OPENERS {
         let mut search = 0;
         while let Some(idx) = response_cleaned[search..].find(opener) {
             let opener_pos = search + idx;
             let start = opener_pos + opener.len();
             let rest = &response_cleaned[start..];
-            let end = rest
-                .find("</tool_call>")
-                .or_else(|| rest.find("<|/tool_call|>"))
-                .or_else(|| rest.find("<tool_call|>"))
-                .or_else(|| rest.find("<|tool_call>"));
-            let inner = match end {
-                Some(e) => &rest[..e],
+            // Earliest closer of any form, remembering its length so the call's
+            // end offset lands AFTER it (multi-call scanning resumes there).
+            let mut closer: Option<(usize, usize)> = None; // (offset, len)
+            for cl in TAG_CLOSERS {
+                if let Some(p) = rest.find(cl) {
+                    if closer.map(|(e, _)| p < e).unwrap_or(true) {
+                        closer = Some((p, cl.len()));
+                    }
+                }
+            }
+            let inner = match closer {
+                Some((e, _)) => &rest[..e],
                 None => rest,
+            };
+            let call_end = match closer {
+                Some((e, l)) => start + e + l,
+                None => response_cleaned.len(),
             };
             let inner = inner.trim();
             if let Some((name, args)) = try_parse_json(inner) {
-                return Some((name, args, opener_pos));
+                return Some((name, args, opener_pos, call_end));
             }
             if let Some((name, args)) = parse_function_syntax(inner) {
-                return Some((name, args, opener_pos));
+                return Some((name, args, opener_pos, call_end));
             }
             if let Some((name, args)) = parse_qwen_syntax(inner) {
-                return Some((name, args, opener_pos));
+                return Some((name, args, opener_pos, call_end));
             }
             search = start;
         }
     }
 
     if let Some((name, args)) = try_parse_json(response_cleaned) {
-        return Some((name, args, 0));
+        return Some((name, args, 0, response_cleaned.len()));
     }
 
     // Bare function-call syntax in the response body (e.g. `list_dir(path="src")`),
@@ -5430,9 +5674,13 @@ fn parse_tool_call_at(response_cleaned: &str) -> Option<(String, serde_json::Val
     for tool in KNOWN_TOOLS {
         let pat = format!("{}(", tool);
         if let Some(idx) = response_cleaned.find(&pat) {
-            if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..]) {
+            let paren_idx = idx + tool.len();
+            let call_end = find_matching_delim_bytes(response_cleaned, paren_idx, b'(', b')')
+                .map(|c| c + 1)
+                .unwrap_or(response_cleaned.len());
+            if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..call_end]) {
                 if name == tool {
-                    return Some((name, args, idx));
+                    return Some((name, args, idx, call_end));
                 }
             }
         }
@@ -5441,18 +5689,29 @@ fn parse_tool_call_at(response_cleaned: &str) -> Option<(String, serde_json::Val
         // would leave a dangling "call:" classified as preamble prose.
         let pat_prefix = format!("call:{}{{", tool);
         if let Some(idx) = response_cleaned.find(&pat_prefix) {
-            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
+            let brace_idx = idx + pat_prefix.len() - 1;
+            // Slice the parse input to the balanced span: parse_qwen_syntax uses
+            // rfind('}') internally, which would otherwise swallow a SECOND
+            // brace-style call later in the response (latent single-call bug).
+            let call_end = find_matching_delim_bytes(response_cleaned, brace_idx, b'{', b'}')
+                .map(|c| c + 1)
+                .unwrap_or(response_cleaned.len());
+            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..call_end]) {
                 if name == tool {
-                    return Some((name, args, idx));
+                    return Some((name, args, idx, call_end));
                 }
             }
         }
         // Bare Qwen/Hermes-style JSON calls in the response body (e.g. `list_dir{"path": "src"}`)
         let pat_brace = format!("{}{{", tool);
         if let Some(idx) = response_cleaned.find(&pat_brace) {
-            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..]) {
+            let brace_idx = idx + tool.len();
+            let call_end = find_matching_delim_bytes(response_cleaned, brace_idx, b'{', b'}')
+                .map(|c| c + 1)
+                .unwrap_or(response_cleaned.len());
+            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..call_end]) {
                 if name == tool {
-                    return Some((name, args, idx));
+                    return Some((name, args, idx, call_end));
                 }
             }
         }
@@ -6007,30 +6266,91 @@ fn find_symbol_impl(worktree_path: &Path, symbol: &str, path_opt: &str) -> Strin
     }
 }
 
+/// Key for line-shift tracking: worktree + normalized relative path, so the
+/// same file referenced with either slash style maps to one entry.
+fn line_shift_key(worktree_path: &Path, path: &str) -> String {
+    format!(
+        "{}::{}",
+        clean_project_path(worktree_path).display(),
+        path.trim().replace('\\', "/")
+    )
+}
+
+fn get_line_shift(app_handle: &tauri::AppHandle, run_id: &str, key: &str) -> LineShift {
+    app_handle
+        .try_state::<AppState>()
+        .map(|s| {
+            let map = s.line_shift_state.lock().unwrap();
+            map.get(run_id)
+                .and_then(|m| m.get(key))
+                .copied()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// Accumulate drift after an edit that changed the file's line count.
+fn record_line_shift(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    key: &str,
+    delta: i64,
+    edit_line: usize,
+) {
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        let mut map = state.line_shift_state.lock().unwrap();
+        let entry = map
+            .entry(run_id.to_string())
+            .or_default()
+            .entry(key.to_string())
+            .or_default();
+        entry.shift += delta;
+        entry.lowest_edit_line = if entry.lowest_edit_line == 0 {
+            edit_line
+        } else {
+            entry.lowest_edit_line.min(edit_line)
+        };
+    }
+}
+
+/// A fresh read (or full-content write) gives the model current line numbers:
+/// clear the drift entry for that file.
+fn reset_line_shift(app_handle: &tauri::AppHandle, run_id: &str, key: &str) {
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        let mut map = state.line_shift_state.lock().unwrap();
+        if let Some(m) = map.get_mut(run_id) {
+            m.remove(key);
+        }
+    }
+}
+
 fn replace_lines_impl(
     worktree_path: &Path,
     path: &str,
     start_line: usize,
     end_line: usize,
     new_content: &str,
-) -> String {
+) -> (String, i64) {
     let worktree_abs = clean_project_path(worktree_path);
     let target_file = match verify_sandbox(&worktree_abs, path) {
         Ok(p) => p,
-        Err(e) => return format!("Error: {}", e),
+        Err(e) => return (format!("Error: {}", e), 0),
     };
     let original = match fs::read_to_string(&target_file) {
         Ok(c) => c,
-        Err(e) => return format!("Error reading '{}': {}", path, e),
+        Err(e) => return (format!("Error reading '{}': {}", path, e), 0),
     };
     let lines: Vec<&str> = original.lines().collect();
     if start_line == 0 || end_line < start_line || start_line > lines.len() {
-        return format!(
-            "Error: invalid line range {}-{} ('{}' has {} lines)",
-            start_line,
-            end_line,
-            path,
-            lines.len()
+        return (
+            format!(
+                "Error: invalid line range {}-{} ('{}' has {} lines)",
+                start_line,
+                end_line,
+                path,
+                lines.len()
+            ),
+            0,
         );
     }
     let end_line = end_line.min(lines.len());
@@ -6053,16 +6373,30 @@ fn replace_lines_impl(
         joined.push('\n');
     }
     if let Err(e) = fs::write(&target_file, joined) {
-        return format!("Error writing '{}': {}", path, e);
+        return (format!("Error writing '{}': {}", path, e), 0);
     }
-    format!(
-        "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). First removed line was: `{}`. If that is NOT the line you expected to remove, the file has changed since you read it — line numbers SHIFT after every edit. Re-read the section before making further edits.",
-        start_line,
-        end_line,
-        path,
-        end_line - start_line + 1,
-        inserted,
-        first_removed
+    let removed = end_line - start_line + 1;
+    let delta = inserted as i64 - removed as i64;
+    let shift_note = if delta != 0 {
+        format!(
+            " Line numbers at/after line {} have now shifted by {:+}; lines BELOW {} are unchanged — chain multiple edits bottom-to-top (highest line numbers first), or re-read before the next line-numbered edit.",
+            start_line, delta, start_line
+        )
+    } else {
+        " Line count unchanged — all line numbers remain valid.".to_string()
+    };
+    (
+        format!(
+            "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). First removed line was: `{}`. If that is NOT the line you expected to remove, the file has changed since you read it — re-read the section before further edits.{}",
+            start_line,
+            end_line,
+            path,
+            removed,
+            inserted,
+            first_removed,
+            shift_note
+        ),
+        delta,
     )
 }
 
@@ -6175,14 +6509,24 @@ fn execute_tool(
                 .map(|v| v as usize);
             // Hard cap on a single read so it can't blow the context budget. A full
             // read past this is truncated with guidance to range-read or outline first.
-            read_file_range_impl(worktree_path, path, start_line, end_line, 8000)
+            let result = read_file_range_impl(worktree_path, path, start_line, end_line, 8000);
+            if !result.starts_with("Error") {
+                // A fresh read gives the model current line numbers: drift cleared.
+                reset_line_shift(app_handle, run_id, &line_shift_key(worktree_path, path));
+            }
+            result
         }
         "outline_file" => {
             let path = match args.get("path").and_then(|p| p.as_str()) {
                 Some(p) => p,
                 None => return "Error: Missing path argument".to_string(),
             };
-            outline_file_impl(worktree_path, path)
+            let result = outline_file_impl(worktree_path, path);
+            if !result.starts_with("Error") {
+                // The outline carries current line numbers: drift is cleared.
+                reset_line_shift(app_handle, run_id, &line_shift_key(worktree_path, path));
+            }
+            result
         }
         "write_file" => {
             let path = match args.get("path").and_then(|p| p.as_str()) {
@@ -6201,7 +6545,12 @@ fn execute_tool(
                 let _ = fs::create_dir_all(parent);
             }
             match fs::write(target, content) {
-                Ok(_) => "Success: File written successfully".to_string(),
+                Ok(_) => {
+                    // The model supplied the file's full content: its knowledge of
+                    // the line numbering is fresh by construction.
+                    reset_line_shift(app_handle, run_id, &line_shift_key(worktree_path, path));
+                    "Success: File written successfully".to_string()
+                }
                 Err(e) => format!("Error writing file: {}", e),
             }
         }
@@ -6767,7 +7116,24 @@ fn execute_tool(
                 Some(r) => r,
                 None => return "Error: Missing replacement argument".to_string(),
             };
-            patch_file_impl(worktree_path, path, target_str, replacement_str)
+            let result = patch_file_impl(worktree_path, path, target_str, replacement_str);
+            if result.starts_with("Success") {
+                let delta = replacement_str.lines().count() as i64
+                    - target_str.lines().count() as i64;
+                if delta != 0 {
+                    // Text-anchored edit: we don't know WHICH lines it landed on,
+                    // so conservatively treat the whole file's numbering as
+                    // drifted (lowest_edit_line = 1) until the next read.
+                    record_line_shift(
+                        app_handle,
+                        run_id,
+                        &line_shift_key(worktree_path, path),
+                        delta,
+                        1,
+                    );
+                }
+            }
+            result
         }
         "replace_lines" => {
             const USAGE: &str = " Usage: replace_lines(path: String, start_line: int, end_line: int, content: String) — path is the file to edit, relative to the project root (the same path you passed to read_file).";
@@ -6784,7 +7150,29 @@ fn execute_tool(
                 None => return format!("Error: Missing 'end_line' argument.{}", USAGE),
             };
             let content = args.get("content").and_then(|c| c.as_str()).unwrap_or("");
-            replace_lines_impl(worktree_path, path, start_line, end_line, content)
+            // Stale-line guard: if earlier edits this session changed the file's
+            // line count, numbers at/after the earliest edited line no longer
+            // mean what the model read. Refuse BEFORE landing on wrong code.
+            // Edits entirely below the drift point are still valid — that's the
+            // bottom-to-top workflow — and same-length replacements never drift.
+            let key = line_shift_key(worktree_path, path);
+            let prior = get_line_shift(app_handle, run_id, &key);
+            if prior.shift != 0 && end_line >= prior.lowest_edit_line {
+                return format!(
+                    "Error: NOT executed — '{}' was already modified this session: line numbers at/after line {} have shifted by {:+} line(s) since you last read the file, so an edit at lines {}-{} would land on the WRONG code. Re-read the section first (read_file with start_line/end_line, or outline_file — either refreshes your numbers), or chain edits bottom-to-top: lines below {} are still exactly where you read them.",
+                    path,
+                    prior.lowest_edit_line,
+                    prior.shift,
+                    start_line,
+                    end_line,
+                    prior.lowest_edit_line
+                );
+            }
+            let (result, delta) = replace_lines_impl(worktree_path, path, start_line, end_line, content);
+            if delta != 0 && result.starts_with("Success") {
+                record_line_shift(app_handle, run_id, &key, delta, start_line);
+            }
+            result
         }
         "read_card" => {
             let state_handle = match app_handle.try_state::<AppState>() {
@@ -6926,7 +7314,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
         // truncated or all-reasoning response is a stall, not a user question.
         let mut empty_response_streak: u32 = 0;
 
-        loop {
+        'run: loop {
             {
                 let cards = state.cards.lock().unwrap();
                 if let Some(card) = cards.iter().find(|c| c.id == card_id) {
@@ -7051,7 +7439,9 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
             }
 
-            if let Some((tool_name, args, preamble)) = parse_tool_call_spanned(&remaining) {
+            let parsed_calls = parse_tool_calls_all(&remaining);
+            if !parsed_calls.is_empty() {
+                for (tool_name, args, preamble) in parsed_calls {
                 // Surface the prose the model wrote before its tool call —
                 // previously this commentary was silently clobbered.
                 if !preamble.is_empty() {
@@ -7116,7 +7506,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     set_card_status(&app_handle_clone, &state, &card_id, "blocked");
                     let _ = app_handle_clone
                         .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
-                    break;
+                    break 'run;
                 }
 
                 let mut tool_result = execute_tool(
@@ -7162,10 +7552,11 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 if tool_name == "task_complete" && tool_result.starts_with("Success") {
                     let _ = app_handle_clone
                         .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
-                    break;
+                    break 'run;
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
             } else {
                 let visible = remaining.trim();
 
@@ -7484,6 +7875,111 @@ BeetleAI
         let input_debris = "\n> \n```tool_call\n{\"name\": \"git_status\", \"args\": {}}\n```";
         let (_, _, preamble_d) = parse_tool_call_spanned(input_debris).unwrap();
         assert_eq!(preamble_d, "");
+    }
+
+    #[test]
+    fn test_parse_tool_call_relaxed_json() {
+        // Verbatim field failure: unquoted key inside a mangled-token wrapper
+        // parsed as prose instead of a tool call.
+        let input = "<|tool_call>call:list_dir{path: \"\"}<tool_call|>";
+        let res = parse_tool_call_spanned(input);
+        assert!(res.is_some());
+        let (name, args, preamble) = res.unwrap();
+        assert_eq!(name, "list_dir");
+        assert_eq!(args.get("path").unwrap().as_str().unwrap(), "");
+        assert_eq!(preamble, "");
+
+        // Single-quoted strings and trailing commas are also tolerated.
+        let input2 =
+            "```tool_call\n{name: 'read_file', args: {path: 'src/main.ts',},}\n```";
+        let (name2, args2, _) = parse_tool_call_spanned(input2).unwrap();
+        assert_eq!(name2, "read_file");
+        assert_eq!(args2.get("path").unwrap().as_str().unwrap(), "src/main.ts");
+
+        // Strict JSON must keep working, including apostrophes inside values.
+        let input3 = "```tool_call\n{\"name\": \"remember\", \"args\": {\"topic\": \"beetle's law\", \"content\": \"it works\"}}\n```";
+        let (name3, args3, _) = parse_tool_call_spanned(input3).unwrap();
+        assert_eq!(name3, "remember");
+        assert_eq!(
+            args3.get("topic").unwrap().as_str().unwrap(),
+            "beetle's law"
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_calls_multiple() {
+        // Two fenced calls in one response — both must survive, each with its
+        // own preamble. This is the "she filed two great cards and we lost
+        // one" regression.
+        let input = "Filing both cards now.\n```tool_call\n{\"name\": \"create_card\", \"args\": {\"title\": \"A\", \"description\": \"first\"}}\n```\nAnd the second:\n```tool_call\n{\"name\": \"create_card\", \"args\": {\"title\": \"B\", \"description\": \"second\"}}\n```";
+        let calls = parse_tool_calls_all(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "create_card");
+        assert_eq!(calls[0].1.get("title").unwrap().as_str().unwrap(), "A");
+        assert_eq!(calls[0].2, "Filing both cards now.");
+        assert_eq!(calls[1].1.get("title").unwrap().as_str().unwrap(), "B");
+        assert_eq!(calls[1].2, "And the second:");
+
+        // Two bare qwen-brace calls — the old rfind('}') would have spanned
+        // both braces and corrupted even the FIRST call.
+        let input2 = "call:list_dir{\"path\": \"src\"}\ncall:read_file{\"path\": \"src/main.ts\"}";
+        let calls2 = parse_tool_calls_all(input2);
+        assert_eq!(calls2.len(), 2);
+        assert_eq!(calls2[0].0, "list_dir");
+        assert_eq!(calls2[1].0, "read_file");
+        assert_eq!(
+            calls2[1].1.get("path").unwrap().as_str().unwrap(),
+            "src/main.ts"
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_call_backtick_template_literal() {
+        // Field failure: a JS template literal as an argument value, with
+        // NESTED backticks inside the code payload — a model deep in
+        // TypeScript passing code the way TypeScript would write it.
+        let input = "<|tool_call>call:replace_lines{end_line:183,path:\"src/main.ts\",start_line:168,content:`ctx.strokeStyle = `rgba(255, 215, 0, ${opacity})`;\nctx.stroke();`}<tool_call|>";
+        let res = parse_tool_call_spanned(input);
+        assert!(res.is_some());
+        let (name, args, preamble) = res.unwrap();
+        assert_eq!(name, "replace_lines");
+        assert_eq!(args.get("start_line").unwrap().as_i64().unwrap(), 168);
+        assert_eq!(args.get("end_line").unwrap().as_i64().unwrap(), 183);
+        assert_eq!(
+            args.get("path").unwrap().as_str().unwrap(),
+            "src/main.ts"
+        );
+        let content = args.get("content").unwrap().as_str().unwrap();
+        assert!(content.contains("rgba(255, 215, 0"));
+        assert!(content.contains("ctx.stroke();"));
+        assert_eq!(preamble, "");
+    }
+
+    #[test]
+    fn test_replace_lines_impl_reports_shift_delta() {
+        let dir = std::env::temp_dir().join(format!("beetle_rl_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("t.txt"), "a\nb\nc\nd\ne\n").unwrap();
+
+        // 3 lines out, 1 in → delta -2; numbers below the edit untouched.
+        let (msg, delta) = replace_lines_impl(&dir, "t.txt", 2, 4, "X");
+        assert!(msg.starts_with("Success"), "{}", msg);
+        assert_eq!(delta, -2);
+        assert_eq!(fs::read_to_string(dir.join("t.txt")).unwrap(), "a\nX\ne\n");
+
+        // 1 line out, 2 in → delta +1.
+        let (msg2, delta2) = replace_lines_impl(&dir, "t.txt", 1, 1, "a1\na2");
+        assert!(msg2.starts_with("Success"), "{}", msg2);
+        assert_eq!(delta2, 1);
+
+        // Same-length replacement → delta 0 (numbers stay valid; never blocked).
+        let (msg3, delta3) = replace_lines_impl(&dir, "t.txt", 1, 1, "A1");
+        assert!(msg3.starts_with("Success"), "{}", msg3);
+        assert_eq!(delta3, 0);
+        assert!(msg3.contains("Line count unchanged"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -50,6 +50,30 @@ fn normalize_priority(p: &str) -> String {
     }
 }
 
+/// Report any argument keys a tool didn't recognize. Silent argument drops
+/// teach the model false beliefs about what happened: a tool that uses some
+/// arguments, ignores others, and reports plain "Success" is lying by
+/// omission. Every tool result must name what it ignored.
+fn unknown_args_note(args: &serde_json::Value, known: &[&str]) -> String {
+    let Some(map) = args.as_object() else {
+        return String::new();
+    };
+    let unknown: Vec<&str> = map
+        .keys()
+        .map(|k| k.as_str())
+        .filter(|k| !known.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Note: IGNORED unrecognized argument(s): {}. Supported arguments: {}.",
+            unknown.join(", "),
+            known.join(", ")
+        )
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RunEvent {
     pub run_id: String,
@@ -1719,7 +1743,7 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "update_card",
-                    "description": "Edits a card in this project's backlog or todo column: change its title or description, or append a todo item. Cards that are running, in review, or done cannot be edited.",
+                    "description": "Edits a card in this project's backlog or todo column: change its title, description, or priority, REPLACE the whole todo checklist, or append a single todo or label. Cards that are running, in review, or done cannot be edited.",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -1734,6 +1758,11 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                             "description": {
                                 "type": "string",
                                 "description": "Optional new description (replaces the old one)"
+                            },
+                            "todos": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Optional: REPLACES the entire todo checklist with this list (all items unchecked). Use add_todo to append a single item instead."
                             },
                             "add_todo": {
                                 "type": "string",
@@ -4931,7 +4960,7 @@ fn construct_agent_system_prompt(
          19. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword and returns the most recent matches (empty query = latest memories). Past runs may have already mapped the territory — check before exploring from scratch.\n\
          20. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
          21. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
-         22. `update_card(card_id: String, title?: String, description?: String, priority?: String, add_todo?: String, add_label?: String)`: Edits a backlog/todo card.\n\
+         22. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
          23. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
@@ -6540,15 +6569,25 @@ fn execute_tool(
             }
             let _ = app_handle.emit("run-updated", serde_json::json!({ "run_id": run_id }));
             format!(
-                "Success: card '{}' filed in the backlog with id {} ({} todo item{}). The developer will review and schedule it.",
+                "Success: card '{}' filed in the backlog with id {} ({} todo item{}). The developer will review and schedule it.{}",
                 new_card.title,
                 id,
                 new_card.todo_list.len(),
-                if new_card.todo_list.len() == 1 { "" } else { "s" }
+                if new_card.todo_list.len() == 1 { "" } else { "s" },
+                unknown_args_note(args, &["title", "description", "todos", "priority", "labels"])
             )
         }
         "update_card" => {
-            const USAGE: &str = " Usage: update_card(card_id: String, title?: String, description?: String, add_todo?: String) — card_id comes from list_cards; only backlog/todo cards can be edited.";
+            const USAGE: &str = " Usage: update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String) — card_id comes from list_cards; only backlog/todo cards can be edited. `todos` REPLACES the whole checklist; `add_todo` appends one item.";
+            const KNOWN: &[&str] = &[
+                "card_id",
+                "title",
+                "description",
+                "priority",
+                "todos",
+                "add_todo",
+                "add_label",
+            ];
             let card_id = match args.get("card_id").and_then(|c| c.as_str()) {
                 Some(c) if !c.trim().is_empty() => c.trim().to_string(),
                 _ => return format!("Error: Missing 'card_id' argument.{}", USAGE),
@@ -6558,8 +6597,15 @@ fn execute_tool(
             let add_todo = args.get("add_todo").and_then(|t| t.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             let new_priority = args.get("priority").and_then(|p| p.as_str()).map(normalize_priority);
             let add_label = args.get("add_label").and_then(|l| l.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-            if new_title.is_none() && new_desc.is_none() && add_todo.is_none() && new_priority.is_none() && add_label.is_none() {
-                return format!("Error: nothing to update — provide title, description, priority, add_todo, or add_label.{}", USAGE);
+            let new_todos: Option<Vec<String>> = args.get("todos").and_then(|t| t.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            });
+            if new_title.is_none() && new_desc.is_none() && add_todo.is_none() && new_priority.is_none() && add_label.is_none() && new_todos.is_none() {
+                return format!("Error: nothing to update — provide title, description, priority, todos, add_todo, or add_label.{}", USAGE);
             }
             let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
             let scope_clean = PathBuf::from(&scope);
@@ -6585,19 +6631,36 @@ fn execute_tool(
                     card.title, card.status
                 );
             }
+            let mut changed: Vec<String> = Vec::new();
             if let Some(t) = &new_title {
                 card.title = t.clone();
+                changed.push("title".to_string());
             }
             if let Some(d) = &new_desc {
                 card.description = d.clone();
+                changed.push("description".to_string());
             }
             if let Some(p) = &new_priority {
                 card.priority = p.clone();
+                changed.push("priority".to_string());
             }
             if let Some(label) = &add_label {
                 if !card.labels.contains(label) {
                     card.labels.push(label.clone());
                 }
+                changed.push("label added".to_string());
+            }
+            let mut todos_replaced = false;
+            if let Some(list) = &new_todos {
+                card.todo_list = list
+                    .iter()
+                    .map(|t| TodoItem {
+                        text: t.clone(),
+                        completed: false,
+                    })
+                    .collect();
+                todos_replaced = true;
+                changed.push(format!("todo list replaced ({} items)", list.len()));
             }
             let mut todo_added = false;
             if let Some(todo_text) = &add_todo {
@@ -6606,6 +6669,7 @@ fn execute_tool(
                     completed: false,
                 });
                 todo_added = true;
+                changed.push("todo appended".to_string());
             }
             let card_title = card.title.clone();
             let card_desc = card.description.clone();
@@ -6615,12 +6679,23 @@ fn execute_tool(
             let card_id_db = card.id.clone();
             let todo_idx = card.todo_list.len().saturating_sub(1);
             let todo_text_db = add_todo.clone();
+            let todo_texts: Vec<String> = card.todo_list.iter().map(|t| t.text.clone()).collect();
             if let Ok(conn) = get_db_conn(app_handle) {
                 let _ = conn.execute(
                     "UPDATE cards SET title = ?1, description = ?2, priority = ?3, labels = ?4 WHERE id = ?5",
                     (&card_title, &card_desc, &card_priority, &card_labels_json, &card_id_db),
                 );
-                if todo_added {
+                if todos_replaced {
+                    // Full rewrite: the replacement list (plus any appended item)
+                    // becomes the card's entire checklist, all unchecked.
+                    let _ = conn.execute("DELETE FROM todo_items WHERE card_id = ?1", [&card_id_db]);
+                    for (idx, text) in todo_texts.iter().enumerate() {
+                        let _ = conn.execute(
+                            "INSERT INTO todo_items (card_id, idx, text, completed) VALUES (?1, ?2, ?3, 0)",
+                            (&card_id_db, idx as i32, text),
+                        );
+                    }
+                } else if todo_added {
                     if let Some(text) = &todo_text_db {
                         let _ = conn.execute(
                             "INSERT INTO todo_items (card_id, idx, text, completed) VALUES (?1, ?2, ?3, ?4)",
@@ -6630,7 +6705,12 @@ fn execute_tool(
                 }
             }
             let _ = app_handle.emit("run-updated", serde_json::json!({ "run_id": run_id }));
-            format!("Success: card '{}' updated.", card_title)
+            format!(
+                "Success: card '{}' updated ({}).{}",
+                card_title,
+                changed.join(", "),
+                unknown_args_note(args, KNOWN)
+            )
         }
         "delete_card" => {
             const USAGE: &str = " Usage: delete_card(card_id: String) — card_id comes from list_cards; only backlog/todo cards with no run history can be deleted.";
@@ -7241,7 +7321,7 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
          12. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before proposing from scratch.\n\
          13. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
          14. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. When a design discussion produces actionable work, FILE IT as a card with a clear description, priority, and todos — that is how plans become runs.\n\
-         15. `update_card(card_id: String, title?: String, description?: String, priority?: String, add_todo?: String, add_label?: String)`: Edits a backlog/todo card.\n\
+         15. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
          16. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your ideas, proposals, or questions.",
         doc_name, project_path.to_string_lossy()
@@ -7283,7 +7363,7 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
          14. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
          15. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
          16. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. If a fix you're discussing is bigger than the current conversation, file it as a card so it gets scheduled instead of forgotten.\n\
-         17. `update_card(card_id: String, title?: String, description?: String, priority?: String, add_todo?: String, add_label?: String)`: Edits a backlog/todo card.\n\
+         17. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
          18. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your changes or asking questions.",
         target, project_path.to_string_lossy()

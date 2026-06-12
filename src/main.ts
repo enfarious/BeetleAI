@@ -1685,6 +1685,14 @@ function renderLogs(logs: RunEvent[]) {
   let pendingToolCall: any = null;
 
   logs.forEach((log) => {
+    if (log.event_type === "compaction") {
+      if (pendingToolCall) {
+        processedLogs.push(pendingToolCall);
+        pendingToolCall = null;
+      }
+      processedLogs.push(log);
+      return;
+    }
     if (log.event_type === "tool_call") {
       if (pendingToolCall) {
         processedLogs.push(pendingToolCall);
@@ -1715,6 +1723,20 @@ function renderLogs(logs: RunEvent[]) {
   }
 
   processedLogs.forEach((log) => {
+    if (log.event_type === "compaction") {
+      const div = document.createElement("div");
+      div.className = "bubble-meta chat-compaction-divider";
+      div.style.alignSelf = "center";
+      div.style.margin = "10px 0";
+      div.textContent = "⧉ Earlier conversation condensed to save context — full transcript preserved above";
+      let summary = "";
+      try {
+        summary = JSON.parse(log.payload).summary || "";
+      } catch { /* ignore */ }
+      if (summary) div.title = summary;
+      chatMessages.appendChild(div);
+      return;
+    }
     if (log.event_type === "status") {
       const div = document.createElement("div");
       div.className = "bubble-meta";

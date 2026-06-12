@@ -1872,6 +1872,27 @@ fn truncate_tool_result(text: &str, max_chars: usize) -> String {
 }
 
 fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
+    // Compaction-aware replay: if the log contains compaction events, the
+    // latest one's summary stands in for everything it covers, and only the
+    // tail after the covered range is replayed verbatim. The full transcript
+    // stays in the log, DB, and UI — this shapes only what the model sees.
+    let mut compaction_summary: Option<String> = None;
+    let mut replay_start = 0usize;
+    for e in events.iter() {
+        if e.event_type == "compaction" {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&e.payload) {
+                if let (Some(s), Some(c)) = (
+                    v.get("summary").and_then(|s| s.as_str()),
+                    v.get("covers").and_then(|c| c.as_u64()),
+                ) {
+                    compaction_summary = Some(s.to_string());
+                    replay_start = (c as usize).min(events.len());
+                }
+            }
+        }
+    }
+    let events = &events[replay_start..];
+
     // Index tool_results so we can budget by recency: the last couple of results
     // stay generous, older ones get trimmed hard. This bounds prompt growth over
     // a long run, which is what was driving local-model prompt-ingestion timeouts.
@@ -1994,7 +2015,114 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
             }
         }
     }
+    if let Some(s) = compaction_summary {
+        let block = format!(
+            "[CONVERSATION SUMMARY — earlier turns were condensed to fit the context window. The full transcript is preserved outside this view; durable project facts may also be retrievable with recall().]\n{}\n[END SUMMARY — the conversation resumes below]",
+            s
+        );
+        // Merge into the first message if it's already a user turn, so provider
+        // role-alternation rules (e.g. Anthropic) are never violated.
+        let merged = if let Some(first) = messages.first_mut() {
+            if first.get("role").and_then(|r| r.as_str()) == Some("user") {
+                let existing = first
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                first["content"] = serde_json::json!(format!("{}\n\n{}", block, existing));
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !merged {
+            messages.insert(
+                0,
+                serde_json::json!({ "role": "user", "content": block }),
+            );
+        }
+    }
     messages
+}
+
+/// Option-3 context management for long sessions: when the replayed history
+/// exceeds the threshold, everything but a recent tail is condensed into a
+/// single `compaction` event by the configured model. Nothing is deleted —
+/// the UI and DB keep every event; only the model's view shrinks. If the
+/// summarizer call fails, a stub summary still caps growth (graceful fallback
+/// to plain trimming), so the user's message is never blocked on compaction.
+const COMPACT_THRESHOLD_CHARS: usize = 48_000;
+const COMPACT_KEEP_RECENT_EVENTS: usize = 12;
+
+fn history_size_chars(messages: &[serde_json::Value]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+fn compacted_history(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    events: &[RunEvent],
+) -> (Vec<serde_json::Value>, Option<RunEvent>) {
+    let messages = get_history_messages(events);
+    if history_size_chars(&messages) < COMPACT_THRESHOLD_CHARS
+        || events.len() <= COMPACT_KEEP_RECENT_EVENTS + 4
+    {
+        return (messages, None);
+    }
+
+    let covers = events.len() - COMPACT_KEEP_RECENT_EVENTS;
+    // Flatten the to-be-covered portion into a transcript for the summarizer.
+    // This already folds in any previous compaction summary, so repeated
+    // compactions compound instead of stacking.
+    let old_msgs = get_history_messages(&events[..covers]);
+    let mut transcript = String::new();
+    for m in &old_msgs {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let clipped: String = content.chars().take(1200).collect();
+        transcript.push_str(&format!("{}: {}\n", role.to_uppercase(), clipped));
+    }
+    let transcript: String = transcript.chars().take(30_000).collect();
+
+    let system = "You are a context compaction engine. Condense the conversation transcript into a dense briefing the assistant will continue from. Preserve: decisions made and their reasons; the current task state and next steps; exact file paths, function names, card ids, and commands mentioned; unresolved questions; and the user's standing instructions. Omit pleasantries and repetition. Output ONLY the summary text, under 400 words.";
+    let summarizer_history = vec![serde_json::json!({ "role": "user", "content": transcript })];
+
+    // Synthetic run id: call_llm streams tokens keyed by run id, and the
+    // summarizer's output must never paint into the visible chat.
+    let summarizer_run_id = format!("{}-compaction", run_id);
+    let fallback = "Earlier conversation was condensed to fit the context window; specifics may be retrievable with recall().".to_string();
+    let summary = match call_llm(app_handle, &summarizer_run_id, system, summarizer_history, None)
+    {
+        Ok(raw) => {
+            let (_, cleaned) = extract_reasoning(&raw);
+            let s = cleaned.trim().to_string();
+            if s.is_empty() {
+                fallback
+            } else {
+                s.chars().take(4000).collect()
+            }
+        }
+        Err(_) => fallback,
+    };
+
+    let event = RunEvent {
+        run_id: run_id.to_string(),
+        event_type: "compaction".to_string(),
+        payload: serde_json::json!({ "summary": summary, "covers": covers }).to_string(),
+    };
+    let mut with_compaction = events.to_vec();
+    with_compaction.push(event.clone());
+    (get_history_messages(&with_compaction), Some(event))
 }
 
 fn log_error(msg: &str) {
@@ -3117,14 +3245,15 @@ pub async fn send_design_chat(
             }
             step += 1;
 
-            let history = {
+            let events_snapshot: Vec<RunEvent> = {
                 let logs = state.design_logs.lock().unwrap();
-                if let Some(evs) = logs.get(&log_key_clone) {
-                    get_history_messages(evs)
-                } else {
-                    Vec::new()
-                }
+                logs.get(&log_key_clone).cloned().unwrap_or_default()
             };
+            let (history, compaction) =
+                compacted_history(&app_handle_clone, &log_key_clone, &events_snapshot);
+            if let Some(ev) = compaction {
+                append_design_event(&app_handle_clone, &state, &log_key_clone, ev);
+            }
 
             let system_prompt =
                 construct_architect_system_prompt(&cleaned_path_clone, &doc_name_clone);
@@ -3378,14 +3507,15 @@ pub async fn send_code_chat(
             }
             step += 1;
 
-            let history = {
+            let events_snapshot: Vec<RunEvent> = {
                 let logs = state.code_logs.lock().unwrap();
-                if let Some(evs) = logs.get(&log_key_clone) {
-                    get_history_messages(evs)
-                } else {
-                    Vec::new()
-                }
+                logs.get(&log_key_clone).cloned().unwrap_or_default()
             };
+            let (history, compaction) =
+                compacted_history(&app_handle_clone, &log_key_clone, &events_snapshot);
+            if let Some(ev) = compaction {
+                append_code_event(&app_handle_clone, &state, &log_key_clone, ev);
+            }
 
             let system_prompt =
                 construct_copilot_system_prompt(&cleaned_path_clone, &file_path_clone);
@@ -6754,14 +6884,15 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
 
             step += 1;
 
-            let history = {
+            let events_snapshot: Vec<RunEvent> = {
                 let logs = state.run_logs.lock().unwrap();
-                if let Some(events) = logs.get(&run_id_clone) {
-                    get_history_messages(events)
-                } else {
-                    Vec::new()
-                }
+                logs.get(&run_id_clone).cloned().unwrap_or_default()
             };
+            let (history, compaction) =
+                compacted_history(&app_handle_clone, &run_id_clone, &events_snapshot);
+            if let Some(ev) = compaction {
+                append_run_event(&app_handle_clone, &state, &run_id_clone, ev);
+            }
 
             let system_prompt =
                 construct_agent_system_prompt(&worktree_path, &card_title, &card_desc);

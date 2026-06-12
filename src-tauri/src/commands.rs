@@ -111,14 +111,29 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let default_project_path = {
-            let mut p = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            if p.ends_with("src-tauri") {
-                p.pop();
-            }
-            p.to_string_lossy().into_owned()
-        };
+        // Demo seeding removed: a fresh install — and every new project —
+        // starts with an empty board. The database is the source of truth at
+        // startup (load_state_from_db); the hardcoded demo cards and fictional
+        // run transcripts that used to live here were dead weight, overwritten
+        // milliseconds after construction. Spotting that was the agent's own
+        // finding (its Card A, todo #1).
+        Self {
+            cards: Mutex::new(Vec::new()),
+            run_logs: Mutex::new(HashMap::new()),
+            design_logs: Mutex::new(HashMap::new()),
+            code_logs: Mutex::new(HashMap::new()),
+            active_runs: Mutex::new(std::collections::HashSet::new()),
+            cancelled_runs: Mutex::new(std::collections::HashSet::new()),
+            lmstudio_response_ids: Mutex::new(HashMap::new()),
+        }
+    }
 
+    // Pruned from compilation (always-false cfg). The demo data below is kept
+    // un-compiled solely so the agent can delete it as its own cleanup card.
+    // Safe to remove wholesale, including this attribute and stub.
+    #[cfg(any())]
+    fn _pruned_demo_data() {
+        let default_project_path = String::new();
         let initial_cards = vec![
             Card {
                 id: "card_1".to_string(),
@@ -238,15 +253,7 @@ impl AppState {
             ],
         );
 
-        Self {
-            cards: Mutex::new(initial_cards),
-            run_logs: Mutex::new(initial_logs),
-            design_logs: Mutex::new(HashMap::new()),
-            code_logs: Mutex::new(HashMap::new()),
-            active_runs: Mutex::new(std::collections::HashSet::new()),
-            cancelled_runs: Mutex::new(std::collections::HashSet::new()),
-            lmstudio_response_ids: Mutex::new(HashMap::new()),
-        }
+        let _ = (initial_cards, initial_logs);
     }
 }
 
@@ -366,6 +373,11 @@ fn get_db_conn(app_handle: &tauri::AppHandle) -> Result<rusqlite::Connection, St
     rusqlite::Connection::open(db_path).map_err(|e| e.to_string())
 }
 
+// Pruned from compilation (always-false cfg): demo-card seeding is retired.
+// The body below is kept un-compiled solely so the agent can delete it as its
+// own cleanup card — its Card A, todo #1. Safe to remove wholesale, including
+// this attribute and comment.
+#[cfg(any())]
 fn seed_default_cards_for_project(
     conn: &rusqlite::Connection,
     project_path: &str,
@@ -632,18 +644,6 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
         [],
     )
     .map_err(|e| e.to_string())?;
-
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM cards", [], |row| row.get(0))
-        .unwrap_or(0);
-    if count == 0 {
-        let mut p = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        if p.ends_with("src-tauri") {
-            p.pop();
-        }
-        let default_project_path = p.to_string_lossy().into_owned();
-        let _ = seed_default_cards_for_project(&conn, &default_project_path);
-    }
 
     let settings_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
@@ -3739,21 +3739,16 @@ pub async fn get_code_log(
 
 #[tauri::command]
 pub async fn list_cards(
-    app_handle: tauri::AppHandle,
+    _app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     project_path: String,
 ) -> Result<Vec<Card>, String> {
-    let mut cards = state.cards.lock().unwrap();
+    let cards = state.cards.lock().unwrap();
 
-    let has_cards = cards.iter().any(|c| c.project_path == project_path);
-    if !has_cards {
-        if let Ok(conn) = get_db_conn(&app_handle) {
-            if let Ok(seeded) = seed_default_cards_for_project(&conn, &project_path) {
-                cards.extend(seeded);
-            }
-        }
-    }
-
+    // New and empty projects start with an empty board — the lazy demo-card
+    // seeding that used to happen here planted four fictional cards (with
+    // fabricated run transcripts) into every project that had none, which the
+    // agent once solemnly audited as real project history.
     Ok(cards
         .iter()
         .filter(|c| c.project_path == project_path)

@@ -77,8 +77,48 @@ fn unknown_args_note(args: &serde_json::Value, known: &[&str]) -> String {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RunEvent {
     pub run_id: String,
-    pub event_type: String, // "status", "message", "tool_call", "tool_result", "file_touched", "blocked", "error"
+    pub event_type: String, // "status", "message", "reasoning", "tool_call", "tool_result", "file_touched", "blocked", "error", "malformed"
     pub payload: String,    // JSON payload or text
+}
+
+/// Per-tool tally for the vitals panel.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct ToolStat {
+    pub name: String,
+    pub calls: u32,
+    pub failures: u32,
+}
+
+/// Read-only telemetry summary for one run, derived from its event log. Drives
+/// the harness vitals panel; everything here is recomputed on demand, so there
+/// is no aggregate to keep in sync.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct RunVitals {
+    pub total_calls: u32,
+    pub successes: u32,
+    pub failures: u32,
+    pub malformed: u32,
+    pub reads: u32,
+    pub writes: u32,
+    pub reasoning_events: u32,
+    /// Longest streak of failures on a single edit signature before it cleared
+    /// (or, if never cleared, the streak it ended on) — how hard the worst edit
+    /// was to land. Mirrors the stuck-edit detector's counter.
+    pub worst_edit_retry_streak: u32,
+    /// failure_reason → count, over failed tool_results, sorted desc.
+    pub failure_reasons: Vec<(String, u32)>,
+    /// failure_reason → count, over malformed events, sorted desc.
+    pub malformed_reasons: Vec<(String, u32)>,
+    /// Per-tool calls/failures, sorted by calls desc.
+    pub per_tool: Vec<ToolStat>,
+    /// Throughput — averaged across the run's LLM calls (from `metrics` events).
+    pub llm_calls: u32,
+    pub avg_ttft_ms: Option<f64>,
+    pub avg_prompt_tps: Option<f64>,
+    pub avg_decode_tps: Option<f64>,
+    /// True if any decode-rate sample was estimated from response length rather
+    /// than a real token count (server didn't report usage).
+    pub decode_tps_approx: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -88,6 +128,29 @@ pub struct LlmSettings {
     pub api_key: String,
     pub model: String,
     pub max_steps: u32,
+    // Frontier escalation target: a SECOND model config held alongside the
+    // local one so the agent can ask a stronger model for help mid-run without
+    // a human reconfiguring anything (that reconfiguration would defeat the
+    // point of autonomy). All optional — absent/empty means escalation is
+    // unconfigured and request_assist degrades to "ask your human". Defaulted
+    // for serde so existing config.json and DB rows load unchanged.
+    #[serde(default)]
+    pub assist_provider: String,
+    #[serde(default)]
+    pub assist_api_url: String,
+    #[serde(default)]
+    pub assist_api_key: String,
+    #[serde(default)]
+    pub assist_model: String,
+}
+
+impl LlmSettings {
+    /// True only when every field the escalation call needs is present.
+    pub fn assist_configured(&self) -> bool {
+        !self.assist_provider.trim().is_empty()
+            && !self.assist_api_url.trim().is_empty()
+            && !self.assist_model.trim().is_empty()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -560,11 +623,35 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             api_url TEXT NOT NULL,
             api_key TEXT NOT NULL,
             model TEXT NOT NULL,
-            max_steps INTEGER NOT NULL
+            max_steps INTEGER NOT NULL,
+            assist_provider TEXT NOT NULL DEFAULT '',
+            assist_api_url TEXT NOT NULL DEFAULT '',
+            assist_api_key TEXT NOT NULL DEFAULT '',
+            assist_model TEXT NOT NULL DEFAULT ''
         );",
         [],
     )
     .map_err(|e| e.to_string())?;
+
+    // Lightweight migrations for existing settings tables: ADD COLUMN fails
+    // harmlessly when the column already exists (same pattern as the card
+    // priority/labels columns).
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN assist_provider TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN assist_api_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN assist_api_key TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN assist_model TEXT NOT NULL DEFAULT ''",
+        [],
+    );
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS projects (
@@ -673,6 +760,9 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
                 50i64,
             ),
         );
+        // assist_* columns intentionally omitted here: they take their DDL
+        // defaults (empty), i.e. escalation starts unconfigured until the user
+        // sets a frontier target in settings.
     }
 
     let projects_count: i64 = conn
@@ -695,7 +785,7 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
 
 fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> {
     let mut stmt = conn
-        .prepare("SELECT provider, api_url, api_key, model, max_steps FROM settings LIMIT 1")
+        .prepare("SELECT provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model FROM settings LIMIT 1")
         .map_err(|e| e.to_string())?;
     let settings_opt = stmt
         .query_row([], |row| {
@@ -705,6 +795,10 @@ fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> 
                 api_key: row.get(2)?,
                 model: row.get(3)?,
                 max_steps: row.get(4)?,
+                assist_provider: row.get(5)?,
+                assist_api_url: row.get(6)?,
+                assist_api_key: row.get(7)?,
+                assist_model: row.get(8)?,
             })
         })
         .optional()
@@ -738,13 +832,17 @@ fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> 
 fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result<(), String> {
     let _ = conn.execute("DELETE FROM settings", []);
     conn.execute(
-        "INSERT INTO settings (provider, api_url, api_key, model, max_steps) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO settings (provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (
             &config.settings.provider,
             &config.settings.api_url,
             &config.settings.api_key,
             &config.settings.model,
             &config.settings.max_steps,
+            &config.settings.assist_provider,
+            &config.settings.assist_api_url,
+            &config.settings.assist_api_key,
+            &config.settings.assist_model,
         ),
     ).map_err(|e| e.to_string())?;
 
@@ -905,6 +1003,10 @@ fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
             api_key: "".to_string(),
             model: "llama3".to_string(),
             max_steps: 50,
+            assist_provider: String::new(),
+            assist_api_url: String::new(),
+            assist_api_key: String::new(),
+            assist_model: String::new(),
         },
         projects: vec![Project {
             id: "beetleai".to_string(),
@@ -2632,6 +2734,107 @@ fn call_llm(
     }
 }
 
+/// Wall-clock timer for one LLM call. `start` is set at construction (just
+/// before the request goes out); `mark()` stamps the first streamed token so
+/// TTFT = first_token - start. TTFT is the prefill-dominated number — the
+/// "slow to inject prompts" symptom — and it's provider-independent, so every
+/// path gets it even when the server reports no token stats.
+struct StreamTimer {
+    start: std::time::Instant,
+    first_token: Option<std::time::Instant>,
+}
+impl StreamTimer {
+    fn new() -> Self {
+        Self { start: std::time::Instant::now(), first_token: None }
+    }
+    fn mark(&mut self) {
+        if self.first_token.is_none() {
+            self.first_token = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// Pull (prompt_tokens, completion_tokens) out of an OpenAI-style SSE line, if
+/// it carries a usage block (emitted only when stream_options.include_usage is
+/// set). Returns None for ordinary delta lines.
+fn parse_openai_usage(line: &str) -> Option<(u64, u64)> {
+    let data = line.trim().strip_prefix("data: ")?.trim();
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let u = v.get("usage")?;
+    let p = u.get("prompt_tokens").and_then(|x| x.as_u64());
+    let c = u.get("completion_tokens").and_then(|x| x.as_u64());
+    match (p, c) {
+        (Some(p), Some(c)) => Some((p, c)),
+        _ => None,
+    }
+}
+
+/// Emit a per-call `metrics` event for the vitals panel. Wall-clock TTFT/total
+/// are always present. Decode rate prefers server-reported tok/s, then exact
+/// completion-token count, then a chars/4 estimate (flagged `approx`) so the
+/// user's path still shows a rate even when the server is stingy with stats.
+#[allow(clippy::too_many_arguments)]
+fn log_llm_metrics(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    timer: &StreamTimer,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    server_prompt_tps: Option<f64>,
+    server_decode_tps: Option<f64>,
+    response_chars: usize,
+) {
+    let now = std::time::Instant::now();
+    let total_ms = now.duration_since(timer.start).as_secs_f64() * 1000.0;
+    let ttft_ms = timer
+        .first_token
+        .map(|t| t.duration_since(timer.start).as_secs_f64() * 1000.0);
+    let decode_secs = timer
+        .first_token
+        .map(|ft| now.duration_since(ft).as_secs_f64())
+        .unwrap_or(0.0);
+
+    let mut approx = false;
+    let decode_tps = server_decode_tps.or_else(|| {
+        if decode_secs <= 0.0 {
+            return None;
+        }
+        if let Some(ct) = completion_tokens {
+            Some(ct as f64 / decode_secs)
+        } else if response_chars > 0 {
+            approx = true;
+            Some((response_chars as f64 / 4.0) / decode_secs)
+        } else {
+            None
+        }
+    });
+    let prompt_tps = server_prompt_tps.or_else(|| match (prompt_tokens, ttft_ms) {
+        (Some(pt), Some(ms)) if ms > 0.0 => Some(pt as f64 / (ms / 1000.0)),
+        _ => None,
+    });
+
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        append_run_event(
+            app_handle,
+            state.inner(),
+            run_id,
+            RunEvent {
+                run_id: run_id.to_string(),
+                event_type: "metrics".to_string(),
+                payload: serde_json::json!({
+                    "ttft_ms": ttft_ms,
+                    "total_ms": total_ms,
+                    "prompt_tps": prompt_tps,
+                    "decode_tps": decode_tps,
+                    "tokens_out": completion_tokens,
+                    "approx": approx,
+                })
+                .to_string(),
+            },
+        );
+    }
+}
+
 fn call_anthropic(
     app_handle: &tauri::AppHandle,
     run_id: &str,
@@ -2696,6 +2899,9 @@ fn call_anthropic(
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(300))
         .build();
+    let mut timer = StreamTimer::new();
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
     let resp = match agent
         .post(&url)
         .set("Content-Type", "application/json")
@@ -2752,6 +2958,7 @@ fn call_anthropic(
                 }
 
                 if !chunk_to_emit.is_empty() {
+                    timer.mark();
                     full_response.push_str(&chunk_to_emit);
                     let _ = app_handle.emit(
                         "chat-chunk",
@@ -2765,6 +2972,18 @@ fn call_anthropic(
                 }
             }
             accumulate_anthropic_tool_calls(&line_str, &mut accumulated_tool_calls);
+            // Anthropic reports tokens across two events: input in message_start,
+            // cumulative output in message_delta.
+            if let Some(data) = line_str.trim().strip_prefix("data: ") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(data.trim()) {
+                    if let Some(it) = v.pointer("/message/usage/input_tokens").and_then(|x| x.as_u64()) {
+                        prompt_tokens = Some(it);
+                    }
+                    if let Some(ot) = v.pointer("/usage/output_tokens").and_then(|x| x.as_u64()) {
+                        completion_tokens = Some(ot);
+                    }
+                }
+            }
         }
 
         if in_reasoning {
@@ -2776,6 +2995,16 @@ fn call_anthropic(
 
         emit_chunk(app_handle, run_id, "", true);
 
+        log_llm_metrics(
+            app_handle,
+            run_id,
+            &timer,
+            prompt_tokens,
+            completion_tokens,
+            None,
+            None,
+            full_response.chars().count(),
+        );
         Ok(full_response)
     } else {
         let error_text = resp.into_string().unwrap_or_default();
@@ -2783,6 +3012,72 @@ fn call_anthropic(
         log_error(&err_msg);
         Err(err_msg)
     }
+}
+
+/// Strict-template guard for OpenAI-compatible and Ollama chat endpoints.
+/// Local-model jinja templates (Mistral, Qwen, ...) hard-reject message
+/// streams that Gemma's permissive template silently accepted: roles must
+/// alternate user/assistant after the system message, the first non-system
+/// message must be user, and generation must be prompted by a trailing user
+/// turn. Normalizing here costs nothing on tolerant templates and makes
+/// strict ones work at all. (Field failures: Mistral "conversation roles
+/// must alternate"; Qwen "No user query found in messages". call_anthropic
+/// has carried its own copy of this guard from day one — the strict locals
+/// deserve the same one.)
+fn normalize_for_strict_templates(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut has_system = false;
+    for m in messages.into_iter() {
+        let role = m
+            .get("role")
+            .and_then(|r| r.as_str())
+            .unwrap_or("user")
+            .to_string();
+        if role == "system" {
+            if !has_system {
+                out.insert(0, m);
+                has_system = true;
+            } else if let Some(extra) = m.get("content").and_then(|c| c.as_str()) {
+                // Fold stray extra system messages into the first one.
+                if let Some(first) = out.first_mut() {
+                    let prev = first.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    first["content"] = serde_json::json!(format!("{}\n\n{}", prev, extra));
+                }
+            }
+            continue;
+        }
+        let content = m
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let non_system_count = out.len() - usize::from(has_system);
+        if non_system_count == 0 && role == "assistant" {
+            out.push(serde_json::json!({ "role": "user", "content": "(conversation resumed)" }));
+        }
+        if let Some(last) = out.last_mut() {
+            if last.get("role").and_then(|r| r.as_str()) == Some(role.as_str()) {
+                let prev = last.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                last["content"] = serde_json::json!(format!("{}\n\n{}", prev, content));
+                continue;
+            }
+        }
+        out.push(serde_json::json!({ "role": role, "content": content }));
+    }
+    // Generation must be prompted by a trailing user turn.
+    match out.last().and_then(|m| m.get("role")).and_then(|r| r.as_str()) {
+        Some("user") => {}
+        Some("system") | None => {
+            out.push(serde_json::json!({ "role": "user", "content": "(begin)" }));
+        }
+        _ => {
+            out.push(serde_json::json!({
+                "role": "user",
+                "content": "(continue from the conversation above)"
+            }));
+        }
+    }
+    out
 }
 
 fn call_openai_compat(
@@ -2793,6 +3088,7 @@ fn call_openai_compat(
     messages: Vec<serde_json::Value>,
     tools: Option<serde_json::Value>,
 ) -> Result<String, String> {
+    let messages = normalize_for_strict_templates(messages);
     let mut payload = serde_json::json!({
     "model": settings.model,
     "messages": messages,
@@ -2802,6 +3098,16 @@ fn call_openai_compat(
             "max_tokens": 4096,
             "stream": true
         });
+
+    // Ask for a usage block in the stream so the vitals panel gets exact token
+    // counts (LM Studio / llama.cpp honor this; servers that don't just omit it
+    // and we fall back to a length estimate).
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "stream_options".to_string(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
 
     if let Some(ref t) = tools {
         if let Some(obj) = payload.as_object_mut() {
@@ -2820,6 +3126,9 @@ fn call_openai_compat(
         req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
     }
 
+    let mut timer = StreamTimer::new();
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
     let resp = match req.send_json(payload) {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, resp)) => {
@@ -2873,6 +3182,7 @@ fn call_openai_compat(
                 }
 
                 if !chunk_to_emit.is_empty() {
+                    timer.mark();
                     full_response.push_str(&chunk_to_emit);
                     let _ = app_handle.emit(
                         "chat-chunk",
@@ -2886,6 +3196,10 @@ fn call_openai_compat(
                 }
             }
             accumulate_sse_tool_calls(&line_str, &mut accumulated_tool_calls);
+            if let Some((p, c)) = parse_openai_usage(&line_str) {
+                prompt_tokens = Some(p);
+                completion_tokens = Some(c);
+            }
         }
 
         if in_reasoning {
@@ -2913,6 +3227,16 @@ fn call_openai_compat(
             }),
         );
 
+        log_llm_metrics(
+            app_handle,
+            run_id,
+            &timer,
+            prompt_tokens,
+            completion_tokens,
+            None,
+            None,
+            full_response.chars().count(),
+        );
         Ok(full_response)
     } else {
         let error_text = resp.into_string().unwrap_or_default();
@@ -2930,6 +3254,7 @@ fn call_ollama_native(
     messages: Vec<serde_json::Value>,
     tools: Option<serde_json::Value>,
 ) -> Result<String, String> {
+    let messages = normalize_for_strict_templates(messages);
     let mut payload = serde_json::json!({
         "model": settings.model,
         "messages": messages,
@@ -2949,6 +3274,7 @@ fn call_ollama_native(
         req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
     }
 
+    let mut timer = StreamTimer::new();
     let resp = match req.send_json(payload) {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, resp)) => {
@@ -2977,6 +3303,10 @@ fn call_ollama_native(
     let mut full_response = String::new();
     let mut accumulated_tool_calls: Vec<ToolCallAccumulator> = Vec::new();
     let mut in_reasoning = false;
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
+    let mut server_prompt_tps: Option<f64> = None;
+    let mut server_decode_tps: Option<f64> = None;
 
     for line in reader.lines() {
         if run_is_cancelled(app_handle, run_id) {
@@ -3041,11 +3371,24 @@ fn call_ollama_native(
         }
 
         if !chunk_to_emit.is_empty() {
+            timer.mark();
             full_response.push_str(&chunk_to_emit);
             emit_chunk(app_handle, run_id, &chunk_to_emit, false);
         }
 
         if json.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            // Ollama's final object carries exact server timings (durations in
+            // nanoseconds) — use them directly rather than wall-clock estimates.
+            prompt_tokens = json.get("prompt_eval_count").and_then(|x| x.as_u64());
+            completion_tokens = json.get("eval_count").and_then(|x| x.as_u64());
+            let tps = |count: Option<u64>, dur_ns: Option<u64>| -> Option<f64> {
+                match (count, dur_ns) {
+                    (Some(c), Some(d)) if d > 0 => Some(c as f64 / (d as f64 / 1e9)),
+                    _ => None,
+                }
+            };
+            server_prompt_tps = tps(prompt_tokens, json.get("prompt_eval_duration").and_then(|x| x.as_u64()));
+            server_decode_tps = tps(completion_tokens, json.get("eval_duration").and_then(|x| x.as_u64()));
             break;
         }
     }
@@ -3058,6 +3401,16 @@ fn call_ollama_native(
     bridge_tool_calls_into_text(&mut full_response, &accumulated_tool_calls);
 
     emit_chunk(app_handle, run_id, "", true);
+    log_llm_metrics(
+        app_handle,
+        run_id,
+        &timer,
+        prompt_tokens,
+        completion_tokens,
+        server_prompt_tps,
+        server_decode_tps,
+        full_response.chars().count(),
+    );
     Ok(full_response)
 }
 
@@ -3120,6 +3473,7 @@ fn call_lmstudio_stateful(
         req = req.set("Authorization", &format!("Bearer {}", settings.api_key));
     }
 
+    let mut timer = StreamTimer::new();
     let resp = match req.send_json(payload) {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, resp)) => {
@@ -3148,6 +3502,9 @@ fn call_lmstudio_stateful(
     let reader = BufReader::new(resp.into_reader());
     let mut full_response = String::new();
     let mut in_reasoning = false;
+    let mut server_decode_tps: Option<f64> = None;
+    let mut prompt_tokens: Option<u64> = None;
+    let mut completion_tokens: Option<u64> = None;
 
     for line in reader.lines() {
         if run_is_cancelled(app_handle, run_id) {
@@ -3167,6 +3524,7 @@ fn call_lmstudio_stateful(
         match json.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "reasoning.delta" => {
                 if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
+                    timer.mark();
                     let mut chunk_to_emit = String::new();
                     if !in_reasoning {
                         in_reasoning = true;
@@ -3179,6 +3537,7 @@ fn call_lmstudio_stateful(
             }
             "message.delta" => {
                 if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
+                    timer.mark();
                     let mut chunk_to_emit = String::new();
                     if in_reasoning {
                         in_reasoning = false;
@@ -3199,8 +3558,8 @@ fn call_lmstudio_stateful(
                 return Err(err_msg);
             }
             "chat.end" => {
-                let response_id = json
-                    .get("result")
+                let result = json.get("result");
+                let response_id = result
                     .and_then(|r| r.get("response_id"))
                     .or_else(|| json.get("response_id"))
                     .and_then(|r| r.as_str())
@@ -3211,6 +3570,19 @@ fn call_lmstudio_stateful(
                         ids.insert(run_id.to_string(), rid);
                     }
                 }
+                // LM Studio reports throughput + token counts in the terminal
+                // event (field names vary across versions, so probe a few).
+                let stats = result.and_then(|r| r.get("stats")).or_else(|| json.get("stats"));
+                server_decode_tps = stats
+                    .and_then(|s| s.get("tokens_per_second").or_else(|| s.get("generation_tps")))
+                    .and_then(|t| t.as_f64());
+                let usage = result.and_then(|r| r.get("usage")).or_else(|| json.get("usage"));
+                prompt_tokens = usage
+                    .and_then(|u| u.get("prompt_tokens").or_else(|| u.get("input_tokens")))
+                    .and_then(|x| x.as_u64());
+                completion_tokens = usage
+                    .and_then(|u| u.get("completion_tokens").or_else(|| u.get("output_tokens")))
+                    .and_then(|x| x.as_u64());
                 break;
             }
             _ => {}
@@ -3223,6 +3595,16 @@ fn call_lmstudio_stateful(
     }
 
     emit_chunk(app_handle, run_id, "", true);
+    log_llm_metrics(
+        app_handle,
+        run_id,
+        &timer,
+        prompt_tokens,
+        completion_tokens,
+        None,
+        server_decode_tps,
+        full_response.chars().count(),
+    );
     Ok(full_response)
 }
 
@@ -4306,6 +4688,18 @@ pub async fn get_run_log(
 }
 
 #[tauri::command]
+pub async fn get_run_vitals(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<RunVitals, String> {
+    let logs = state.run_logs.lock().unwrap();
+    Ok(match logs.get(&run_id) {
+        Some(events) => compute_run_vitals(events),
+        None => RunVitals::default(),
+    })
+}
+
+#[tauri::command]
 pub async fn send_chat(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -4484,6 +4878,20 @@ pub struct ModelInfo {
     pub context_size: Option<u32>,
 }
 
+/// Anthropic has no model-discovery endpoint, so the frontier escalation
+/// targets are listed statically (mirrors The Reef's approach). Dashed IDs
+/// only — dotted aliases are rejected by some auth endpoints. Keep current
+/// when new models ship. These are the models Beetle can escalate TO when a
+/// local run gets stuck: she works locally 90% of the time and reaches up the
+/// ladder — to her human, or to a frontier model that reads the same card,
+/// repo, and memory — when she needs an assist.
+const ANTHROPIC_MODEL_IDS: &[&str] = &[
+    "claude-opus-4-8",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+];
+
 #[tauri::command]
 pub async fn fetch_local_models(url: String, provider: String) -> Result<Vec<ModelInfo>, String> {
     let base_url = url.trim_end_matches('/');
@@ -4578,7 +4986,35 @@ pub async fn fetch_local_models(url: String, provider: String) -> Result<Vec<Mod
         None
     };
 
-    if provider == "lmstudio" {
+    // Fetch strategy is keyed off the SAME provider_kind that call_llm uses to
+    // route chat, so the dropdown can never again disagree with chat about what
+    // a provider string means. (The original bug: this function bucketed
+    // "custom" WITH "ollama" and hit /api/tags + /api/ps first, so the
+    // default-seeded "custom" provider pointed at LM Studio on port 11434 —
+    // Ollama's port — got the wrong dialect, LM Studio shimmed an unhelpful
+    // 200, and the dropdown starved while chat worked fine.)
+    let kind = provider_kind(&provider.to_lowercase());
+
+    // Anthropic exposes no model-discovery endpoint — return the static
+    // escalation catalogue rather than probing.
+    if kind == ProviderKind::Anthropic {
+        return Ok(ANTHROPIC_MODEL_IDS
+            .iter()
+            .map(|id| ModelInfo {
+                name: id.to_string(),
+                is_loaded: true,
+                context_size: Some(200_000),
+            })
+            .collect());
+    }
+
+    let is_ollama_first = kind == ProviderKind::OllamaNative;
+
+    // LM Studio's native /api/v1/models list is richer than its OpenAI-compat
+    // shim (real loaded state, configured context length). Try it for any
+    // non-Ollama provider, since "custom" is the common way to point at LM
+    // Studio without selecting the dedicated provider.
+    if !is_ollama_first {
         let root = base_url
             .trim_end_matches("/api/v1/chat")
             .trim_end_matches("/api/v1")
@@ -4595,8 +5031,7 @@ pub async fn fetch_local_models(url: String, provider: String) -> Result<Vec<Mod
         }
     }
 
-    // If LM Studio or OpenAI is selected, skip Ollama-specific endpoints entirely
-    if provider != "custom" && provider != "ollama" {
+    if !is_ollama_first {
         let mut candidates = vec![
             format!("{}/models", base_url),
             format!("{}/v1/models", base_url),
@@ -4626,8 +5061,38 @@ pub async fn fetch_local_models(url: String, provider: String) -> Result<Vec<Mod
                 }
             }
         }
+
+        // Last-resort Ollama probe: a "custom" provider could legitimately be
+        // pointed at an Ollama server. Only reached after LM Studio native and
+        // OpenAI-compat /models have all failed, so it never fires first for
+        // an LM Studio endpoint that answers /v1/models.
+        let tags_url = format!("{}/api/tags", base_url);
+        if let Ok(resp) = ureq::get(&tags_url)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+        {
+            if resp.status() == 200 {
+                if let Ok(json) = resp.into_json::<serde_json::Value>() {
+                    if let Some(models) = json.get("models").and_then(|v| v.as_array()) {
+                        let mut models_list = Vec::new();
+                        for m in models {
+                            if let Some(name) = m.get("name").and_then(|v| v.as_str()) {
+                                models_list.push(ModelInfo {
+                                    name: name.to_string(),
+                                    is_loaded: false,
+                                    context_size: None,
+                                });
+                            }
+                        }
+                        if !models_list.is_empty() {
+                            return Ok(models_list);
+                        }
+                    }
+                }
+            }
+        }
     } else {
-        // For custom (Ollama), try Ollama specific endpoints first
+        // Genuine Ollama provider: Ollama-specific endpoints first.
         let tags_url = format!("{}/api/tags", base_url);
         if let Ok(resp) = ureq::get(&tags_url)
             .timeout(std::time::Duration::from_secs(3))
@@ -4963,8 +5428,8 @@ fn construct_agent_system_prompt(
          6. `git_status()`: Runs `git status` in the sandbox.\n\
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
          8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
-         9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. The target must match byte-for-byte including quotes and whitespace; if the snippet contains quotes or escapes, use replace_lines instead.\n\
-         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). THE tool for fixing compiler errors: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. NEVER rewrite a whole file to fix a one-line error. Line numbers SHIFT after any edit that changes line count, and the harness REFUSES an edit made with stale numbers — to make several edits to one file in a row, work bottom-to-top (highest line numbers first; lines below an edit keep their numbers), or re-read between edits.\n\
+         9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. THE tool for a SINGLE-LINE fix: target = the exact TEXT of the broken line (copied without read_file's line-number prefix — target is text, NEVER a line number), replacement = the corrected line — no line numbers involved, so it either lands exactly or refuses cleanly; it cannot hit the wrong line. The target must match byte-for-byte including quotes and whitespace; if you cannot reproduce the snippet exactly, use replace_lines. Also the safest way to INSERT new lines (a missing brace, an import): target = an existing anchor line, replacement = that same line plus the new content — anchored insertion can't land in the wrong place and survives line-number drift.\n\
+         10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). To INSERT without deleting, replace one anchor line with itself plus the new lines. THE tool for multi-line edits and for fixes where the broken text is hard to quote exactly: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. For a single broken line you CAN quote exactly, prefer patch_file. NEVER rewrite a whole file to fix a one-line error, and NEVER widen the range when an edit misses — the result message echoes the edit site with current numbers: verify, aim, and fix the ONE line. Line numbers SHIFT after any edit that changes line count, and the harness REFUSES an edit made with stale numbers — to make several edits to one file in a row, work bottom-to-top (highest line numbers first; lines below an edit keep their numbers), or re-read between edits.\n\
          11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
          12. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
          13. `read_card()`: Shows YOUR current card: title, description, status, and its todo list with indices. Read it at the start of a run and use the todos as your work plan.\n\
@@ -5291,6 +5756,27 @@ fn extract_tool_args(val: &serde_json::Value) -> serde_json::Value {
             return parsed;
         }
     }
+    // Flattened-args recovery: some models (e.g. Qwen3.5 emitting text-protocol
+    // calls) write the arguments as SIBLINGS of "name" rather than under an
+    // args/arguments/parameters wrapper — {"name":"list_dir","path":"src"}.
+    // Without this, those arguments silently vanish: the call parses with a
+    // valid name and null args, the tool runs with defaults (list_dir lists the
+    // root no matter which path was asked for), and the model loops. Only kick
+    // in when no explicit wrapper was found, and skip the call's own metadata
+    // keys so we don't mistake them for arguments.
+    if args.is_null() {
+        if let Some(obj) = val.as_object() {
+            const META_KEYS: [&str; 6] = ["name", "tool", "type", "id", "index", "function"];
+            let recovered: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .filter(|(k, _)| !META_KEYS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            if !recovered.is_empty() {
+                return serde_json::Value::Object(recovered);
+            }
+        }
+    }
     args
 }
 
@@ -5384,12 +5870,31 @@ fn repair_relaxed_json(s: &str) -> String {
             '`' => {
                 // JS template-literal habit: a backtick-delimited value. JSON
                 // has no backtick strings, and the payload may contain NESTED
-                // backticks (template literals inside the code being passed),
-                // so match greedily to the LAST backtick in the input and
-                // JSON-escape the span. Code payloads are typically the final
-                // argument, which makes greedy matching correct in practice.
-                if let Some(rel_close) = chars[i + 1..].iter().rposition(|&ch| ch == '`') {
-                    let close = i + 1 + rel_close;
+                // backticks (template literals inside code), so the closer is
+                // the FIRST backtick followed (after optional whitespace) by
+                // ',' or '}' or end-of-input — a plausible value terminator.
+                // Nested template-literal backticks sit against code characters
+                // and never qualify. (Plain greedy-to-last-backtick swallowed a
+                // following `path:` argument into the content string when the
+                // model backtick-quoted TWO values in one call — field failure.)
+                let rest = &chars[i + 1..];
+                let mut rel_close: Option<usize> = None;
+                for (j, &ch) in rest.iter().enumerate() {
+                    if ch != '`' {
+                        continue;
+                    }
+                    let mut k = j + 1;
+                    while k < rest.len() && rest[k].is_whitespace() {
+                        k += 1;
+                    }
+                    if k >= rest.len() || rest[k] == ',' || rest[k] == '}' {
+                        rel_close = Some(j);
+                        break;
+                    }
+                }
+                let rel_close = rel_close.or_else(|| rest.iter().rposition(|&ch| ch == '`'));
+                if let Some(rel) = rel_close {
+                    let close = i + 1 + rel;
                     out.push('"');
                     for &ch in &chars[i + 1..close] {
                         match ch {
@@ -5669,52 +6174,67 @@ fn parse_tool_call_at(
         return Some((name, args, 0, response_cleaned.len()));
     }
 
-    // Bare function-call syntax in the response body (e.g. `list_dir(path="src")`),
+    // Bare-syntax calls in the response body (e.g. `list_dir(path="src")`),
     // anchored to known tool names so ordinary prose can't false-positive.
+    // Scan ALL tools and all three pattern forms, then take the TEXTUALLY
+    // EARLIEST match. Iterating the tool array and returning on the first hit
+    // would let the ARRAY's order decide which call wins: with
+    // `call:list_dir{...}` followed by `call:read_file{...}`, read_file's
+    // earlier position in KNOWN_TOOLS made the scanner return the SECOND call
+    // and demote the first to preamble prose (caught by the multi-call
+    // regression test). Earliest-wins also subsumes the old rule that the
+    // `call:`-prefixed form must beat the bare brace form: for the same
+    // physical call, the prefix form starts earlier.
+    let mut best: Option<(String, serde_json::Value, usize, usize)> = None;
     for tool in KNOWN_TOOLS {
         let pat = format!("{}(", tool);
         if let Some(idx) = response_cleaned.find(&pat) {
-            let paren_idx = idx + tool.len();
-            let call_end = find_matching_delim_bytes(response_cleaned, paren_idx, b'(', b')')
-                .map(|c| c + 1)
-                .unwrap_or(response_cleaned.len());
-            if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..call_end]) {
-                if name == tool {
-                    return Some((name, args, idx, call_end));
+            if best.as_ref().map(|b| idx < b.2).unwrap_or(true) {
+                let paren_idx = idx + tool.len();
+                let call_end = find_matching_delim_bytes(response_cleaned, paren_idx, b'(', b')')
+                    .map(|c| c + 1)
+                    .unwrap_or(response_cleaned.len());
+                if let Some((name, args)) = parse_function_syntax(&response_cleaned[idx..call_end]) {
+                    if name == tool {
+                        best = Some((name, args, idx, call_end));
+                    }
                 }
             }
         }
-        // The `call:`-prefixed form must be checked BEFORE the bare brace form:
-        // the bare pattern is a substring of it, and matching the bare form first
-        // would leave a dangling "call:" classified as preamble prose.
         let pat_prefix = format!("call:{}{{", tool);
         if let Some(idx) = response_cleaned.find(&pat_prefix) {
-            let brace_idx = idx + pat_prefix.len() - 1;
-            // Slice the parse input to the balanced span: parse_qwen_syntax uses
-            // rfind('}') internally, which would otherwise swallow a SECOND
-            // brace-style call later in the response (latent single-call bug).
-            let call_end = find_matching_delim_bytes(response_cleaned, brace_idx, b'{', b'}')
-                .map(|c| c + 1)
-                .unwrap_or(response_cleaned.len());
-            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..call_end]) {
-                if name == tool {
-                    return Some((name, args, idx, call_end));
+            if best.as_ref().map(|b| idx < b.2).unwrap_or(true) {
+                let brace_idx = idx + pat_prefix.len() - 1;
+                // Slice the parse input to the balanced span: parse_qwen_syntax uses
+                // rfind('}') internally, which would otherwise swallow a SECOND
+                // brace-style call later in the response.
+                let call_end = find_matching_delim_bytes(response_cleaned, brace_idx, b'{', b'}')
+                    .map(|c| c + 1)
+                    .unwrap_or(response_cleaned.len());
+                if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..call_end]) {
+                    if name == tool {
+                        best = Some((name, args, idx, call_end));
+                    }
                 }
             }
         }
-        // Bare Qwen/Hermes-style JSON calls in the response body (e.g. `list_dir{"path": "src"}`)
         let pat_brace = format!("{}{{", tool);
         if let Some(idx) = response_cleaned.find(&pat_brace) {
-            let brace_idx = idx + tool.len();
-            let call_end = find_matching_delim_bytes(response_cleaned, brace_idx, b'{', b'}')
-                .map(|c| c + 1)
-                .unwrap_or(response_cleaned.len());
-            if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..call_end]) {
-                if name == tool {
-                    return Some((name, args, idx, call_end));
+            if best.as_ref().map(|b| idx < b.2).unwrap_or(true) {
+                let brace_idx = idx + tool.len();
+                let call_end = find_matching_delim_bytes(response_cleaned, brace_idx, b'{', b'}')
+                    .map(|c| c + 1)
+                    .unwrap_or(response_cleaned.len());
+                if let Some((name, args)) = parse_qwen_syntax(&response_cleaned[idx..call_end]) {
+                    if name == tool {
+                        best = Some((name, args, idx, call_end));
+                    }
                 }
             }
         }
+    }
+    if best.is_some() {
+        return best;
     }
 
     None
@@ -6377,6 +6897,20 @@ fn replace_lines_impl(
     }
     let removed = end_line - start_line + 1;
     let delta = inserted as i64 - removed as i64;
+    // Echo the edit site with CURRENT line numbers: a missed aim becomes
+    // visible in this very result — not three steps later in a compiler error
+    // read against drifted coordinates. (This spiral was observed in the
+    // field: a single-line fix escalating through 10+ widening multi-line
+    // attempts that never touched the actual error.)
+    let win_start = start_line.saturating_sub(3).max(1);
+    let win_end = (start_line + inserted + 2).min(out.len());
+    let mut echo = String::new();
+    for n in win_start..=win_end {
+        if let Some(l) = out.get(n - 1) {
+            let clipped: String = l.chars().take(120).collect();
+            echo.push_str(&format!("\n{:>5} | {}", n, clipped));
+        }
+    }
     let shift_note = if delta != 0 {
         format!(
             " Line numbers at/after line {} have now shifted by {:+}; lines BELOW {} are unchanged — chain multiple edits bottom-to-top (highest line numbers first), or re-read before the next line-numbered edit.",
@@ -6387,13 +6921,14 @@ fn replace_lines_impl(
     };
     (
         format!(
-            "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). First removed line was: `{}`. If that is NOT the line you expected to remove, the file has changed since you read it — re-read the section before further edits.{}",
+            "Success: replaced lines {}-{} of '{}' ({} line(s) removed, {} inserted). First removed line was: `{}`. The edit site now reads (CURRENT line numbers):{}\nVerify this is what you intended; if not, correct it using these numbers.{}",
             start_line,
             end_line,
             path,
             removed,
             inserted,
             first_removed,
+            echo,
             shift_note
         ),
         delta,
@@ -6467,7 +7002,7 @@ fn patch_file_impl(
         Ok(content) => {
             let matches: Vec<_> = content.match_indices(target_str).collect();
             if matches.is_empty() {
-                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If the snippet contains quotes or escapes, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.", path);
+                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If you copied the target from read_file output, remove the leading line numbers — target must match the file's RAW text. If the snippet contains quotes or escapes you cannot reproduce exactly, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.", path);
             }
             if matches.len() > 1 {
                 return format!(
@@ -6484,6 +7019,270 @@ fn patch_file_impl(
         }
         Err(e) => format!("Error reading file: {}", e),
     }
+}
+
+/// The canonical tool names the parser/dispatcher knows. Used by
+/// `looks_like_malformed_tool_call` to tell a botched call (the model named a
+/// real tool but mangled the syntax) apart from ordinary prose.
+const KNOWN_TOOL_NAMES: [&str; 23] = [
+    "read_file", "outline_file", "write_file", "list_dir", "git_status",
+    "git_diff", "run_command", "web_search", "send_notification", "task_complete",
+    "search_grep", "find_file", "find_symbol", "remember", "recall", "list_cards",
+    "create_card", "update_card", "delete_card", "read_card", "set_todo",
+    "replace_lines", "patch_file",
+];
+
+/// Bucket a tool result into a coarse, STABLE `failure_reason` for harness
+/// telemetry (the per-run vitals panel and the stuck-detector both key on it).
+/// Returns None for any result that isn't an error — successes and the raw
+/// content tools like read_file return both land here as "not a failure".
+/// The buckets are deliberately few: adding one is a schema decision, since
+/// downstream aggregation groups by these exact strings. Order matters —
+/// the most specific patterns must come first. Strings are matched against
+/// the human-readable errors `execute_tool` and the `_impl` helpers return,
+/// so this function and those messages must move together.
+fn classify_failure_reason(result: &str) -> Option<&'static str> {
+    if !result.trim_start().starts_with("Error") {
+        return None;
+    }
+    // Wrong-tool / chimera calls: patch args on replace_lines or vice versa.
+    if result.contains("NOT executed")
+        && (result.contains("replace_lines argument")
+            || result.contains("patch_file argument"))
+    {
+        return Some("wrong_tool_args");
+    }
+    // A line number handed to patch_file's text `target`.
+    if result.contains("must be the exact text") || result.contains("not a line number") {
+        return Some("line_number_as_text");
+    }
+    // Edit using line numbers that drifted after an earlier same-file edit.
+    if result.contains("already modified this session") || result.contains("have shifted") {
+        return Some("stale_lines");
+    }
+    // patch_file target text absent from the file.
+    if result.contains("Target text not found") {
+        return Some("no_match");
+    }
+    // patch_file target text not unique.
+    if result.contains("Target text occurs") {
+        return Some("ambiguous_match");
+    }
+    // replace_lines line range outside the file.
+    if result.contains("invalid line range")
+        || result.contains("is past end of file")
+        || result.contains("is before start_line")
+    {
+        return Some("line_out_of_range");
+    }
+    if result.contains("Missing") && result.contains("argument") {
+        return Some("missing_arg");
+    }
+    Some("other_error")
+}
+
+/// Heuristic: did the model TRY to emit a tool call but produce something
+/// `parse_tool_calls_all` couldn't read? Returns a coarse reason when the text
+/// carries unmistakable tool-call debris, None when it reads as genuine prose
+/// (a real question for the human). Only called AFTER parsing returned nothing,
+/// so any positive here is by definition an attempt the parser rejected. Kept
+/// conservative on purpose: a false positive nudges a model that was actually
+/// asking a question, which is worse than missing one malformed call.
+fn looks_like_malformed_tool_call(text: &str) -> Option<&'static str> {
+    // Native chat-template tags the parser tried and failed to close/parse.
+    if text.contains("<tool_call")
+        || text.contains("tool_call|>")
+        || text.contains("|tool_call")
+    {
+        return Some("unparsed_tool_tag");
+    }
+    // A JSON-ish object that names a key but never parsed as a call.
+    if (text.contains("\"name\"") || text.contains("'name'")) && text.contains('{') {
+        return Some("unparsed_json_call");
+    }
+    // A fenced ```tool_call / ```json block whose body didn't parse.
+    if (text.contains("```tool_call") || text.contains("```json"))
+        && text.contains('{')
+    {
+        return Some("unparsed_fenced_block");
+    }
+    // Bare `tool_name(...)` function syntax for a tool we actually have.
+    for name in KNOWN_TOOL_NAMES {
+        if let Some(idx) = text.find(name) {
+            if text[idx + name.len()..].trim_start().starts_with('(') {
+                return Some("unparsed_function_syntax");
+            }
+        }
+    }
+    None
+}
+
+/// Collapse whitespace runs to single spaces, trim, and cap length so two
+/// edits that differ only in indentation/reflow hash to the same signature.
+/// Bounded so a huge replacement body doesn't bloat the in-memory map.
+fn normalize_anchor(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+/// Signature for a MUTATING edit, used by the stuck-edit detector. Keyed on
+/// (tool, path, edit body) — deliberately NOT on line numbers, so a re-read
+/// that shifts coordinates but retries the same edit collapses to one
+/// signature. Returns None for non-edit tools or calls with no usable path
+/// (those failures are caught by the malformed/consecutive guards instead).
+fn edit_failure_signature(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    let path = args.get("path").and_then(|p| p.as_str())?;
+    let anchor = match tool_name {
+        "patch_file" => args.get("target").and_then(|t| t.as_str())?,
+        "replace_lines" => args.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+        _ => return None,
+    };
+    Some(format!("{}\u{1f}{}\u{1f}{}", tool_name, path, normalize_anchor(anchor)))
+}
+
+/// Tools that only observe (no repo mutation). Anything mutating or neither
+/// (run_command, web_search, notifications, task_complete) is not a "read";
+/// only the mutating set counts as a "write". The read:write ratio is a
+/// retrieval-quality proxy — lots of reads per write means she's hunting.
+const READ_TOOLS: [&str; 11] = [
+    "read_file", "outline_file", "list_dir", "git_status", "git_diff",
+    "search_grep", "find_file", "find_symbol", "read_card", "list_cards", "recall",
+];
+const WRITE_TOOLS: [&str; 8] = [
+    "write_file", "replace_lines", "patch_file", "create_card", "update_card",
+    "delete_card", "set_todo", "remember",
+];
+
+/// Sort a name→count map into a Vec ordered by count desc, then name asc for
+/// stable output.
+fn histogram_sorted(map: std::collections::HashMap<String, u32>) -> Vec<(String, u32)> {
+    let mut v: Vec<(String, u32)> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+/// Derive a run's vitals from its ordered event log. Pure over the events so it
+/// can be unit-tested with fixtures; the command wrapper just supplies them.
+fn compute_run_vitals(events: &[RunEvent]) -> RunVitals {
+    let mut v = RunVitals::default();
+    let mut failure_reasons: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut malformed_reasons: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut per_tool: std::collections::HashMap<String, ToolStat> =
+        std::collections::HashMap::new();
+    // Edit-signature streaks, replayed exactly like the live stuck detector so
+    // the panel and the run loop agree on what "stuck" means. tool_result
+    // payloads don't carry args, so pair each result with the preceding call.
+    let mut edit_streaks: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut last_call: Option<(String, serde_json::Value)> = None;
+    // Running sums for throughput averages; each tracks its own sample count so
+    // a call that reported TTFT but not tok/s doesn't skew the rate averages.
+    let (mut ttft_sum, mut ttft_n) = (0.0_f64, 0u32);
+    let (mut ptps_sum, mut ptps_n) = (0.0_f64, 0u32);
+    let (mut dtps_sum, mut dtps_n) = (0.0_f64, 0u32);
+
+    for ev in events {
+        match ev.event_type.as_str() {
+            "reasoning" => v.reasoning_events += 1,
+            "metrics" => {
+                v.llm_calls += 1;
+                if let Ok(p) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+                    if let Some(x) = p.get("ttft_ms").and_then(|x| x.as_f64()) {
+                        ttft_sum += x;
+                        ttft_n += 1;
+                    }
+                    if let Some(x) = p.get("prompt_tps").and_then(|x| x.as_f64()) {
+                        ptps_sum += x;
+                        ptps_n += 1;
+                    }
+                    if let Some(x) = p.get("decode_tps").and_then(|x| x.as_f64()) {
+                        dtps_sum += x;
+                        dtps_n += 1;
+                    }
+                    if p.get("approx").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        v.decode_tps_approx = true;
+                    }
+                }
+            }
+            "malformed" => {
+                v.malformed += 1;
+                if let Ok(p) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+                    if let Some(r) = p.get("failure_reason").and_then(|r| r.as_str()) {
+                        *malformed_reasons.entry(r.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+            "tool_call" => {
+                if let Ok(p) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+                    if let Some(name) = p.get("name").and_then(|n| n.as_str()) {
+                        let args = p.get("args").cloned().unwrap_or(serde_json::Value::Null);
+                        last_call = Some((name.to_string(), args));
+                    }
+                }
+            }
+            "tool_result" => {
+                let p = match serde_json::from_str::<serde_json::Value>(&ev.payload) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let failed = p.get("failed").and_then(|f| f.as_bool()).unwrap_or(false);
+                v.total_calls += 1;
+                if failed {
+                    v.failures += 1;
+                } else {
+                    v.successes += 1;
+                }
+                if READ_TOOLS.contains(&name.as_str()) {
+                    v.reads += 1;
+                } else if WRITE_TOOLS.contains(&name.as_str()) {
+                    v.writes += 1;
+                }
+                let stat = per_tool.entry(name.clone()).or_default();
+                stat.name = name.clone();
+                stat.calls += 1;
+                if failed {
+                    stat.failures += 1;
+                    if let Some(r) = p.get("failure_reason").and_then(|r| r.as_str()) {
+                        *failure_reasons.entry(r.to_string()).or_insert(0) += 1;
+                    }
+                }
+                // Edit-retry streak, using the paired call's args for the signature.
+                if let Some((call_name, call_args)) = &last_call {
+                    if *call_name == name {
+                        if let Some(sig) = edit_failure_signature(&name, call_args) {
+                            if failed {
+                                let n = edit_streaks.entry(sig).or_insert(0);
+                                *n += 1;
+                                v.worst_edit_retry_streak = v.worst_edit_retry_streak.max(*n);
+                            } else {
+                                edit_streaks.remove(&sig);
+                            }
+                        }
+                    }
+                }
+                last_call = None;
+            }
+            _ => {}
+        }
+    }
+
+    v.failure_reasons = histogram_sorted(failure_reasons);
+    v.malformed_reasons = histogram_sorted(malformed_reasons);
+    let mut tools: Vec<ToolStat> = per_tool.into_values().collect();
+    tools.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.name.cmp(&b.name)));
+    v.per_tool = tools;
+    let avg = |sum: f64, n: u32| if n > 0 { Some(sum / n as f64) } else { None };
+    v.avg_ttft_ms = avg(ttft_sum, ttft_n);
+    v.avg_prompt_tps = avg(ptps_sum, ptps_n);
+    v.avg_decode_tps = avg(dtps_sum, dtps_n);
+    v
 }
 
 fn execute_tool(
@@ -7104,17 +7903,36 @@ fn execute_tool(
             format!("Success: card '{}' deleted.", removed.title)
         }
         "patch_file" => {
+            const USAGE: &str = " Usage: patch_file(path: String, target: String, replacement: String) — target is the EXACT TEXT currently in the file (copied without read_file's line-number prefix), NEVER a line number.";
+            // Chimera-call diagnosis (field failure): a model mixing patch_file's
+            // name with replace_lines' body deserves to be told which tool its
+            // arguments belong to, not a generic missing-arg error.
+            if args.get("start_line").is_some()
+                || args.get("end_line").is_some()
+                || args.get("content").is_some()
+            {
+                return format!(
+                    "Error: NOT executed — start_line/end_line/content are replace_lines arguments, not patch_file arguments. Either call replace_lines(path: String, start_line: int, end_line: int, content: String) with those line numbers, or call patch_file with ONLY path, target (the line's exact current text), and replacement.{}",
+                    USAGE
+                );
+            }
+            if args.get("target").map(|t| t.is_number()).unwrap_or(false) {
+                return format!(
+                    "Error: NOT executed — 'target' must be the exact text to replace, not a line number. To edit by line numbers, use replace_lines(path, start_line, end_line, content). To use patch_file, set target to the exact current text of the line.{}",
+                    USAGE
+                );
+            }
             let path = match args.get("path").and_then(|p| p.as_str()) {
                 Some(p) => p,
-                None => return "Error: Missing path argument".to_string(),
+                None => return format!("Error: Missing path argument.{}", USAGE),
             };
             let target_str = match args.get("target").and_then(|t| t.as_str()) {
                 Some(t) => t,
-                None => return "Error: Missing target argument".to_string(),
+                None => return format!("Error: Missing target argument.{}", USAGE),
             };
             let replacement_str = match args.get("replacement").and_then(|r| r.as_str()) {
                 Some(r) => r,
-                None => return "Error: Missing replacement argument".to_string(),
+                None => return format!("Error: Missing replacement argument.{}", USAGE),
             };
             let result = patch_file_impl(worktree_path, path, target_str, replacement_str);
             if result.starts_with("Success") {
@@ -7137,6 +7955,16 @@ fn execute_tool(
         }
         "replace_lines" => {
             const USAGE: &str = " Usage: replace_lines(path: String, start_line: int, end_line: int, content: String) — path is the file to edit, relative to the project root (the same path you passed to read_file).";
+            // Mirror of patch_file's chimera diagnosis: patch-shaped arguments
+            // sent to the line-numbered tool get routed, not stonewalled.
+            if (args.get("target").is_some() || args.get("replacement").is_some())
+                && (args.get("start_line").is_none() || args.get("end_line").is_none())
+            {
+                return format!(
+                    "Error: NOT executed — target/replacement are patch_file arguments. Either call patch_file(path: String, target: String, replacement: String) with the exact current text, or call replace_lines with path, start_line, end_line, and content.{}",
+                    USAGE
+                );
+            }
             let path = match args.get("path").and_then(|p| p.as_str()) {
                 Some(p) => p,
                 None => return format!("Error: Missing 'path' argument.{}", USAGE),
@@ -7313,6 +8141,16 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
         // Consecutive responses with no tool call and no visible content — a
         // truncated or all-reasoning response is a stall, not a user question.
         let mut empty_response_streak: u32 = 0;
+        // Consecutive responses that LOOKED like a tool call but didn't parse.
+        // Capped so a model that can't be coaxed into valid syntax still blocks
+        // rather than nudging forever.
+        let mut malformed_streak: u32 = 0;
+        // Per-edit-signature failure tally for the stuck-edit detector. Unlike
+        // the consecutive guard, an intervening read does NOT reset this — the
+        // fail → read → retry-same-edit loop is exactly what we're catching. A
+        // signature clears only when that edit finally SUCCEEDS.
+        let mut edit_failure_counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
 
         'run: loop {
             {
@@ -7480,6 +8318,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
 
                 // Loop-guard: track consecutive identical calls.
                 empty_response_streak = 0;
+                malformed_streak = 0;
                 let signature = format!("{}:{}", tool_name, args);
                 if last_tool_signature.as_deref() == Some(signature.as_str()) {
                     repeat_count += 1;
@@ -7525,6 +8364,35 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     ));
                 }
 
+                // Tag the outcome for harness telemetry: `failed` drives the
+                // success/fail split on the vitals panel; `failure_reason`
+                // buckets the why so the stuck-detector can match repeated
+                // same-cause failures across intervening reads.
+                let failed = tool_result.trim_start().starts_with("Error");
+                let failure_reason = classify_failure_reason(&tool_result);
+
+                // Stuck-edit detector: count repeated failures of the SAME edit
+                // (tool+path+body), surviving intervening reads. Nudge harder at
+                // 2, hard-block at 3 — the ladder we agreed on: nudge, let her
+                // retry, push the issue up if the same edit fails again. A
+                // success clears the signature so honest progress never trips it.
+                let mut stuck_edit_n: u32 = 0;
+                if let Some(sig) = edit_failure_signature(&tool_name, &args) {
+                    if failed {
+                        let n = edit_failure_counts.entry(sig).or_insert(0);
+                        *n += 1;
+                        stuck_edit_n = *n;
+                        if stuck_edit_n == 2 {
+                            tool_result.push_str(&format!(
+                                "\n\n[harness note: this exact {} has now failed {} times, including across re-reads — retrying it unchanged will not work. The text or lines you're targeting are not where you think they are. Re-read the precise region with read_file(start_line, end_line) to refresh your coordinates, switch tools (patch_file ⇄ replace_lines), or anchor on different text.]",
+                                tool_name, stuck_edit_n
+                            ));
+                        }
+                    } else {
+                        edit_failure_counts.remove(&sig);
+                    }
+                }
+
                 append_run_event(
                     &app_handle_clone,
                     &state,
@@ -7535,6 +8403,8 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                         payload: serde_json::json!({
                             "name": tool_name.clone(),
                             "result": tool_result,
+                            "failed": failed,
+                            "failure_reason": failure_reason,
                         })
                         .to_string(),
                     },
@@ -7542,6 +8412,36 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
 
                 let _ = app_handle_clone
                     .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+
+                // Hard-block once the same edit has failed three times. The
+                // failing result above is already logged; now surface WHY (file
+                // + failure bucket) so the user — or, later, a frontier assist —
+                // can pick it up with full context instead of a bare "stuck".
+                if stuck_edit_n >= 3 {
+                    log_error(&format!(
+                        "Run {} blocked: edit via '{}' failed {} times on the same target ({})",
+                        run_id_clone,
+                        tool_name,
+                        stuck_edit_n,
+                        failure_reason.unwrap_or("error")
+                    ));
+                    let edit_path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                    append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "blocked".to_string(),
+                        payload: serde_json::json!({
+                            "reason": "stuck_edit",
+                            "tool": tool_name.clone(),
+                            "path": edit_path,
+                            "failure_reason": failure_reason,
+                            "message": format!("The agent tried the same edit to '{}' via {} {} times and it failed every time ({}). It can't get past this edit on its own. Reply in chat to redirect it.", edit_path, tool_name, stuck_edit_n, failure_reason.unwrap_or("error"))
+                        }).to_string(),
+                    });
+                    set_card_status(&app_handle_clone, &state, &card_id, "blocked");
+                    let _ = app_handle_clone
+                        .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                    break 'run;
+                }
 
                 // task_complete moves the card to `review` (done inside execute_tool).
                 // Break the loop immediately so the next iteration can't overwrite that
@@ -7559,6 +8459,55 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 }
             } else {
                 let visible = remaining.trim();
+
+                // Malformed tool call: the model produced content that reads as
+                // a tool-call ATTEMPT but the parser couldn't extract one. This
+                // is distinct from a genuine question — blocking-and-waiting on
+                // it would strand the run on a formatting slip (the failure mode
+                // we see most with small models). Log it for the vitals panel +
+                // stuck-detector, nudge with the exact reference format, and
+                // keep going. Only a persistent malformed stall (after repeated
+                // nudges) falls through to the block path below.
+                if !visible.is_empty() && malformed_streak < 3 {
+                    if let Some(reason) = looks_like_malformed_tool_call(visible) {
+                        malformed_streak += 1;
+                        append_run_event(
+                            &app_handle_clone,
+                            &state,
+                            &run_id_clone,
+                            RunEvent {
+                                run_id: run_id_clone.clone(),
+                                event_type: "malformed".to_string(),
+                                payload: serde_json::json!({
+                                    "failure_reason": reason,
+                                    // Bounded sample of the offending text so the
+                                    // panel can show WHAT didn't parse without
+                                    // storing a whole runaway response.
+                                    "attempt": visible.chars().take(600).collect::<String>(),
+                                })
+                                .to_string(),
+                            },
+                        );
+                        append_run_event(
+                            &app_handle_clone,
+                            &state,
+                            &run_id_clone,
+                            RunEvent {
+                                run_id: run_id_clone.clone(),
+                                event_type: "message".to_string(),
+                                payload: serde_json::json!({
+                                    "role": "user",
+                                    "content": "[harness note: your last message looked like a tool call but could not be parsed. Emit EXACTLY ONE tool call as a fenced block — three backticks, then `tool_call`, then a JSON object with \"name\" and \"args\", then three backticks:\n```tool_call\n{\n  \"name\": \"read_file\",\n  \"args\": { \"path\": \"src/main.ts\" }\n}\n```\nNo prose inside the fence. Try again now.]"
+                                })
+                                .to_string(),
+                            },
+                        );
+                        let _ = app_handle_clone
+                            .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
 
                 // A response with no tool call AND no visible content is not a
                 // question — the reasoning consumed the whole output budget, or
@@ -7827,6 +8776,102 @@ BeetleAI
     }
 
     #[test]
+    fn test_compute_run_vitals() {
+        fn ev(t: &str, payload: serde_json::Value) -> RunEvent {
+            RunEvent { run_id: "r".into(), event_type: t.into(), payload: payload.to_string() }
+        }
+        let edit_args = serde_json::json!({"path":"a.rs","content":"x"});
+        let events = vec![
+            ev("reasoning", serde_json::json!("thinking")),
+            // read: success
+            ev("tool_call", serde_json::json!({"name":"read_file","args":{"path":"a.rs"}})),
+            ev("tool_result", serde_json::json!({"name":"read_file","result":"...","failed":false,"failure_reason":null})),
+            // edit fails twice (same signature) then succeeds → streak 2, then cleared
+            ev("tool_call", serde_json::json!({"name":"replace_lines","args":edit_args})),
+            ev("tool_result", serde_json::json!({"name":"replace_lines","result":"Error: invalid line range","failed":true,"failure_reason":"line_out_of_range"})),
+            ev("tool_call", serde_json::json!({"name":"replace_lines","args":edit_args})),
+            ev("tool_result", serde_json::json!({"name":"replace_lines","result":"Error: invalid line range","failed":true,"failure_reason":"line_out_of_range"})),
+            ev("tool_call", serde_json::json!({"name":"replace_lines","args":edit_args})),
+            ev("tool_result", serde_json::json!({"name":"replace_lines","result":"Success","failed":false,"failure_reason":null})),
+            // a malformed attempt
+            ev("malformed", serde_json::json!({"failure_reason":"unparsed_json_call","attempt":"{..."})),
+            // two LLM calls with throughput; one decode rate is estimated
+            ev("metrics", serde_json::json!({"ttft_ms":800.0,"total_ms":2000.0,"prompt_tps":600.0,"decode_tps":40.0,"approx":false})),
+            ev("metrics", serde_json::json!({"ttft_ms":1200.0,"total_ms":3000.0,"prompt_tps":null,"decode_tps":50.0,"approx":true})),
+        ];
+        let v = compute_run_vitals(&events);
+        assert_eq!(v.llm_calls, 2);
+        assert_eq!(v.avg_ttft_ms, Some(1000.0));
+        assert_eq!(v.avg_decode_tps, Some(45.0));
+        assert_eq!(v.avg_prompt_tps, Some(600.0), "only the call that reported prompt_tps counts");
+        assert!(v.decode_tps_approx, "one sample was estimated");
+        assert_eq!(v.total_calls, 4);
+        assert_eq!(v.successes, 2);
+        assert_eq!(v.failures, 2);
+        assert_eq!(v.malformed, 1);
+        assert_eq!(v.reads, 1);
+        assert_eq!(v.writes, 3);
+        assert_eq!(v.reasoning_events, 1);
+        assert_eq!(v.worst_edit_retry_streak, 2, "two failures before the edit landed");
+        assert_eq!(v.failure_reasons, vec![("line_out_of_range".to_string(), 2)]);
+        assert_eq!(v.malformed_reasons, vec![("unparsed_json_call".to_string(), 1)]);
+        let rl = v.per_tool.iter().find(|t| t.name == "replace_lines").unwrap();
+        assert_eq!((rl.calls, rl.failures), (3, 2));
+    }
+
+    #[test]
+    fn test_edit_failure_signature() {
+        // replace_lines: line numbers are NOT in the signature, so a re-read
+        // that shifts coordinates but retries the same body collapses to one.
+        let a = serde_json::json!({"path":"src/x.rs","start_line":10,"end_line":12,"content":"let y = 1;"});
+        let b = serde_json::json!({"path":"src/x.rs","start_line":20,"end_line":22,"content":"let   y = 1;"});
+        assert_eq!(
+            edit_failure_signature("replace_lines", &a),
+            edit_failure_signature("replace_lines", &b),
+            "same body at shifted lines (and reflowed whitespace) must share a signature"
+        );
+        // Different body → different signature (honest progress, not a loop).
+        let c = serde_json::json!({"path":"src/x.rs","start_line":10,"end_line":12,"content":"let z = 2;"});
+        assert_ne!(
+            edit_failure_signature("replace_lines", &a),
+            edit_failure_signature("replace_lines", &c)
+        );
+        // Non-edit tools and pathless calls produce no signature.
+        assert!(edit_failure_signature("read_file", &a).is_none());
+        assert!(edit_failure_signature("patch_file", &serde_json::json!({"target":"x"})).is_none());
+        // patch_file keys on its text target.
+        let p = serde_json::json!({"path":"a.txt","target":"foo","replacement":"bar"});
+        assert!(edit_failure_signature("patch_file", &p).is_some());
+    }
+
+    #[test]
+    fn test_parse_tool_call_flattened_args() {
+        // Qwen3.5-style emission: arguments as SIBLINGS of "name", no wrapper.
+        // Must be recovered, not dropped to null (which silently ran tools with
+        // default args — list_dir always listing root, etc.).
+        let input = r#"
+```tool_call
+{ "name": "list_dir", "path": "src" }
+```
+"#;
+        let res = parse_tool_call_spanned(input);
+        assert!(res.is_some());
+        let (name, args, _) = res.unwrap();
+        assert_eq!(name, "list_dir");
+        assert_eq!(args.get("path").unwrap().as_str().unwrap(), "src");
+    }
+
+    #[test]
+    fn test_extract_tool_args_prefers_wrapper_over_siblings() {
+        // An explicit args wrapper must win even if stray siblings exist, and a
+        // name-only call still yields null (nothing to recover).
+        let wrapped = serde_json::json!({"name":"x","args":{"a":1},"stray":2});
+        assert_eq!(extract_tool_args(&wrapped), serde_json::json!({"a":1}));
+        let name_only = serde_json::json!({"name":"recall"});
+        assert!(extract_tool_args(&name_only).is_null());
+    }
+
+    #[test]
     fn test_parse_tool_call_json_block() {
         let input = r#"
 ```json
@@ -7980,6 +9025,58 @@ BeetleAI
         assert!(msg3.contains("Line count unchanged"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_tool_call_two_backtick_values() {
+        // Field failure: TWO backtick-quoted values in one call. Greedy
+        // capture used to swallow ",path:" into the content string, leaving
+        // the call with no path at all.
+        let input = "call:patch_file{path:`src/a.ts`,target:`let x = 1;`,replacement:`let x = 2;`}";
+        let res = parse_tool_call_spanned(input);
+        assert!(res.is_some());
+        let (name, args, _) = res.unwrap();
+        assert_eq!(name, "patch_file");
+        assert_eq!(args.get("path").unwrap().as_str().unwrap(), "src/a.ts");
+        assert_eq!(args.get("target").unwrap().as_str().unwrap(), "let x = 1;");
+        assert_eq!(
+            args.get("replacement").unwrap().as_str().unwrap(),
+            "let x = 2;"
+        );
+    }
+
+    #[test]
+    fn test_normalize_for_strict_templates() {
+        // Assistant-first history with adjacent same-role messages and a
+        // trailing assistant turn — the exact shapes strict jinja templates
+        // (Mistral, Qwen) reject and Gemma silently tolerated.
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "assistant", "content": "I started"}),
+            serde_json::json!({"role": "assistant", "content": "more"}),
+            serde_json::json!({"role": "user", "content": "ok"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let out = normalize_for_strict_templates(msgs);
+        let roles: Vec<&str> = out
+            .iter()
+            .map(|m| m.get("role").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "user", "assistant", "user"]
+        );
+        // The two adjacent assistant messages were merged, not dropped.
+        let merged = out[2].get("content").unwrap().as_str().unwrap();
+        assert!(merged.contains("I started") && merged.contains("more"));
+        // Already-clean histories pass through unchanged except the guard tail.
+        let clean = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let out2 = normalize_for_strict_templates(clean);
+        assert_eq!(out2.len(), 2);
+        assert_eq!(out2[1].get("content").unwrap().as_str().unwrap(), "hi");
     }
 
     #[test]

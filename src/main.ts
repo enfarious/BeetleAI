@@ -406,6 +406,26 @@ interface RunEvent {
   payload: string;
 }
 
+interface ToolStat { name: string; calls: number; failures: number; }
+interface RunVitals {
+  total_calls: number;
+  successes: number;
+  failures: number;
+  malformed: number;
+  reads: number;
+  writes: number;
+  reasoning_events: number;
+  worst_edit_retry_streak: number;
+  failure_reasons: [string, number][];
+  malformed_reasons: [string, number][];
+  per_tool: ToolStat[];
+  llm_calls: number;
+  avg_ttft_ms: number | null;
+  avg_prompt_tps: number | null;
+  avg_decode_tps: number | null;
+  decode_tps_approx: boolean;
+}
+
 interface DirEntry {
   name: string;
   path: string;
@@ -736,8 +756,17 @@ async function setupTauriEventListeners() {
       
       await listen("run-updated", async () => {
         await refreshState();
+        // Coalesce bursts: the agent loop emits run-updated once per tool
+        // call; re-rendering the tree for each is wasted churn. (The
+        // generation guard in renderFileTreeRoot keeps it CORRECT either way.)
         if (currentProject) {
-          await renderFileTreeRoot(currentProject.path).catch((err) => console.error(err));
+          if (treeRefreshTimer !== null) clearTimeout(treeRefreshTimer);
+          treeRefreshTimer = window.setTimeout(() => {
+            treeRefreshTimer = null;
+            if (currentProject) {
+              renderFileTreeRoot(currentProject.path).catch((err) => console.error(err));
+            }
+          }, 250);
         }
       });
 
@@ -1637,7 +1666,13 @@ async function updateActiveCardUI() {
   if (activeCard.run_id) {
     try {
       const logs = await invoke<RunEvent[]>("get_run_log", { runId: activeCard.run_id });
-      renderLogs(logs);
+      let vitals: RunVitals | null = null;
+      try {
+        vitals = await invoke<RunVitals>("get_run_vitals", { runId: activeCard.run_id });
+      } catch (err) {
+        console.error("Error reading run vitals:", err);
+      }
+      renderLogs(logs, vitals);
     } catch (err) {
       console.error("Error reading run logs:", err);
     }
@@ -1672,12 +1707,98 @@ async function updateActiveCardUI() {
   updateSendButtonState();
 }
 
+// Compact, collapsed-by-default telemetry panel at the top of a run transcript.
+// Reads what the harness logs per turn (tool outcomes, failure_reason buckets,
+// malformed calls) so harness behavior can be tuned by looking, not guessing.
+function renderVitalsPanel(v: RunVitals) {
+  const total = v.total_calls;
+  const failPct = total > 0 ? Math.round((v.failures / total) * 100) : 0;
+  const malTotal = v.malformed;
+  const okPct = total > 0 ? 100 - failPct : 0;
+
+  const histogram = (rows: [string, number][]) =>
+    rows.length === 0
+      ? `<div style="color: var(--text-muted); font-size: 0.78rem;">none</div>`
+      : rows.map(([reason, n]) => `
+          <div style="display:flex; justify-content:space-between; gap:8px; font-size:0.78rem;">
+            <span style="color: var(--text-secondary);">${escapeHtml(reason)}</span>
+            <span style="color: var(--text-muted);">${n}</span>
+          </div>`).join("");
+
+  const toolRows = v.per_tool.map(t => {
+    const fr = t.calls > 0 ? Math.round((t.failures / t.calls) * 100) : 0;
+    const color = fr === 0 ? "var(--text-muted)" : (fr >= 50 ? "var(--danger, #e06c75)" : "var(--text-secondary)");
+    return `<div style="display:flex; justify-content:space-between; gap:8px; font-size:0.78rem;">
+      <span style="color: var(--text-secondary);">${escapeHtml(t.name)}</span>
+      <span style="color:${color};">${t.calls} call${t.calls === 1 ? "" : "s"}${t.failures > 0 ? ` · ${t.failures} failed (${fr}%)` : ""}</span>
+    </div>`;
+  }).join("");
+
+  const chip = (label: string, value: string) =>
+    `<span style="font-size:0.75rem; color: var(--text-secondary); background: var(--bg-tertiary, rgba(127,127,127,0.12)); padding:2px 8px; border-radius:10px;">${label}: <strong>${value}</strong></span>`;
+
+  // Throughput: TTFT is the prefill-dominated "time to inject prompt" number;
+  // decode is generation speed. Both averaged across the run's LLM calls.
+  const fmtTtft = (ms: number) => ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+  const tput: string[] = [];
+  if (v.llm_calls > 0) {
+    if (v.avg_ttft_ms != null) tput.push(chip("TTFT (prefill)", fmtTtft(v.avg_ttft_ms)));
+    if (v.avg_prompt_tps != null) tput.push(chip("prompt", `${Math.round(v.avg_prompt_tps)} tok/s`));
+    if (v.avg_decode_tps != null) tput.push(chip("decode", `${v.decode_tps_approx ? "~" : ""}${Math.round(v.avg_decode_tps)} tok/s`));
+  }
+  const throughputRow = tput.length > 0
+    ? `<div style="display:flex; flex-wrap:wrap; gap:6px;">${tput.join("")}</div>`
+    : "";
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "chat-bubble tool";
+  wrapper.style.alignSelf = "stretch";
+  wrapper.innerHTML = `
+    <details style="width:100%;">
+      <summary class="tool-summary">
+        <span class="tool-status-icon">📊</span>
+        <span>Run vitals — <strong>${total}</strong> call${total === 1 ? "" : "s"} · ${v.successes}✓ ${v.failures}✗${malTotal > 0 ? ` · ${malTotal} malformed` : ""}</span>
+      </summary>
+      <div style="padding: 6px 10px 10px 10px; display:flex; flex-direction:column; gap:10px;">
+        <div style="display:flex; height:6px; border-radius:3px; overflow:hidden; background: var(--bg-tertiary, rgba(127,127,127,0.15));">
+          <div style="width:${okPct}%; background: var(--success, #98c379);"></div>
+          <div style="width:${failPct}%; background: var(--danger, #e06c75);"></div>
+        </div>
+        <div style="display:flex; flex-wrap:wrap; gap:6px;">
+          ${chip("read : write", `${v.reads} : ${v.writes}`)}
+          ${chip("worst edit retries", String(v.worst_edit_retry_streak))}
+          ${chip("malformed", String(v.malformed))}
+          ${chip("reasoning turns", String(v.reasoning_events))}
+        </div>
+        ${throughputRow}
+        <div>
+          <div style="font-weight:600; font-size:0.78rem; color: var(--text-secondary); margin-bottom:2px;">Failure reasons</div>
+          ${histogram(v.failure_reasons)}
+        </div>
+        ${malTotal > 0 ? `<div>
+          <div style="font-weight:600; font-size:0.78rem; color: var(--text-secondary); margin-bottom:2px;">Malformed reasons</div>
+          ${histogram(v.malformed_reasons)}
+        </div>` : ""}
+        <div>
+          <div style="font-weight:600; font-size:0.78rem; color: var(--text-secondary); margin-bottom:2px;">Per tool</div>
+          ${toolRows || `<div style="color: var(--text-muted); font-size:0.78rem;">none</div>`}
+        </div>
+      </div>
+    </details>
+  `;
+  chatMessages.appendChild(wrapper);
+}
+
 // Render run execution transcript logs
-function renderLogs(logs: RunEvent[]) {
+function renderLogs(logs: RunEvent[], vitals: RunVitals | null = null) {
   chatMessages.innerHTML = "";
   if (logs.length === 0) {
     chatMessages.innerHTML = `<p class="empty-state">No execution logs yet.</p>`;
     return;
+  }
+
+  if (vitals && vitals.total_calls + vitals.malformed > 0) {
+    renderVitalsPanel(vitals);
   }
 
   // Preprocess events to pair tool_call and tool_result
@@ -1832,7 +1953,10 @@ function renderLogs(logs: RunEvent[]) {
         wrapper.className = "chat-bubble tool";
         
         const toolName = callDetails.tool || callDetails.name || "unknown";
-        const argsStr = escapeHtml(JSON.stringify(callDetails.args || callDetails.arguments, null, 2));
+        // Default to {} so a null/absent args (some models emit name-only calls)
+        // can't make JSON.stringify return undefined → escapeHtml(undefined)
+        // throw → the whole tool bubble silently vanish from chat.
+        const argsStr = escapeHtml(JSON.stringify(callDetails.args ?? callDetails.arguments ?? {}, null, 2));
         
         let resultSection = "";
         if (resultDetails) {
@@ -1884,7 +2008,7 @@ function renderLogs(logs: RunEvent[]) {
               <span class="tool-status-icon">${isCall ? '⚙️' : '✔️'}</span>
               <span>${isCall ? 'Calling tool:' : 'Response from:'} <strong>${toolName}</strong></span>
             </summary>
-            <pre class="tool-details"><code>${isCall ? escapeHtml(JSON.stringify(details.args, null, 2)) : escapeHtml(details.result || '')}</code></pre>
+            <pre class="tool-details"><code>${isCall ? escapeHtml(JSON.stringify(details.args ?? details.arguments ?? {}, null, 2)) : escapeHtml(details.result || '')}</code></pre>
           </details>
         `;
         chatMessages.appendChild(wrapper);
@@ -2191,17 +2315,71 @@ function removeThinkingBubble() {
   }
 }
 
+// ─── File tree rendering ──────────────────────────────────────────────────────────────────────────────
+// Re-renders fire on every run-updated event, and the backend emits those in
+// bursts (one per agent tool call). Two guards keep that sane:
+//  1. Generation counter: overlapping renders used to interleave across the
+//     await — each cleared, then EACH appended — doubling every entry in the
+//     tree. Only the newest render may touch the DOM now.
+//  2. Expansion preservation: rebuilding from scratch collapsed every folder
+//     the user had open. Expanded paths are collected before the rebuild and
+//     restored after it, along with the active-file highlight.
+let treeRenderGen = 0;
+let treeRefreshTimer: number | null = null;
+
+function collectExpandedPaths(): Set<string> {
+  const expanded = new Set<string>();
+  fileTreeContainer.querySelectorAll(".tree-children").forEach((el) => {
+    if ((el as HTMLElement).style.display !== "none") {
+      const dirNode = el.parentElement?.querySelector(":scope > .tree-node.directory") as HTMLElement | null;
+      if (dirNode?.dataset.path) expanded.add(dirNode.dataset.path);
+    }
+  });
+  return expanded;
+}
+
+async function restoreExpansion(container: HTMLElement, expandedPaths: Set<string>, gen: number) {
+  for (const child of Array.from(container.children)) {
+    if (gen !== treeRenderGen) return; // superseded mid-restore
+    const el = child as HTMLElement;
+    const dirNode = el.querySelector(":scope > .tree-node.directory") as HTMLElement | null;
+    const path = dirNode?.dataset.path;
+    if (dirNode && path && expandedPaths.has(path)) {
+      const setExpanded = (el as any)._setExpanded as ((expand: boolean) => Promise<void>) | undefined;
+      if (setExpanded) {
+        await setExpanded(true);
+        const childContainer = el.querySelector(":scope > .tree-children") as HTMLElement | null;
+        if (childContainer) {
+          await restoreExpansion(childContainer, expandedPaths, gen);
+        }
+      }
+    }
+  }
+}
+
 // Render root directory elements
 async function renderFileTreeRoot(path: string) {
+  const gen = ++treeRenderGen;
+  const expanded = collectExpandedPaths();
+  const activePath = (fileTreeContainer.querySelector(".tree-node.file.active") as HTMLElement | null)?.dataset.path;
   try {
-    fileTreeContainer.innerHTML = "";
     const entries = await invoke<DirEntry[]>("list_dir", { path });
+    if (gen !== treeRenderGen) return; // a newer render owns the DOM now
+    fileTreeContainer.innerHTML = "";
     
     entries.forEach((entry) => {
       const node = createFileNode(entry);
       fileTreeContainer.appendChild(node);
     });
+    if (expanded.size > 0) {
+      await restoreExpansion(fileTreeContainer, expanded, gen);
+    }
+    if (activePath && gen === treeRenderGen) {
+      const activeNode = fileTreeContainer.querySelector(`.tree-node.file[data-path="${CSS.escape(activePath)}"]`);
+      activeNode?.classList.add("active");
+    }
   } catch (err) {
+    if (gen !== treeRenderGen) return;
     fileTreeContainer.innerHTML = `<span style="color: var(--status-failed)">Error loading tree</span>`;
     console.error(err);
   }
@@ -2213,6 +2391,7 @@ function createFileNode(entry: DirEntry): HTMLElement {
   
   const node = document.createElement("div");
   node.className = `tree-node ${entry.is_dir ? 'directory' : 'file'}`;
+  node.dataset.path = entry.path;
   
   let actionsHtml = "";
   if (entry.is_dir) {
@@ -2247,6 +2426,31 @@ function createFileNode(entry: DirEntry): HTMLElement {
 
     let loaded = false;
 
+    const loadChildren = async () => {
+      if (loaded) return;
+      const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
+      childrenContainer.innerHTML = "";
+      children.forEach((child) => {
+        childrenContainer.appendChild(createFileNode(child));
+      });
+      loaded = true;
+    };
+
+    // Expansion as a named operation so tree re-renders can programmatically
+    // restore whatever the user had open before the refresh.
+    const setExpanded = async (expand: boolean) => {
+      childrenContainer.style.display = expand ? "block" : "none";
+      node.querySelector(".icon")!.textContent = expand ? '📂' : '📁';
+      if (expand) {
+        try {
+          await loadChildren();
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    };
+    (wrapper as any)._setExpanded = setExpanded;
+
     // Actions click handlers
     const btnAddFile = node.querySelector(".tree-action-btn.add-file") as HTMLButtonElement;
     btnAddFile.addEventListener("click", (e) => {
@@ -2278,22 +2482,10 @@ function createFileNode(entry: DirEntry): HTMLElement {
     node.addEventListener("click", async (e) => {
       e.stopPropagation();
       const isExpanded = childrenContainer.style.display !== "none";
-      childrenContainer.style.display = isExpanded ? "none" : "block";
-      node.querySelector(".icon")!.textContent = isExpanded ? '📁' : '📂';
-
-      if (!loaded && !isExpanded) {
-        try {
-          const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
-          childrenContainer.innerHTML = "";
-          children.forEach((child) => {
-            childrenContainer.appendChild(createFileNode(child));
-          });
-          loaded = true;
-        } catch (err) {
-          console.error(err);
-        }
-      }
+      await setExpanded(!isExpanded);
     });
+
+
   } else {
     const btnDelete = node.querySelector(".tree-action-btn.delete-item") as HTMLButtonElement;
     btnDelete.addEventListener("click", async (e) => {

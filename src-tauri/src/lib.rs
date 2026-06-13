@@ -145,6 +145,7 @@ pub fn run() {
             commands::accept_run,
             commands::reject_run,
             commands::get_run_log,
+            commands::get_run_vitals,
             commands::send_chat,
             commands::read_diff,
             commands::list_dir,

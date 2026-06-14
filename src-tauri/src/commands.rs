@@ -35,10 +35,26 @@ pub struct Card {
     pub priority: String, // "low" | "medium" | "high"
     #[serde(default)]
     pub labels: Vec<String>,
+    #[serde(default = "default_runner")]
+    pub runner: String, // "local" (default) | "frontier" — which model drives this card's run
 }
 
 fn default_priority() -> String {
     "medium".to_string()
+}
+
+fn default_runner() -> String {
+    "local".to_string()
+}
+
+/// Normalize a runner value to the two canonical targets; anything unrecognized
+/// falls back to local so a bad value can never silently route work to the
+/// (paid, slower) frontier.
+fn normalize_runner(r: &str) -> String {
+    match r.trim().to_lowercase().as_str() {
+        "frontier" | "assist" | "remote" => "frontier".to_string(),
+        _ => "local".to_string(),
+    }
 }
 
 /// Normalize free-form priority input to the three canonical levels.
@@ -673,7 +689,8 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             run_id TEXT,
             assignee TEXT,
             priority TEXT NOT NULL DEFAULT 'medium',
-            labels TEXT NOT NULL DEFAULT '[]'
+            labels TEXT NOT NULL DEFAULT '[]',
+            runner TEXT NOT NULL DEFAULT 'local'
         );",
         [],
     )
@@ -687,6 +704,10 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
     );
     let _ = conn.execute(
         "ALTER TABLE cards ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE cards ADD COLUMN runner TEXT NOT NULL DEFAULT 'local'",
         [],
     );
 
@@ -862,7 +883,7 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
     let conn = get_db_conn(app_handle)?;
 
     let mut stmt = conn
-        .prepare("SELECT id, project_path, title, description, status, run_id, assignee, priority, labels FROM cards")
+        .prepare("SELECT id, project_path, title, description, status, run_id, assignee, priority, labels, runner FROM cards")
         .map_err(|e| e.to_string())?;
     let card_rows = stmt
         .query_map([], |row| {
@@ -876,13 +897,14 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut cards = Vec::new();
     for card_res in card_rows {
-        let (id, project_path, title, description, status, run_id, assignee, priority, labels_json) =
+        let (id, project_path, title, description, status, run_id, assignee, priority, labels_json, runner) =
             card_res.map_err(|e| e.to_string())?;
 
         let mut todo_stmt = conn
@@ -913,6 +935,7 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
             priority: normalize_priority(&priority),
             labels: serde_json::from_str(&labels_json).unwrap_or_default(),
             todo_list,
+            runner: normalize_runner(&runner),
         });
     }
 
@@ -2246,7 +2269,7 @@ fn compacted_history(
     // summarizer's output must never paint into the visible chat.
     let summarizer_run_id = format!("{}-compaction", run_id);
     let fallback = "Earlier conversation was condensed to fit the context window; specifics may be retrievable with recall().".to_string();
-    let summary = match call_llm(app_handle, &summarizer_run_id, system, summarizer_history, None)
+    let summary = match call_llm(app_handle, &summarizer_run_id, system, summarizer_history, None, false)
     {
         Ok(raw) => {
             let (_, cleaned) = extract_reasoning(&raw);
@@ -2667,12 +2690,30 @@ fn accumulate_anthropic_tool_calls(line: &str, accumulated: &mut Vec<ToolCallAcc
     }
 }
 
+/// Build a primary-style settings object from the assist_* (frontier) fields,
+/// so the same provider dispatch can drive a run — or a one-shot consult — with
+/// the frontier model.
+fn assist_as_primary(s: &LlmSettings) -> LlmSettings {
+    LlmSettings {
+        provider: s.assist_provider.clone(),
+        api_url: s.assist_api_url.clone(),
+        api_key: s.assist_api_key.clone(),
+        model: s.assist_model.clone(),
+        max_steps: s.max_steps,
+        assist_provider: String::new(),
+        assist_api_url: String::new(),
+        assist_api_key: String::new(),
+        assist_model: String::new(),
+    }
+}
+
 fn call_llm(
     app_handle: &tauri::AppHandle,
     run_id: &str,
     system_prompt: &str,
     mut chat_history: Vec<serde_json::Value>,
     tools: Option<serde_json::Value>,
+    use_assist: bool,
 ) -> Result<String, String> {
     {
         if let Some(state_val) = app_handle.try_state::<AppState>() {
@@ -2681,7 +2722,14 @@ fn call_llm(
         }
     }
     let config = load_config(app_handle);
-    let settings = config.settings;
+    // runner="frontier" cards drive with the assist model; everything else uses
+    // the primary local model. assist_configured() is re-checked so a stale flag
+    // can't route to an unconfigured endpoint.
+    let settings = if use_assist && config.settings.assist_configured() {
+        assist_as_primary(&config.settings)
+    } else {
+        config.settings
+    };
 
     let base_url = settings.api_url.trim().trim_end_matches('/').to_string();
     if base_url.is_empty() {
@@ -3708,6 +3756,7 @@ pub async fn send_design_chat(
                 &system_prompt,
                 history,
                 Some(tools_schema),
+                false,
             ) {
                 Ok(reply) => reply,
                 Err(e) => {
@@ -3803,6 +3852,7 @@ pub async fn send_design_chat(
                     &tool_name,
                     &args,
                     &log_key_clone,
+                    Some("design"),
                 );
 
                 append_design_event(
@@ -3975,6 +4025,7 @@ pub async fn send_code_chat(
                 &system_prompt,
                 history,
                 Some(tools_schema),
+                false,
             ) {
                 Ok(reply) => reply,
                 Err(e) => {
@@ -4070,6 +4121,7 @@ pub async fn send_code_chat(
                     &tool_name,
                     &args,
                     &log_key_clone,
+                    None,
                 );
 
                 append_code_event(
@@ -4199,6 +4251,7 @@ pub async fn create_card(
         priority: "medium".to_string(),
         labels: Vec::new(),
         todo_list: Vec::new(),
+        runner: default_runner(),
     };
     cards.push(new_card.clone());
 
@@ -4252,12 +4305,13 @@ pub async fn save_card(
         c.project_path = card.project_path;
         c.priority = normalize_priority(&card.priority);
         c.labels = card.labels;
+        c.runner = normalize_runner(&card.runner);
 
         if let Ok(conn) = get_db_conn(&app_handle) {
             let labels_json = serde_json::to_string(&c.labels).unwrap_or_else(|_| "[]".to_string());
             let _ = conn.execute(
-                "UPDATE cards SET title = ?1, description = ?2, status = ?3, run_id = ?4, assignee = ?5, project_path = ?6, priority = ?7, labels = ?8 WHERE id = ?9",
-                (&c.title, &c.description, &c.status, &c.run_id, &c.assignee, &c.project_path, &c.priority, &labels_json, &c.id),
+                "UPDATE cards SET title = ?1, description = ?2, status = ?3, run_id = ?4, assignee = ?5, project_path = ?6, priority = ?7, labels = ?8, runner = ?9 WHERE id = ?10",
+                (&c.title, &c.description, &c.status, &c.run_id, &c.assignee, &c.project_path, &c.priority, &labels_json, &c.runner, &c.id),
             );
 
             let _ = conn.execute("DELETE FROM todo_items WHERE card_id = ?1", [&c.id]);
@@ -5402,8 +5456,9 @@ fn construct_agent_system_prompt(
     worktree_path: &Path,
     card_title: &str,
     card_description: &str,
+    assist_available: bool,
 ) -> String {
-    format!(
+    let mut prompt = format!(
         "You are BeetleAI, an autonomous coding agent. You have been assigned the following task:\n\
          Title: {}\n\
          Description: {}\n\n\
@@ -5445,7 +5500,13 @@ fn construct_agent_system_prompt(
          23. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
-    )
+    );
+    if assist_available {
+        prompt.push_str(
+            "\n\nPHONE A FRIEND — `request_assist(question: String, context?: String)`: when you are genuinely STUCK (e.g. the same edit has failed 2–3 times, a build error you can't decipher, or you can't find a workable approach), call this to consult a stronger \"senior\" model. Describe the problem and what you've already tried; you'll get back concrete advice or a patch to apply YOURSELF (it does not edit files for you). Use it sparingly — only when genuinely stuck, never for routine steps.",
+        );
+    }
+    prompt
 }
 
 fn parse_tool_call_fallback(js: &str) -> Option<(String, serde_json::Value)> {
@@ -7285,13 +7346,123 @@ fn compute_run_vitals(events: &[RunEvent]) -> RunVitals {
     v
 }
 
+/// One-shot consult to the configured "assist" (frontier) model — Beetle's
+/// phone-a-friend. Reuses the normal provider dispatch but with the assist_*
+/// settings, and streams under a throwaway run id so the friend's tokens don't
+/// render into Beetle's own transcript. Returns the answer (reasoning stripped).
+/// Errs when no assist model is configured.
+fn call_assist_model(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, String> {
+    let settings = load_config(app_handle).settings;
+    if !settings.assist_configured() {
+        return Err("no assist model configured".to_string());
+    }
+    // Promote the assist_* fields into a primary settings object for dispatch.
+    let assist = assist_as_primary(&settings);
+    let kind = provider_kind(&assist.provider.to_lowercase());
+    let url = resolve_endpoint(kind, assist.api_url.trim().trim_end_matches('/'));
+    let messages = vec![
+        serde_json::json!({ "role": "system", "content": system_prompt }),
+        serde_json::json!({ "role": "user", "content": user_message }),
+    ];
+    // Throwaway id: provider fns stream chat-chunks keyed by run id; an id with
+    // no UI listener keeps the consult out of Beetle's transcript.
+    let assist_id = format!("{}__assist", run_id);
+    let raw = match kind {
+        ProviderKind::Anthropic => {
+            call_anthropic(app_handle, &assist_id, &url, &assist, system_prompt, messages, None)
+        }
+        ProviderKind::OpenAiCompat => {
+            call_openai_compat(app_handle, &assist_id, &url, &assist, messages, None)
+        }
+        ProviderKind::OllamaNative => {
+            call_ollama_native(app_handle, &assist_id, &url, &assist, messages, None)
+        }
+        ProviderKind::LmStudioStateful => {
+            call_lmstudio_stateful(app_handle, &assist_id, &url, &assist, system_prompt, &messages)
+        }
+    }?;
+    let (_reasoning, answer) = extract_reasoning(&raw);
+    Ok(answer)
+}
+
+/// A compact, bounded slice of the run's recent activity — the last several
+/// tool calls/results — so the assist model has grounding without being handed
+/// the entire transcript. Oldest-first.
+fn recent_run_context(app_handle: &tauri::AppHandle, run_id: &str) -> String {
+    let Some(state) = app_handle.try_state::<AppState>() else {
+        return String::new();
+    };
+    let logs = state.run_logs.lock().unwrap();
+    let Some(events) = logs.get(run_id) else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for ev in events.iter().rev() {
+        if lines.len() >= 10 {
+            break;
+        }
+        if let Ok(p) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
+            match ev.event_type.as_str() {
+                "tool_call" => {
+                    let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let args = p.get("args").map(|a| a.to_string()).unwrap_or_default();
+                    lines.push(format!("→ called {} {}", name, truncate_tool_result(&args, 160)));
+                }
+                "tool_result" => {
+                    let name = p.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let res = p.get("result").and_then(|r| r.as_str()).unwrap_or("");
+                    lines.push(format!("  {} ⇒ {}", name, truncate_tool_result(res, 300)));
+                }
+                "malformed" => lines.push("→ (a malformed tool call that didn't parse)".to_string()),
+                _ => {}
+            }
+        }
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// True if `path` (relative, model-supplied) stays within `scope` (e.g.
+/// "design"). Rejects any `..` traversal outright. The rail for plan/design
+/// mode, where writes are confined to design docs.
+fn path_within_scope(path: &str, scope: &str) -> bool {
+    let norm = path.trim().replace('\\', "/");
+    if norm.split('/').any(|seg| seg == "..") {
+        return false;
+    }
+    let norm = norm.trim_start_matches("./");
+    norm == scope || norm.starts_with(&format!("{}/", scope))
+}
+
 fn execute_tool(
     app_handle: &tauri::AppHandle,
     worktree_path: &Path,
     tool_name: &str,
     args: &serde_json::Value,
     run_id: &str,
+    write_scope: Option<&str>,
 ) -> String {
+    // Plan/design mode rail: confine file mutations to a scope directory (e.g.
+    // design/). Enforced HERE — not via the advertised tool schema — because a
+    // text-protocol model can emit ANY tool name regardless of what the schema
+    // lists, so the schema is no protection at all. This is what stops a "plan"
+    // conversation from clobbering source files.
+    if let Some(scope) = write_scope {
+        if matches!(tool_name, "write_file" | "patch_file" | "replace_lines") {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if !path_within_scope(path, scope) {
+                return format!(
+                    "Error: NOT executed — plan/design mode is read-only outside '{0}/': it may only write design docs under '{0}/', not source files. The path '{1}' is outside that scope. To change code, switch to Code mode or run the card.",
+                    scope, path
+                );
+            }
+        }
+    }
     match tool_name {
         "read_file" => {
             let path = match args.get("path").and_then(|p| p.as_str()) {
@@ -7694,6 +7865,7 @@ fn execute_tool(
                         completed: false,
                     })
                     .collect(),
+                runner: default_runner(),
             };
             cards.push(new_card.clone());
             if let Ok(conn) = get_db_conn(app_handle) {
@@ -8079,8 +8251,35 @@ fn execute_tool(
                 None => "Error: no card found for this run".to_string(),
             }
         }
+        "request_assist" => {
+            let question = match args.get("question").and_then(|q| q.as_str()) {
+                Some(q) if !q.trim().is_empty() => q,
+                _ => {
+                    return "Error: Missing 'question' argument. Usage: request_assist(question: String, context?: String) — describe what you're stuck on and what you've tried.".to_string()
+                }
+            };
+            let extra = args.get("context").and_then(|c| c.as_str()).unwrap_or("");
+            let recent = recent_run_context(app_handle, run_id);
+            let system = "You are a senior software engineer helping a smaller autonomous coding agent that is stuck inside a code repository. Reply with the SHORTEST concrete fix that unblocks it: an exact patch or code snippet, or precise step-by-step instructions referencing real file paths and line numbers. No preamble, no pleasantries.";
+            let user = format!(
+                "A coding agent is stuck and is asking for help.\n\n## Its question\n{}\n\n## Extra context it provided\n{}\n\n## Recent tool activity (oldest first)\n{}",
+                question,
+                if extra.trim().is_empty() { "(none)" } else { extra },
+                if recent.trim().is_empty() { "(none)" } else { &recent }
+            );
+            match call_assist_model(app_handle, run_id, system, &user) {
+                Ok(advice) => format!(
+                    "Assist from the senior model — this is ADVICE; you must apply it yourself with your normal tools:\n\n{}",
+                    advice.trim()
+                ),
+                Err(e) => format!(
+                    "Error: could not reach an assist model ({}). No frontier help is available right now — try a different approach yourself, or use send_notification to ask your human.",
+                    e
+                ),
+            }
+        }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -8116,11 +8315,12 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     c.title.clone(),
                     c.description.clone(),
                     c.project_path.clone(),
+                    c.runner.clone(),
                 )
             })
         };
 
-        let (card_title, card_desc, card_project_path) = match card_meta {
+        let (card_title, card_desc, card_project_path, card_runner) = match card_meta {
             Some(meta) => meta,
             None => return,
         };
@@ -8151,6 +8351,31 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
         // signature clears only when that edit finally SUCCEEDS.
         let mut edit_failure_counts: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        // Whether a frontier "assist" model is configured — gates advertising
+        // request_assist in the prompt and the stuck nudge (phone-a-friend).
+        let assist_available = load_config(&app_handle_clone).settings.assist_configured();
+        // A card flagged runner="frontier" is driven by the assist model itself
+        // (for hard cards or review passes). Falls back to local — with a note —
+        // if no assist model is configured, so the run never silently stalls.
+        let frontier_requested = normalize_runner(&card_runner) == "frontier";
+        let drive_with_assist = frontier_requested && assist_available;
+        if frontier_requested {
+            let msg = if drive_with_assist {
+                "This card is set to run on the FRONTIER model.".to_string()
+            } else {
+                "This card requests the FRONTIER model, but no assist model is configured — falling back to the local model. Set one in Settings → Phone-a-Friend.".to_string()
+            };
+            append_run_event(
+                &app_handle_clone,
+                &state,
+                &run_id_clone,
+                RunEvent {
+                    run_id: run_id_clone.clone(),
+                    event_type: "message".to_string(),
+                    payload: serde_json::json!({ "role": "agent", "content": format!("[harness] {}", msg) }).to_string(),
+                },
+            );
+        }
 
         'run: loop {
             {
@@ -8196,7 +8421,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
             }
 
             let system_prompt =
-                construct_agent_system_prompt(&worktree_path, &card_title, &card_desc);
+                construct_agent_system_prompt(&worktree_path, &card_title, &card_desc, assist_available);
             let system_prompt = format!(
                 "{}\n\nYou are on step {} of a maximum of {} for this run. Pace your work to finish and call task_complete before hitting the ceiling.",
                 system_prompt, step, max_steps
@@ -8232,6 +8457,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 &system_prompt,
                 history,
                 Some(tools_schema),
+                drive_with_assist,
             ) {
                 Ok(reply) => reply,
                 Err(e) => {
@@ -8354,6 +8580,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                     &tool_name,
                     &args,
                     &run_id_clone,
+                    None,
                 );
 
                 if repeat_count >= 2 {
@@ -8383,9 +8610,14 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                         *n += 1;
                         stuck_edit_n = *n;
                         if stuck_edit_n == 2 {
+                            let phone = if assist_available {
+                                " If it still won't land, call request_assist to consult a stronger model before trying again."
+                            } else {
+                                ""
+                            };
                             tool_result.push_str(&format!(
-                                "\n\n[harness note: this exact {} has now failed {} times, including across re-reads — retrying it unchanged will not work. The text or lines you're targeting are not where you think they are. Re-read the precise region with read_file(start_line, end_line) to refresh your coordinates, switch tools (patch_file ⇄ replace_lines), or anchor on different text.]",
-                                tool_name, stuck_edit_n
+                                "\n\n[harness note: this exact {} has now failed {} times, including across re-reads — retrying it unchanged will not work. The text or lines you're targeting are not where you think they are. Re-read the precise region with read_file(start_line, end_line) to refresh your coordinates, switch tools (patch_file ⇄ replace_lines), or anchor on different text.{}]",
+                                tool_name, stuck_edit_n, phone
                             ));
                         }
                     } else {
@@ -8644,8 +8876,8 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
          Tools available:\n\
          1. `read_file(path: String, start_line?: Int, end_line?: Int)`: Reads file content (line-numbered, output capped). For large files, call outline_file first, then read only the line range you need — don't read whole large files when a range will do.\n\
          2. `outline_file(path: String)`: Returns a file's structure (markdown headings, or code declarations) with line numbers, without its full contents. Survey large files this way before reading.\n\
-         3. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed). Use this to update design documents under `design/`!\n\
-         4. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file — safer than rewriting a whole file for small edits. The target must match byte-for-byte.\n\
+         3. `write_file(path: String, content: String)`: Writes content to a file (creating folders if needed). In plan/design mode you may ONLY write under `design/` — writes to source files are REFUSED. You are here to think and design, not to edit code; if code must change, say so and let the developer run a Code session or a card.\n\
+         4. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file — safer than rewriting a whole file for small edits. The target must match byte-for-byte. Same rule as write_file: design-mode patches are confined to `design/`.\n\
          5. `list_dir(path: String, depth?: Int)`: Lists files and folders as an indented tree (use \"\" for root). Pass depth 2 or 3 to map nested structure in one call.\n\
          6. `search_grep(query: String, path?: String, context?: Int, case_sensitive?: Bool)`: Searches file contents for a substring (case-insensitive by default), grouped by file with line numbers. Pass context: 2 to see surrounding lines without a follow-up read.\n\
          7. `find_file(name: String, path?: String)`: Finds files by name fragment (case-insensitive) and returns matching relative paths.\n\
@@ -8817,6 +9049,21 @@ BeetleAI
         assert_eq!(v.malformed_reasons, vec![("unparsed_json_call".to_string(), 1)]);
         let rl = v.per_tool.iter().find(|t| t.name == "replace_lines").unwrap();
         assert_eq!((rl.calls, rl.failures), (3, 2));
+    }
+
+    #[test]
+    fn test_path_within_scope() {
+        // Allowed: inside the scope dir.
+        assert!(path_within_scope("design/architecture.md", "design"));
+        assert!(path_within_scope("design", "design"));
+        assert!(path_within_scope("./design/notes.md", "design"));
+        assert!(path_within_scope("design\\sub\\x.md", "design")); // windows sep
+        // Refused: outside scope or traversal escapes.
+        assert!(!path_within_scope("src/main.ts", "design"));
+        assert!(!path_within_scope("design/../src/main.ts", "design"));
+        assert!(!path_within_scope("../design/x.md", "design"));
+        assert!(!path_within_scope("designs/x.md", "design")); // prefix-not-dir
+        assert!(!path_within_scope("", "design"));
     }
 
     #[test]

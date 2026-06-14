@@ -390,6 +390,7 @@ interface Card {
   todo_list: TodoItem[];
   priority?: string; // "low" | "medium" | "high" (backend defaults to medium)
   labels?: string[];
+  runner?: string; // "local" (default) | "frontier"
 }
 
 interface MemoryEntry {
@@ -448,6 +449,12 @@ interface LlmSettings {
   api_key: string;
   model: string;
   max_steps: number;
+  // Phone-a-friend: a stronger model Beetle consults when stuck. Optional;
+  // empty assist_provider/url/model means escalation is disabled.
+  assist_provider?: string;
+  assist_api_url?: string;
+  assist_api_key?: string;
+  assist_model?: string;
 }
 
 // App State
@@ -534,6 +541,10 @@ const btnFetchModels = document.getElementById("btn-fetch-models") as HTMLButton
 const btnToggleModelInput = document.getElementById("btn-toggle-model-input") as HTMLButtonElement;
 const modelContextInfo = document.getElementById("model-context-info") as HTMLSpanElement;
 const settingsSteps = document.getElementById("settings-steps") as HTMLInputElement;
+const settingsAssistProvider = document.getElementById("settings-assist-provider") as HTMLSelectElement;
+const settingsAssistUrl = document.getElementById("settings-assist-url") as HTMLInputElement;
+const settingsAssistKey = document.getElementById("settings-assist-key") as HTMLInputElement;
+const settingsAssistModel = document.getElementById("settings-assist-model") as HTMLInputElement;
 
 // Mode tabs
 const tabPlan = document.getElementById("tab-plan") as HTMLButtonElement;
@@ -1129,7 +1140,11 @@ async function openSettingsModal() {
     settingsKey.value = settings.api_key;
     settingsModel.value = settings.model;
     settingsSteps.value = settings.max_steps.toString();
-    
+    settingsAssistProvider.value = settings.assist_provider || "";
+    settingsAssistUrl.value = settings.assist_api_url || "";
+    settingsAssistKey.value = settings.assist_api_key || "";
+    settingsAssistModel.value = settings.assist_model || "";
+
     // Reset model selection view states
     toggleModelInput(true);
     settingsModal.style.display = "flex";
@@ -1153,7 +1168,11 @@ async function saveSettings() {
     api_url: settingsUrl.value,
     api_key: settingsKey.value,
     model: settingsModel.value,
-    max_steps: parseInt(settingsSteps.value, 10) || 50
+    max_steps: parseInt(settingsSteps.value, 10) || 50,
+    assist_provider: settingsAssistProvider.value,
+    assist_api_url: settingsAssistUrl.value,
+    assist_api_key: settingsAssistKey.value,
+    assist_model: settingsAssistModel.value,
   };
 
   try {
@@ -2797,6 +2816,7 @@ function renderKanbanBoard() {
         ${(card.labels && card.labels.length) ? `<div class="kanban-card-labels">${card.labels.map(l => `<span class="card-label-chip">${escapeHtml(l)}</span>`).join("")}</div>` : ''}
         <div class="kanban-card-meta">
           <span class="card-priority-chip card-priority-${card.priority || 'medium'}">${(card.priority || 'medium').toUpperCase()}</span>
+          ${card.runner === "frontier" ? `<span class="card-priority-chip" style="background: rgba(255,215,0,0.18); color: #e0b000;" title="Runs on the frontier model">FRONTIER</span>` : ''}
           <span>ID: ${card.id}</span>
           ${card.status === "running" ? `<span style="color: var(--status-running); font-weight: 500;">Run Active</span>` : card.status === "blocked" ? `<span style="color: var(--status-blocked); font-weight: 500;">Run Blocked</span>` : ''}
         </div>
@@ -3562,6 +3582,13 @@ function renderCardDetail(card: Card) {
         </select>
       </div>
       <div class="card-detail-meta-item">
+        <span class="card-detail-meta-label">Run on</span>
+        <select class="card-detail-status-select" id="card-detail-runner-select-el">
+          <option value="local" ${(card.runner || "local") === "local" ? 'selected' : ''}>Local model</option>
+          <option value="frontier" ${card.runner === "frontier" ? 'selected' : ''}>Frontier (phone a friend)</option>
+        </select>
+      </div>
+      <div class="card-detail-meta-item">
         <span class="card-detail-meta-label">Labels</span>
         <input type="text" class="todo-item-add-input" id="card-detail-labels-el" placeholder="comma, separated, labels" value="${escapeHtml((card.labels || []).join(", "))}">
       </div>
@@ -3590,6 +3617,13 @@ function renderCardDetail(card: Card) {
   const prioritySelect = detailDiv.querySelector("#card-detail-priority-select-el") as HTMLSelectElement | null;
   prioritySelect?.addEventListener("change", async () => {
     card.priority = prioritySelect.value;
+    await saveCardObject(card);
+  });
+
+  // Event listener: Runner select (local vs frontier)
+  const runnerSelect = detailDiv.querySelector("#card-detail-runner-select-el") as HTMLSelectElement | null;
+  runnerSelect?.addEventListener("change", async () => {
+    card.runner = runnerSelect.value;
     await saveCardObject(card);
   });
 

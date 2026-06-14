@@ -140,6 +140,7 @@ pub fn run() {
             commands::start_run,
             commands::cancel_run,
             commands::abort_chat,
+            commands::pause_run,
             commands::is_run_active,
             commands::unblock_run,
             commands::accept_run,

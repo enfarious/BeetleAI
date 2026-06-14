@@ -114,6 +114,9 @@ pub struct RunVitals {
     pub successes: u32,
     pub failures: u32,
     pub malformed: u32,
+    /// Turns that came back with no visible output AND no tool call — truncated
+    /// mid-reasoning or an empty generation. The "no progress" stall signature.
+    pub empty_responses: u32,
     pub reads: u32,
     pub writes: u32,
     pub reasoning_events: u32,
@@ -158,6 +161,13 @@ pub struct LlmSettings {
     pub assist_api_key: String,
     #[serde(default)]
     pub assist_model: String,
+    /// Usable context window of the PRIMARY model, in tokens. Drives the
+    /// compaction threshold so a small window compacts early enough to leave
+    /// room to generate (instead of overflowing and stalling), and a large one
+    /// isn't compacted prematurely. 0 = unset -> fall back to the legacy fixed
+    /// threshold. Defaulted for serde so old config.json / DB rows load unchanged.
+    #[serde(default)]
+    pub context_tokens: u32,
 }
 
 impl LlmSettings {
@@ -192,6 +202,11 @@ pub struct AppState {
     pub code_logs: Mutex<HashMap<String, Vec<RunEvent>>>,
     pub active_runs: Mutex<std::collections::HashSet<String>>,
     pub cancelled_runs: Mutex<std::collections::HashSet<String>>,
+    /// Cooperative pause requests. Distinct from `cancelled_runs` because a
+    /// pause must NOT destroy the worktree or fail the card — the run loop
+    /// breaks to `blocked` at its next between-turns checkpoint, leaving the
+    /// sandbox and full history intact so `unblock_run` can resume it.
+    pub paused_runs: Mutex<std::collections::HashSet<String>>,
     /// Last LM Studio stateful `response_id` per run/chat key. The /api/v1/chat
     /// endpoint keeps history server-side; chaining `previous_response_id` is
     /// what makes a thread continue instead of starting fresh every call.
@@ -216,6 +231,7 @@ impl AppState {
             code_logs: Mutex::new(HashMap::new()),
             active_runs: Mutex::new(std::collections::HashSet::new()),
             cancelled_runs: Mutex::new(std::collections::HashSet::new()),
+            paused_runs: Mutex::new(std::collections::HashSet::new()),
             lmstudio_response_ids: Mutex::new(HashMap::new()),
             line_shift_state: Mutex::new(HashMap::new()),
         }
@@ -643,7 +659,8 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             assist_provider TEXT NOT NULL DEFAULT '',
             assist_api_url TEXT NOT NULL DEFAULT '',
             assist_api_key TEXT NOT NULL DEFAULT '',
-            assist_model TEXT NOT NULL DEFAULT ''
+            assist_model TEXT NOT NULL DEFAULT '',
+            context_tokens INTEGER NOT NULL DEFAULT 0
         );",
         [],
     )
@@ -666,6 +683,10 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
     );
     let _ = conn.execute(
         "ALTER TABLE settings ADD COLUMN assist_model TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0",
         [],
     );
 
@@ -806,7 +827,7 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
 
 fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> {
     let mut stmt = conn
-        .prepare("SELECT provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model FROM settings LIMIT 1")
+        .prepare("SELECT provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model, context_tokens FROM settings LIMIT 1")
         .map_err(|e| e.to_string())?;
     let settings_opt = stmt
         .query_row([], |row| {
@@ -820,6 +841,7 @@ fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> 
                 assist_api_url: row.get(6)?,
                 assist_api_key: row.get(7)?,
                 assist_model: row.get(8)?,
+                context_tokens: row.get(9)?,
             })
         })
         .optional()
@@ -853,7 +875,7 @@ fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> 
 fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result<(), String> {
     let _ = conn.execute("DELETE FROM settings", []);
     conn.execute(
-        "INSERT INTO settings (provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO settings (provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model, context_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         (
             &config.settings.provider,
             &config.settings.api_url,
@@ -864,6 +886,7 @@ fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result
             &config.settings.assist_api_url,
             &config.settings.assist_api_key,
             &config.settings.assist_model,
+            &config.settings.context_tokens,
         ),
     ).map_err(|e| e.to_string())?;
 
@@ -1030,6 +1053,7 @@ fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
             assist_api_url: String::new(),
             assist_api_key: String::new(),
             assist_model: String::new(),
+            context_tokens: 0,
         },
         projects: vec![Project {
             id: "beetleai".to_string(),
@@ -2039,7 +2063,32 @@ fn truncate_tool_result(text: &str, max_chars: usize) -> String {
     )
 }
 
-fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
+/// Tool-call args are replayed into history every turn until compacted. A
+/// write_file's `content` (or any large string arg) is the model's OWN prior
+/// output echoed straight back — pure prompt bloat that can overflow a small
+/// context window. Truncate long string values for the REPLAY only (disk
+/// already holds the real content); the JSON shape is preserved so the call
+/// still reads clearly. Recurses so nested args are covered too.
+fn truncate_tool_call_args(args: &serde_json::Value, max: usize) -> serde_json::Value {
+    match args {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), truncate_tool_call_args(v, max)))
+                .collect(),
+        ),
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter().map(|v| truncate_tool_call_args(v, max)).collect(),
+        ),
+        serde_json::Value::String(s) if s.chars().count() > max => {
+            let head: String = s.chars().take(max).collect();
+            let dropped = s.chars().count() - max;
+            serde_json::Value::String(format!("{}…[{} chars truncated in history]", head, dropped))
+        }
+        other => other.clone(),
+    }
+}
+
+fn get_history_messages(events: &[RunEvent], context_tokens: u32) -> Vec<serde_json::Value> {
     // Compaction-aware replay: if the log contains compaction events, the
     // latest one's summary stands in for everything it covers, and only the
     // tail after the covered range is replayed verbatim. The full transcript
@@ -2077,16 +2126,34 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
         .filter(|e| e.event_type == "reasoning")
         .count();
     let mut reasoning_seen = 0usize;
-    const REASONING_MAX_CHARS: usize = 2000;
-    // The most recent N results are kept fuller; everything older is trimmed hard.
-    const RECENT_KEEP: usize = 2;
-    // Must exceed the largest single tool-result cap (read_file's 8000 chars
-    // plus its truncation marker): tools append corrective guidance at the
-    // TAIL of capped output, and a head-keeping budget below that cap would
-    // behead the lesson before the model ever sees it. That exact failure
-    // taught an agent its read_file "didn't support line ranges".
-    const RECENT_MAX_CHARS: usize = 9000;
-    const OLD_MAX_CHARS: usize = 800;
+    // The most recent N tool results are kept fuller; older ones trimmed hard.
+    // For a small window keep FEWER full results (a count, not a smaller
+    // per-result cap) so we never behead a single result's tail-appended
+    // guidance — see the read_file note below.
+    let recent_keep: usize = if context_tokens != 0 && context_tokens <= 8192 { 1 } else { 2 };
+    // Per-message char budgets, scaled to the model's context window when known
+    // (context_tokens) so the replayed prompt (system + recent tail) stays INSIDE
+    // the window. Overflow otherwise forces the server to truncate the prompt
+    // (silently dropping the system prompt -> no tools / no <think>) or reprocess
+    // a giant context each turn (-> multi-minute prefills and timeouts). 0 =
+    // unknown -> legacy generous caps. recent_max stays >= read_file's 8000-char
+    // cap (+ marker) because tools append corrective guidance at the TAIL of
+    // capped output; a budget below that cap would behead the lesson before the
+    // model sees it (that exact failure once taught an agent read_file "didn't
+    // support line ranges"). Only reasoning, old results, and echoed tool-call
+    // args scale down.
+    let (reasoning_max, recent_max, old_max, tool_arg_max): (usize, usize, usize, usize) =
+        if context_tokens == 0 {
+            (2000, 9000, 800, 4000)
+        } else {
+            let w = (context_tokens as usize) * 4; // ~chars that fit in the window
+            (
+                (w / 16).clamp(500, 2000),
+                9000,
+                (w / 40).clamp(300, 800),
+                (w / 24).clamp(400, 4000),
+            )
+        };
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for event in events {
@@ -2113,7 +2180,7 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
         } else if event.event_type == "reasoning" {
             reasoning_seen += 1;
             if reasoning_seen == total_reasoning {
-                let trimmed = truncate_tool_result(&event.payload, REASONING_MAX_CHARS);
+                let trimmed = truncate_tool_result(&event.payload, reasoning_max);
                 (
                     Some("assistant".to_string()),
                     Some(format!("<think>\n{}\n</think>", trimmed)),
@@ -2128,6 +2195,9 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
                     .get("args")
                     .cloned()
                     .unwrap_or(serde_json::json!({}));
+                // Don't echo the model's own bulky inputs (e.g. write_file
+                // content) back verbatim every turn — bound them for the replay.
+                let args = truncate_tool_call_args(&args, tool_arg_max);
                 let text_content = format!(
                     "```tool_call\n{{\n  \"name\": \"{}\",\n  \"args\": {}\n}}\n```",
                     name, args
@@ -2147,12 +2217,12 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
                     .and_then(|r| r.as_str())
                     .unwrap_or("");
                 // Is this one of the most recent RECENT_KEEP results?
-                let is_recent = tool_result_seen + RECENT_KEEP >= total_tool_results;
+                let is_recent = tool_result_seen + recent_keep >= total_tool_results;
                 tool_result_seen += 1;
                 let budget = if is_recent {
-                    RECENT_MAX_CHARS
+                    recent_max
                 } else {
-                    OLD_MAX_CHARS
+                    old_max
                 };
                 let trimmed = truncate_tool_result(result, budget);
                 let text_content = format!("Tool '{}' returned:\n{}", name, trimmed);
@@ -2224,6 +2294,21 @@ fn get_history_messages(events: &[RunEvent]) -> Vec<serde_json::Value> {
 const COMPACT_THRESHOLD_CHARS: usize = 48_000;
 const COMPACT_KEEP_RECENT_EVENTS: usize = 12;
 
+/// History char budget before compaction triggers, derived from the primary
+/// model's usable context window (`context_tokens`). Uses ~4 chars/token and
+/// lets the compactable history occupy ~45% of the window — the rest is
+/// reserved for the (uncounted) system prompt, the kept recent tail, and room
+/// to generate. So a small window compacts EARLY (instead of overflowing and
+/// stalling mid-generation) and a large window isn't compacted prematurely
+/// (which silently discards live context). Falls back to the legacy fixed
+/// budget when the window is unknown (0).
+fn compact_threshold_chars(context_tokens: u32) -> usize {
+    if context_tokens == 0 {
+        return COMPACT_THRESHOLD_CHARS;
+    }
+    ((context_tokens as f64) * 4.0 * 0.45) as usize
+}
+
 fn history_size_chars(messages: &[serde_json::Value]) -> usize {
     messages
         .iter()
@@ -2241,8 +2326,13 @@ fn compacted_history(
     run_id: &str,
     events: &[RunEvent],
 ) -> (Vec<serde_json::Value>, Option<RunEvent>) {
-    let messages = get_history_messages(events);
-    if history_size_chars(&messages) < COMPACT_THRESHOLD_CHARS
+    // Threshold + per-message budgets both track the model's real context window
+    // so we neither overflow a small one (stall/timeout) nor over-compact a large
+    // one (lost context).
+    let context_tokens = load_config(app_handle).settings.context_tokens;
+    let messages = get_history_messages(events, context_tokens);
+    let threshold = compact_threshold_chars(context_tokens);
+    if history_size_chars(&messages) < threshold
         || events.len() <= COMPACT_KEEP_RECENT_EVENTS + 4
     {
         return (messages, None);
@@ -2252,7 +2342,7 @@ fn compacted_history(
     // Flatten the to-be-covered portion into a transcript for the summarizer.
     // This already folds in any previous compaction summary, so repeated
     // compactions compound instead of stacking.
-    let old_msgs = get_history_messages(&events[..covers]);
+    let old_msgs = get_history_messages(&events[..covers], context_tokens);
     let mut transcript = String::new();
     for m in &old_msgs {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -2290,7 +2380,7 @@ fn compacted_history(
     };
     let mut with_compaction = events.to_vec();
     with_compaction.push(event.clone());
-    (get_history_messages(&with_compaction), Some(event))
+    (get_history_messages(&with_compaction, context_tokens), Some(event))
 }
 
 fn log_error(msg: &str) {
@@ -2546,9 +2636,15 @@ fn resolve_endpoint(kind: ProviderKind, base_url: &str) -> String {
 }
 
 fn http_agent() -> ureq::Agent {
+    // Generous timeouts: a slow local model can spend MINUTES in prefill before
+    // the first token (a 27b on CPU/partial-offload was observed at 200s+ TTFT).
+    // The read timeout is per-read on the streaming response, so it must exceed
+    // the worst-case gap between bytes (i.e. the prefill), or the call drops to
+    // `blocked` with a "connection ... did not respond" error mid-run. Connect
+    // is also bumped so a server busy with a previous prefill can still accept.
     ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(300))
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(1200))
         .build()
 }
 
@@ -2704,6 +2800,9 @@ fn assist_as_primary(s: &LlmSettings) -> LlmSettings {
         assist_api_url: String::new(),
         assist_api_key: String::new(),
         assist_model: String::new(),
+        // The frontier/assist model has its own (typically large) window; we
+        // don't track it separately, so leave 0 -> legacy threshold fallback.
+        context_tokens: 0,
     }
 }
 
@@ -3485,16 +3584,23 @@ fn call_lmstudio_stateful(
     // chain but multiple local messages (first call after an app restart lost
     // the in-memory chain), replay local history as a transcript so context
     // isn't silently dropped.
-    let input_text = if previous_response_id.is_some() || non_system.len() <= 1 {
-        non_system
-            .last()
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string()
+    let last_content = non_system
+        .last()
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    // Send only the newest message on a live chain — UNLESS it's blank. An empty
+    // prompt (a state a block->resume can leave in the rebuilt history) makes the
+    // model emit filler prose with no thinking or tool calls, and on a chain it
+    // repeats turn after turn. When the delta would be empty (or there's no chain
+    // to continue), replay the local transcript so there is always real,
+    // role-structured content for the model to act on.
+    let send_delta = (previous_response_id.is_some() || non_system.len() <= 1)
+        && !last_content.trim().is_empty();
+    let input_text = if send_delta {
+        last_content.to_string()
     } else {
-        let mut transcript =
-            String::from("[Replaying prior conversation after session restart]\n\n");
+        let mut transcript = String::from("[Replaying prior conversation]\n\n");
         for m in &non_system {
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -3509,9 +3615,14 @@ fn call_lmstudio_stateful(
         "system_prompt": system_prompt,
         "stream": true
     });
-    if let Some(ref prev) = previous_response_id {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("previous_response_id".to_string(), serde_json::json!(prev));
+    // Only continue the server-side chain when we're actually sending the delta.
+    // A transcript replay (empty delta, or no chain) must NOT also chain, or the
+    // server would stack the replayed history on top of the thread it still holds.
+    if send_delta {
+        if let Some(ref prev) = previous_response_id {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("previous_response_id".to_string(), serde_json::json!(prev));
+            }
         }
     }
 
@@ -3558,7 +3669,21 @@ fn call_lmstudio_stateful(
         if run_is_cancelled(app_handle, run_id) {
             return Err("Cancelled by user".to_string());
         }
-        let line_str = line.map_err(|e| e.to_string())?;
+        let line_str = match line {
+            Ok(l) => l,
+            Err(e) => {
+                // Read error mid-stream — most often a slow-prefill/read timeout.
+                // Don't discard what already streamed: if anything came through,
+                // keep it as a (truncated) turn so it persists and renders
+                // instead of vanishing on the next re-render. Only a stream that
+                // produced nothing falls through to a hard error/block.
+                log_error(&format!("LM Studio stream read error: {}", e));
+                if full_response.trim().is_empty() {
+                    return Err(format!("LM Studio stream read failed: {}", e));
+                }
+                break;
+            }
+        };
         let trimmed = line_str.trim();
         let data = match trimmed.strip_prefix("data: ") {
             Some(d) => d.trim(),
@@ -4519,6 +4644,21 @@ pub async fn abort_chat(
 }
 
 #[tauri::command]
+pub async fn pause_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<(), String> {
+    // Non-destructive stop: just flag the run. The agent loop sees the flag at
+    // its next between-turns checkpoint and breaks to `blocked` without
+    // touching the worktree, so unblock_run can resume it. The current turn (an
+    // in-flight LLM call / tool execution) finishes first — pause never
+    // interrupts a tool mid-write. A no-op if the run isn't active.
+    let mut paused = state.paused_runs.lock().unwrap();
+    paused.insert(run_id);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn is_run_active(
     state: tauri::State<'_, AppState>,
     run_id: String,
@@ -4577,21 +4717,25 @@ pub async fn unblock_run(
 
         let mut logs = state.run_logs.lock().unwrap();
         if let Some(run_events) = logs.get_mut(&run_id) {
-            let user_msg = serde_json::json!({ "role": "user", "content": reply });
-            let user_payload = serde_json::to_string(&user_msg).unwrap_or_default();
+            // A plain resume (e.g. after a pause) passes an empty reply — don't
+            // inject a ghost empty user turn into the transcript in that case.
+            if !reply.trim().is_empty() {
+                let user_msg = serde_json::json!({ "role": "user", "content": reply });
+                let user_payload = serde_json::to_string(&user_msg).unwrap_or_default();
 
-            if let Ok(conn) = get_db_conn(&app_handle) {
-                let _ = conn.execute(
-                    "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    ("run", &card_id, &run_id, "message", &user_payload),
-                );
+                if let Ok(conn) = get_db_conn(&app_handle) {
+                    let _ = conn.execute(
+                        "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        ("run", &card_id, &run_id, "message", &user_payload),
+                    );
+                }
+
+                run_events.push(RunEvent {
+                    run_id: run_id.clone(),
+                    event_type: "message".to_string(),
+                    payload: user_payload,
+                });
             }
-
-            run_events.push(RunEvent {
-                run_id: run_id.clone(),
-                event_type: "message".to_string(),
-                payload: user_payload,
-            });
         }
         drop(logs);
 
@@ -7251,6 +7395,7 @@ fn compute_run_vitals(events: &[RunEvent]) -> RunVitals {
     for ev in events {
         match ev.event_type.as_str() {
             "reasoning" => v.reasoning_events += 1,
+            "empty" => v.empty_responses += 1,
             "metrics" => {
                 v.llm_calls += 1;
                 if let Ok(p) = serde_json::from_str::<serde_json::Value>(&ev.payload) {
@@ -8389,6 +8534,30 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 }
             }
 
+            // Cooperative pause checkpoint: a pause_run request breaks the loop
+            // to `blocked` here, between turns (never mid-tool), preserving the
+            // worktree and event history so unblock_run can resume cleanly.
+            {
+                let paused = {
+                    let mut paused = state.paused_runs.lock().unwrap();
+                    paused.remove(&run_id_clone)
+                };
+                if paused {
+                    append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "blocked".to_string(),
+                        payload: serde_json::json!({
+                            "reason": "paused",
+                            "message": "Run paused by the developer. The worktree and full history are intact — resume from chat when ready."
+                        }).to_string(),
+                    });
+                    set_card_status(&app_handle_clone, &state, &card_id, "blocked");
+                    let _ = app_handle_clone
+                        .emit("run-updated", serde_json::json!({ "run_id": run_id_clone }));
+                    break 'run;
+                }
+            }
+
             if step >= max_steps {
                 log_error(&format!(
                     "Max step ceiling reached ({}) for run {}",
@@ -8748,6 +8917,11 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 // the model and continue; only a persistent stall blocks.
                 if visible.is_empty() && empty_response_streak < 2 {
                     empty_response_streak += 1;
+                    append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "empty".to_string(),
+                        payload: serde_json::json!({ "reason": "no_output" }).to_string(),
+                    });
                     append_run_event(
                         &app_handle_clone,
                         &state,
@@ -8769,6 +8943,13 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 }
 
                 // Genuine question — or a persistent stall after repeated nudges.
+                if visible.is_empty() {
+                    append_run_event(&app_handle_clone, &state, &run_id_clone, RunEvent {
+                        run_id: run_id_clone.clone(),
+                        event_type: "empty".to_string(),
+                        payload: serde_json::json!({ "reason": "stall" }).to_string(),
+                    });
+                }
                 let (agent_msg, blocked_msg) = if visible.is_empty() {
                     (
                         "(the agent produced no visible output)".to_string(),
@@ -9371,7 +9552,7 @@ BeetleAI
             },
         ];
 
-        let history = get_history_messages(&events);
+        let history = get_history_messages(&events, 0);
         assert_eq!(history.len(), 2);
 
         let first = &history[0];

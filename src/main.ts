@@ -413,6 +413,7 @@ interface RunVitals {
   successes: number;
   failures: number;
   malformed: number;
+  empty_responses: number;
   reads: number;
   writes: number;
   reasoning_events: number;
@@ -455,6 +456,9 @@ interface LlmSettings {
   assist_api_url?: string;
   assist_api_key?: string;
   assist_model?: string;
+  // Primary model's usable context window (tokens); drives the compaction
+  // threshold. 0/absent = legacy fixed threshold.
+  context_tokens?: number;
 }
 
 // App State
@@ -496,6 +500,8 @@ const controlsActive = document.getElementById("controls-active") as HTMLDivElem
 const controlsReview = document.getElementById("controls-review") as HTMLDivElement;
 
 const btnStartRun = document.getElementById("btn-start-run") as HTMLButtonElement;
+const btnPauseRun = document.getElementById("btn-pause-run") as HTMLButtonElement;
+const btnResumeRun = document.getElementById("btn-resume-run") as HTMLButtonElement;
 const btnCancelRun = document.getElementById("btn-cancel-run") as HTMLButtonElement;
 const btnAcceptRun = document.getElementById("btn-accept-run") as HTMLButtonElement;
 const btnRejectRun = document.getElementById("btn-reject-run") as HTMLButtonElement;
@@ -541,6 +547,21 @@ const btnFetchModels = document.getElementById("btn-fetch-models") as HTMLButton
 const btnToggleModelInput = document.getElementById("btn-toggle-model-input") as HTMLButtonElement;
 const modelContextInfo = document.getElementById("model-context-info") as HTMLSpanElement;
 const settingsSteps = document.getElementById("settings-steps") as HTMLInputElement;
+const settingsContextTokens = document.getElementById("settings-context-tokens") as HTMLSelectElement;
+
+// Select a context-window value in the dropdown, injecting a custom <option>
+// first if the value isn't one of the standard presets (e.g. a model reports an
+// unusual num_ctx). Keeps the dropdown authoritative while still showing odd values.
+function setContextTokensValue(tokens: number) {
+  const val = String(tokens || 0);
+  if (![...settingsContextTokens.options].some(o => o.value === val)) {
+    const opt = document.createElement("option");
+    opt.value = val;
+    opt.textContent = tokens >= 1024 ? `${(tokens / 1024).toFixed(0)}k (${tokens})` : `${tokens}`;
+    settingsContextTokens.appendChild(opt);
+  }
+  settingsContextTokens.value = val;
+}
 const settingsAssistProvider = document.getElementById("settings-assist-provider") as HTMLSelectElement;
 const settingsAssistUrl = document.getElementById("settings-assist-url") as HTMLInputElement;
 const settingsAssistKey = document.getElementById("settings-assist-key") as HTMLInputElement;
@@ -941,6 +962,32 @@ function setupEventListeners() {
     }
   });
 
+  btnPauseRun.addEventListener("click", async () => {
+    if (!activeCard || !activeCard.run_id) return;
+    try {
+      await invoke("pause_run", { runId: activeCard.run_id });
+      // The loop blocks at its next between-turns checkpoint; the current turn
+      // finishes first, so reflect "pausing" without forcing the status here.
+      btnPauseRun.disabled = true;
+      showToast("Pausing after the current step finishes…", "info");
+    } catch (err) {
+      console.error(err);
+      showToast("Failed to pause run: " + err, "error");
+    }
+  });
+
+  btnResumeRun.addEventListener("click", async () => {
+    if (!activeCard || !activeCard.run_id) return;
+    try {
+      await invoke("unblock_run", { runId: activeCard.run_id, reply: "" });
+      btnPauseRun.disabled = false;
+      await refreshState();
+    } catch (err) {
+      console.error(err);
+      showToast("Failed to resume run: " + err, "error");
+    }
+  });
+
   btnAcceptRun.addEventListener("click", async () => {
     if (!activeCard || !activeCard.run_id) return;
     try {
@@ -1140,6 +1187,7 @@ async function openSettingsModal() {
     settingsKey.value = settings.api_key;
     settingsModel.value = settings.model;
     settingsSteps.value = settings.max_steps.toString();
+    setContextTokensValue(settings.context_tokens ?? 0);
     settingsAssistProvider.value = settings.assist_provider || "";
     settingsAssistUrl.value = settings.assist_api_url || "";
     settingsAssistKey.value = settings.assist_api_key || "";
@@ -1169,6 +1217,7 @@ async function saveSettings() {
     api_key: settingsKey.value,
     model: settingsModel.value,
     max_steps: parseInt(settingsSteps.value, 10) || 50,
+    context_tokens: parseInt(settingsContextTokens.value, 10) || 0,
     assist_provider: settingsAssistProvider.value,
     assist_api_url: settingsAssistUrl.value,
     assist_api_key: settingsAssistKey.value,
@@ -1244,6 +1293,8 @@ function onModelSelectChange() {
   if (m) {
     modelContextInfo.textContent = `VRAM Status: ${m.is_loaded ? 'Loaded (Running)' : 'Idle'} | Context Window: ${m.context_size ? m.context_size.toLocaleString() + ' tokens' : 'Unknown'}`;
     modelContextInfo.style.display = "block";
+    // Auto-fill the compaction window from the model's reported context size.
+    if (m.context_size) setContextTokensValue(m.context_size);
   } else {
     modelContextInfo.style.display = "none";
   }
@@ -1669,14 +1720,19 @@ async function updateActiveCardUI() {
     chatInput.placeholder = "Start a run to put the agent to work on this card...";
   } else if (activeCard.status === "running") {
     controlsActive.style.display = "block";
+    btnPauseRun.style.display = "inline-block";
+    btnPauseRun.disabled = false;
+    btnResumeRun.style.display = "none";
     chatInput.disabled = false;
     btnSendChat.disabled = false;
     chatInput.placeholder = "Interject message to agent...";
   } else if (activeCard.status === "blocked") {
     controlsActive.style.display = "block";
+    btnPauseRun.style.display = "none";
+    btnResumeRun.style.display = "inline-block";
     chatInput.disabled = false;
     btnSendChat.disabled = false;
-    chatInput.placeholder = "Provide feedback to unblock agent...";
+    chatInput.placeholder = "Provide feedback to unblock agent, or hit Resume to continue as-is...";
   } else if (activeCard.status === "review") {
     controlsReview.style.display = "flex";
     chatInput.placeholder = "Run finished — review the diff and accept or reject...";
@@ -1787,6 +1843,7 @@ function renderVitalsPanel(v: RunVitals) {
           ${chip("read : write", `${v.reads} : ${v.writes}`)}
           ${chip("worst edit retries", String(v.worst_edit_retry_streak))}
           ${chip("malformed", String(v.malformed))}
+          ${v.empty_responses > 0 ? chip("empty turns", String(v.empty_responses)) : ""}
           ${chip("reasoning turns", String(v.reasoning_events))}
         </div>
         ${throughputRow}

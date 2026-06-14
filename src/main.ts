@@ -1828,6 +1828,14 @@ function renderVitalsPanel(v: RunVitals) {
   const wrapper = document.createElement("div");
   wrapper.className = "chat-bubble tool";
   wrapper.style.alignSelf = "stretch";
+  // Pin to the top of the scrolling transcript so the panel stays reachable
+  // instead of scrolling away the moment the run produces output.
+  wrapper.style.position = "sticky";
+  wrapper.style.top = "0";
+  wrapper.style.zIndex = "5";
+  wrapper.style.background = "var(--bg-secondary, #1e1e1e)";
+  wrapper.style.borderBottom = "1px solid var(--border-color, rgba(127,127,127,0.25))";
+  wrapper.style.boxShadow = "0 2px 6px rgba(0,0,0,0.18)";
   wrapper.innerHTML = `
     <details style="width:100%;">
       <summary class="tool-summary">
@@ -1863,6 +1871,25 @@ function renderVitalsPanel(v: RunVitals) {
     </details>
   `;
   chatMessages.appendChild(wrapper);
+}
+
+// Compact per-turn cost line, attached as a footer to the turn's bubble. The
+// `metrics` event is emitted per LLM call and precedes that turn's output, so
+// it's stashed and rendered on the next agent/tool bubble.
+function metricsFooter(m: any): HTMLElement {
+  const f = document.createElement("div");
+  f.style.fontSize = "0.68rem";
+  f.style.color = "var(--text-muted)";
+  f.style.marginTop = "6px";
+  f.style.opacity = "0.85";
+  const fmtMs = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
+  const parts: string[] = [];
+  if (typeof m.total_ms === "number") parts.push(fmtMs(m.total_ms));
+  if (typeof m.ttft_ms === "number") parts.push(`ttft ${fmtMs(m.ttft_ms)}`);
+  if (typeof m.decode_tps === "number") parts.push(`${m.approx ? "~" : ""}${Math.round(m.decode_tps)} tok/s`);
+  if (typeof m.tokens_out === "number") parts.push(`${m.tokens_out} tok`);
+  f.textContent = parts.length ? `⏱ ${parts.join(" · ")}` : "";
+  return f;
 }
 
 // Render run execution transcript logs
@@ -1919,7 +1946,14 @@ function renderLogs(logs: RunEvent[], vitals: RunVitals | null = null) {
     processedLogs.push(pendingToolCall);
   }
 
+  let pendingMetrics: any = null;
   processedLogs.forEach((log) => {
+    // Per-call metrics precede their turn's output; stash and attach as a footer
+    // to the next agent/tool bubble so each turn shows its own cost inline.
+    if (log.event_type === "metrics") {
+      try { pendingMetrics = JSON.parse(log.payload); } catch { /* ignore */ }
+      return;
+    }
     if (log.event_type === "compaction") {
       const div = document.createElement("div");
       div.className = "bubble-meta chat-compaction-divider";
@@ -2013,6 +2047,10 @@ function renderLogs(logs: RunEvent[], vitals: RunVitals | null = null) {
         content.innerHTML = formatMarkdownInChat(msg.content);
         wrapper.appendChild(content);
 
+        if (isAgent && pendingMetrics) {
+          wrapper.appendChild(metricsFooter(pendingMetrics));
+          pendingMetrics = null;
+        }
         chatMessages.appendChild(wrapper);
       } catch (err) {
         console.error(err);
@@ -2061,6 +2099,10 @@ function renderLogs(logs: RunEvent[], vitals: RunVitals | null = null) {
             </div>
           </details>
         `;
+        if (pendingMetrics) {
+          wrapper.appendChild(metricsFooter(pendingMetrics));
+          pendingMetrics = null;
+        }
         chatMessages.appendChild(wrapper);
       } catch (err) {
         console.error(err);

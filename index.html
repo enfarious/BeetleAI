@@ -38,8 +38,15 @@
                 <button class="btn btn-primary" id="btn-new-project-toggle" style="flex: 0; padding: 0 12px; font-size: 1.2rem; font-weight: bold;" title="Create or Import Project">+</button>
                 <button class="btn btn-secondary" id="btn-edit-project-toggle" style="flex: 0; padding: 0 10px; font-size: 1rem;" title="Edit or Remove Active Project">✎</button>
               </div>
+              <div class="rag-index-bar">
+                <button class="btn btn-secondary" id="btn-reindex" title="Build/refresh the semantic codebase index for this project">⟳ Reindex</button>
+                <span id="rag-status" class="rag-status" title="">
+                  <span class="rag-dot"></span>
+                  <span id="rag-status-text">—</span>
+                </span>
+              </div>
             </div>
-            
+
             <div class="project-select-container" id="repo-workspace-section">
               <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                 <label style="margin: 0;">Repository Workspace</label>
@@ -114,6 +121,8 @@
               <button class="btn btn-primary" id="btn-start-run">🚀 Start Run</button>
             </div>
             <div class="run-controls" id="controls-active" style="display: none;">
+              <button class="btn btn-secondary" id="btn-pause-run">⏸ Pause</button>
+              <button class="btn btn-primary" id="btn-resume-run">▶ Resume</button>
               <button class="btn btn-danger" id="btn-cancel-run">🛑 Cancel Run</button>
             </div>
             <div class="run-controls" id="controls-review" style="display: none;">
@@ -166,61 +175,145 @@
     <div class="modal-overlay" id="settings-modal" style="display: none;">
       <div class="modal-container">
         <header class="modal-header">
-          <h3>LLM Service Settings</h3>
+          <h3>Settings</h3>
           <button class="modal-close" id="btn-settings-close">×</button>
         </header>
         <div class="modal-body">
           <form id="settings-form" class="settings-form">
-            <div class="form-group">
-              <label for="settings-provider">LLM Provider</label>
-              <select id="settings-provider" class="custom-select">
-                <option value="openai">OpenAI (Official)</option>
-                <option value="anthropic">Anthropic (Claude)</option>
-                <option value="lmstudio">LM Studio (Local)</option>
-                <option value="ollama">Ollama (Local)</option>
-                <option value="custom">Custom (OpenAI-compatible API)</option>
-              </select>
+            <div class="settings-tabs" role="tablist">
+              <button type="button" class="settings-tab-btn active" data-tab="model">Model</button>
+              <button type="button" class="settings-tab-btn" data-tab="assist">Phone a Friend</button>
+              <button type="button" class="settings-tab-btn" data-tab="rag">Embeddings &amp; RAG</button>
             </div>
-            <div class="form-group">
-              <label for="settings-url">API Base URL</label>
-              <input type="text" id="settings-url" class="form-input" placeholder="https://api.openai.com/v1" />
-            </div>
-            <div class="form-group">
-              <label for="settings-key">API Key / Token</label>
-              <input type="password" id="settings-key" class="form-input" placeholder="Enter API Key..." />
-            </div>
-            <div class="form-group">
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <label for="settings-model">Model Name</label>
-                <button type="button" class="btn btn-secondary" id="btn-toggle-model-input" style="padding: 2px 6px; font-size: 0.75rem; display: none;">Type manually</button>
-              </div>
-              <div style="display: flex; gap: 8px;">
-                <select id="settings-model-select" class="custom-select" style="display: none; flex: 1;">
-                  <option value="">Select a model...</option>
+
+            <!-- MODEL TAB -->
+            <div class="settings-tab-panel active" data-panel="model">
+              <div class="form-group">
+                <label for="settings-provider">LLM Provider</label>
+                <select id="settings-provider" class="custom-select">
+                  <option value="openai">OpenAI (Official)</option>
+                  <option value="anthropic">Anthropic (Claude)</option>
+                  <option value="lmstudio">LM Studio (Local)</option>
+                  <option value="ollama">Ollama (Local)</option>
+                  <option value="custom">Custom (OpenAI-compatible API)</option>
                 </select>
-                <input type="text" id="settings-model" class="form-input" placeholder="gpt-4o" style="flex: 1;" />
-                <button type="button" class="btn btn-secondary" id="btn-fetch-models" style="padding: 0 12px; flex: 0; font-size: 0.85rem;" title="Query models from server">Fetch</button>
               </div>
-              <span id="model-context-info" style="font-size: 0.8rem; color: var(--text-muted); display: none; margin-top: 4px;"></span>
+              <div class="form-group">
+                <label for="settings-url">API Base URL</label>
+                <input type="text" id="settings-url" class="form-input" placeholder="https://api.openai.com/v1" />
+              </div>
+              <div class="form-group">
+                <label for="settings-key">API Key / Token</label>
+                <input type="password" id="settings-key" class="form-input" placeholder="Enter API Key..." />
+              </div>
+              <div class="form-group">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <label for="settings-model">Model Name</label>
+                  <button type="button" class="btn btn-secondary" id="btn-toggle-model-input" style="padding: 2px 6px; font-size: 0.75rem; display: none;">Type manually</button>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                  <select id="settings-model-select" class="custom-select" style="display: none; flex: 1;">
+                    <option value="">Select a model...</option>
+                  </select>
+                  <input type="text" id="settings-model" class="form-input" placeholder="gpt-4o" style="flex: 1;" />
+                  <button type="button" class="btn btn-secondary" id="btn-fetch-models" style="padding: 0 12px; flex: 0; font-size: 0.85rem;" title="Query models from server">Fetch</button>
+                </div>
+                <span id="model-context-info" style="font-size: 0.8rem; color: var(--text-muted); display: none; margin-top: 4px;"></span>
+              </div>
+              <div class="form-group">
+                <label for="settings-steps">Max Step Ceiling</label>
+                <input type="number" id="settings-steps" class="form-input" value="50" min="1" max="500" />
+              </div>
+              <div class="form-group">
+                <label for="settings-context-tokens">Model Context Window</label>
+                <select id="settings-context-tokens" class="custom-select">
+                  <option value="0">Auto / legacy (no window hint)</option>
+                  <option value="2048">2k (2048)</option>
+                  <option value="4096">4k (4096)</option>
+                  <option value="8192">8k (8192)</option>
+                  <option value="16384">16k (16384)</option>
+                  <option value="32768">32k (32768)</option>
+                  <option value="65536">64k (65536)</option>
+                  <option value="131072">128k (131072)</option>
+                </select>
+                <span style="display:block; font-size:0.78rem; color: var(--text-muted); margin-top:4px;">Controls when the agent compacts and how hard it trims, so long runs don't overflow (stall/timeout) or over-compact. Auto-fills from the model you pick via Fetch — match your model's num_ctx.</span>
+              </div>
             </div>
-            <div class="form-group">
-              <label for="settings-steps">Max Step Ceiling</label>
-              <input type="number" id="settings-steps" class="form-input" value="50" min="1" max="500" />
+
+            <!-- PHONE A FRIEND TAB -->
+            <div class="settings-tab-panel" data-panel="assist">
+              <span class="settings-tab-hint">Optional. A stronger model Beetle consults via <code>request_assist</code> when it's stuck. Leave provider on "(disabled)" to turn it off.</span>
+              <div class="form-group">
+                <label for="settings-assist-provider">Assist Provider</label>
+                <select id="settings-assist-provider" class="custom-select">
+                  <option value="">(disabled)</option>
+                  <option value="anthropic">Anthropic</option>
+                  <option value="openai">OpenAI-compatible</option>
+                  <option value="ollama">Ollama</option>
+                  <option value="lmstudio">LM Studio</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="settings-assist-url">Assist API Base URL</label>
+                <input type="text" id="settings-assist-url" class="form-input" placeholder="https://api.anthropic.com/v1" />
+              </div>
+              <div class="form-group">
+                <label for="settings-assist-key">Assist API Key</label>
+                <input type="password" id="settings-assist-key" class="form-input" placeholder="Assist API key..." />
+              </div>
+              <div class="form-group">
+                <label for="settings-assist-model">Assist Model</label>
+                <input type="text" id="settings-assist-model" class="form-input" placeholder="claude-opus-4-8" />
+              </div>
             </div>
-            <div class="form-group" style="border-top: 1px solid var(--border-color, rgba(127,127,127,0.2)); padding-top: 14px; margin-top: 6px;">
-              <label style="font-weight: 600;">Phone-a-Friend (Frontier Assist)</label>
-              <span style="display: block; font-size: 0.78rem; color: var(--text-muted); margin: 4px 0 10px;">Optional. A stronger model Beetle consults via <code>request_assist</code> when it's stuck. Leave provider on "(disabled)" to turn it off.</span>
-              <select id="settings-assist-provider" class="custom-select" style="margin-bottom: 8px;">
-                <option value="">(disabled)</option>
-                <option value="anthropic">Anthropic</option>
-                <option value="openai">OpenAI-compatible</option>
-                <option value="ollama">Ollama</option>
-                <option value="lmstudio">LM Studio</option>
-              </select>
-              <input type="text" id="settings-assist-url" class="form-input" placeholder="https://api.anthropic.com/v1" style="margin-bottom: 8px;" />
-              <input type="password" id="settings-assist-key" class="form-input" placeholder="Assist API key..." style="margin-bottom: 8px;" />
-              <input type="text" id="settings-assist-model" class="form-input" placeholder="claude-opus-4-8" />
+
+            <!-- EMBEDDINGS & RAG TAB -->
+            <div class="settings-tab-panel" data-panel="rag">
+              <span class="settings-tab-hint">Optional. Powers semantic <code>recall</code> and the <code>search_codebase</code> tool. Anthropic has no embeddings API — use Voyage or a local Ollama embed model. Leave provider on "(disabled)" to turn RAG off.</span>
+              <div class="form-group">
+                <label for="settings-embedding-provider">Embedding Provider</label>
+                <select id="settings-embedding-provider" class="custom-select">
+                  <option value="">(disabled)</option>
+                  <option value="ollama">Ollama (Local)</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="voyage">Voyage AI</option>
+                  <option value="lmstudio">LM Studio (Local)</option>
+                  <option value="custom">Custom (OpenAI-compatible API)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="settings-embedding-url">Embedding API Base URL</label>
+                <input type="text" id="settings-embedding-url" class="form-input" placeholder="http://localhost:11434" />
+              </div>
+              <div class="form-group">
+                <label for="settings-embedding-key">Embedding API Key</label>
+                <input type="password" id="settings-embedding-key" class="form-input" placeholder="Embedding API key..." />
+              </div>
+              <div class="form-group">
+                <label for="settings-embedding-model">Embedding Model</label>
+                <div style="display: flex; gap: 8px;">
+                  <input type="text" id="settings-embedding-model" class="form-input" placeholder="nomic-embed-text" style="flex: 1;" />
+                  <button type="button" class="btn btn-secondary" id="btn-test-embedding" style="padding: 0 12px; flex: 0; font-size: 0.85rem;" title="Embed a probe string to verify connectivity">Test</button>
+                </div>
+                <span id="embedding-test-info" style="font-size: 0.8rem; color: var(--text-muted); display: none; margin-top: 4px;"></span>
+              </div>
+              <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+                  <input type="checkbox" id="settings-embedding-auto-inject" checked />
+                  Auto-inject top matches into agent context
+                </label>
+                <span class="settings-tab-hint" style="margin-top: 4px;">When on, each run automatically gets the top code matches for its task added to context (one embedding call per run) — in addition to the agent's <code>search_codebase</code> tool. Turn off to save tokens and rely on the tool alone.</span>
+              </div>
+              <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 8px; font-weight: normal; cursor: pointer;">
+                  <input type="checkbox" id="settings-embedding-auto-index" checked />
+                  Auto-index codebase before each run
+                </label>
+                <span class="settings-tab-hint" style="margin-top: 4px;">When on, the index is incrementally refreshed in the background as each run starts (only changed files are re-embedded). Turn off for manual indexing — the index updates only when you click <strong>Reindex</strong>, avoiding the per-run file scan on large repos.</span>
+              </div>
+              <span class="settings-tab-hint">Once a provider is set and tested, build the index per-project from the <strong>Reindex</strong> button under the project selector.</span>
             </div>
+
             <div class="modal-actions">
               <button type="button" class="btn btn-secondary" id="btn-settings-cancel">Cancel</button>
               <button type="submit" class="btn btn-primary">Save Settings</button>

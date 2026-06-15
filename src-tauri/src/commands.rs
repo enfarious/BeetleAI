@@ -168,6 +168,35 @@ pub struct LlmSettings {
     /// threshold. Defaulted for serde so old config.json / DB rows load unchanged.
     #[serde(default)]
     pub context_tokens: u32,
+    // Embedding model config: a THIRD provider held alongside the chat and
+    // assist models, used only for RAG (codebase indexing + semantic recall).
+    // Kept separate because embeddings are a distinct API surface (no chat
+    // streaming, no tools) and the best embedding provider is often not the
+    // chat provider — e.g. Anthropic has no embeddings endpoint, so Voyage or a
+    // local Ollama model fills that role. All optional/defaulted for serde so
+    // existing config.json and DB rows load unchanged; empty == RAG disabled.
+    #[serde(default)]
+    pub embedding_provider: String,
+    #[serde(default)]
+    pub embedding_api_url: String,
+    #[serde(default)]
+    pub embedding_api_key: String,
+    #[serde(default)]
+    pub embedding_model: String,
+    /// When true (default), the run agent gets the top codebase matches for its
+    /// task auto-injected into context each run, in addition to the on-demand
+    /// search_codebase tool. Off lets the user avoid the per-run token cost.
+    #[serde(default = "default_true")]
+    pub embedding_auto_inject: bool,
+    /// When true (default), the codebase index is incrementally refreshed in the
+    /// background at the start of each run. Off = index only on demand via the
+    /// Reindex button (manual indexing), avoiding the per-run file walk.
+    #[serde(default = "default_true")]
+    pub embedding_auto_index: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl LlmSettings {
@@ -176,6 +205,15 @@ impl LlmSettings {
         !self.assist_provider.trim().is_empty()
             && !self.assist_api_url.trim().is_empty()
             && !self.assist_model.trim().is_empty()
+    }
+
+    /// True only when every field the embedding call needs is present. Gates all
+    /// RAG features: when false, indexing is skipped and semantic recall falls
+    /// back to keyword search.
+    pub fn embedding_configured(&self) -> bool {
+        !self.embedding_provider.trim().is_empty()
+            && !self.embedding_api_url.trim().is_empty()
+            && !self.embedding_model.trim().is_empty()
     }
 }
 
@@ -416,9 +454,10 @@ fn insert_memory(
     source: &str,
     run_id: Option<&str>,
     card_id: Option<&str>,
+    embedding: Option<&[u8]>,
 ) -> Result<(), rusqlite::Error> {
     conn.execute(
-        "INSERT INTO memories (project_path, topic, content, source, run_id, card_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO memories (project_path, topic, content, source, run_id, card_id, created_at, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         (
             project_path,
             topic,
@@ -427,9 +466,25 @@ fn insert_memory(
             run_id,
             card_id,
             chrono::Utc::now().to_rfc3339(),
+            embedding,
         ),
     )?;
     Ok(())
+}
+
+/// Best-effort embedding of a memory (topic + content) for semantic recall.
+/// Returns None when RAG is unconfigured or the provider errors — memory
+/// writes must never fail just because embedding is unavailable; those rows
+/// simply fall back to keyword recall.
+fn embed_memory_text(settings: &LlmSettings, topic: &str, content: &str) -> Option<Vec<u8>> {
+    if !settings.embedding_configured() {
+        return None;
+    }
+    let text = format!("{}\n{}", topic, content);
+    match call_embedding(settings, &[text]) {
+        Ok(v) => v.into_iter().next().map(|vec| embedding_to_blob(&vec)),
+        Err(_) => None,
+    }
 }
 
 /// Recover the task_complete summary for a run from the persisted logs.
@@ -660,7 +715,13 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
             assist_api_url TEXT NOT NULL DEFAULT '',
             assist_api_key TEXT NOT NULL DEFAULT '',
             assist_model TEXT NOT NULL DEFAULT '',
-            context_tokens INTEGER NOT NULL DEFAULT 0
+            context_tokens INTEGER NOT NULL DEFAULT 0,
+            embedding_provider TEXT NOT NULL DEFAULT '',
+            embedding_api_url TEXT NOT NULL DEFAULT '',
+            embedding_api_key TEXT NOT NULL DEFAULT '',
+            embedding_model TEXT NOT NULL DEFAULT '',
+            embedding_auto_inject INTEGER NOT NULL DEFAULT 1,
+            embedding_auto_index INTEGER NOT NULL DEFAULT 1
         );",
         [],
     )
@@ -687,6 +748,30 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
     );
     let _ = conn.execute(
         "ALTER TABLE settings ADD COLUMN context_tokens INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN embedding_provider TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN embedding_api_url TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN embedding_api_key TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN embedding_model TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN embedding_auto_inject INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE settings ADD COLUMN embedding_auto_index INTEGER NOT NULL DEFAULT 1",
         [],
     );
 
@@ -788,6 +873,47 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
+    // Optional embedding for each memory (little-endian f32 BLOB), enabling
+    // semantic recall. Nullable: rows created before RAG was configured, or
+    // while it's off, simply have no vector and fall back to keyword match.
+    let _ = conn.execute("ALTER TABLE memories ADD COLUMN embedding BLOB", []);
+
+    // RAG codebase index. `rag_files` tracks per-file content hashes so a
+    // reindex only re-embeds files that actually changed; `rag_chunks` holds the
+    // embedded windows. Both scoped by project_path (same scope key as memories).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_files (
+            project_path TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            hash TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            PRIMARY KEY (project_path, file_path)
+        );",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS rag_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_path TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            content TEXT NOT NULL,
+            embedding BLOB NOT NULL
+        );",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rag_chunks_project ON rag_chunks (project_path);",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+
     let settings_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM settings", [], |row| row.get(0))
         .unwrap_or(0);
@@ -827,7 +953,7 @@ pub fn init_db(app_handle: &tauri::AppHandle) -> Result<(), String> {
 
 fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> {
     let mut stmt = conn
-        .prepare("SELECT provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model, context_tokens FROM settings LIMIT 1")
+        .prepare("SELECT provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model, context_tokens, embedding_provider, embedding_api_url, embedding_api_key, embedding_model, embedding_auto_inject, embedding_auto_index FROM settings LIMIT 1")
         .map_err(|e| e.to_string())?;
     let settings_opt = stmt
         .query_row([], |row| {
@@ -842,6 +968,12 @@ fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> 
                 assist_api_key: row.get(7)?,
                 assist_model: row.get(8)?,
                 context_tokens: row.get(9)?,
+                embedding_provider: row.get(10)?,
+                embedding_api_url: row.get(11)?,
+                embedding_api_key: row.get(12)?,
+                embedding_model: row.get(13)?,
+                embedding_auto_inject: row.get(14)?,
+                embedding_auto_index: row.get(15)?,
             })
         })
         .optional()
@@ -875,7 +1007,7 @@ fn load_config_sqlite(conn: &rusqlite::Connection) -> Result<AppConfig, String> 
 fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result<(), String> {
     let _ = conn.execute("DELETE FROM settings", []);
     conn.execute(
-        "INSERT INTO settings (provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model, context_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO settings (provider, api_url, api_key, model, max_steps, assist_provider, assist_api_url, assist_api_key, assist_model, context_tokens, embedding_provider, embedding_api_url, embedding_api_key, embedding_model, embedding_auto_inject, embedding_auto_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         (
             &config.settings.provider,
             &config.settings.api_url,
@@ -887,6 +1019,12 @@ fn save_config_sqlite(conn: &rusqlite::Connection, config: &AppConfig) -> Result
             &config.settings.assist_api_key,
             &config.settings.assist_model,
             &config.settings.context_tokens,
+            &config.settings.embedding_provider,
+            &config.settings.embedding_api_url,
+            &config.settings.embedding_api_key,
+            &config.settings.embedding_model,
+            &config.settings.embedding_auto_inject,
+            &config.settings.embedding_auto_index,
         ),
     ).map_err(|e| e.to_string())?;
 
@@ -1054,6 +1192,12 @@ fn load_config(app_handle: &tauri::AppHandle) -> AppConfig {
             assist_api_key: String::new(),
             assist_model: String::new(),
             context_tokens: 0,
+            embedding_provider: String::new(),
+            embedding_api_url: String::new(),
+            embedding_api_key: String::new(),
+            embedding_model: String::new(),
+            embedding_auto_inject: true,
+            embedding_auto_index: true,
         },
         projects: vec![Project {
             id: "beetleai".to_string(),
@@ -1404,8 +1548,27 @@ pub async fn save_settings(
     settings: LlmSettings,
 ) -> Result<(), String> {
     let mut config = load_config(&app_handle);
+    // Detect an embedding-identity change before overwriting. A different
+    // provider/model produces vectors in a different space (and often dimension),
+    // so every stored vector becomes meaningless — comparing across them yields
+    // garbage rankings, not just dimension-mismatch zeros.
+    let embedding_changed = config.settings.embedding_provider.trim().to_lowercase()
+        != settings.embedding_provider.trim().to_lowercase()
+        || config.settings.embedding_model.trim().to_lowercase()
+            != settings.embedding_model.trim().to_lowercase();
     config.settings = settings;
-    save_config(&app_handle, &config)
+    save_config(&app_handle, &config)?;
+
+    // Drop the now-incompatible index + memory vectors so a fresh reindex (and
+    // re-embed on the next remember/recall) rebuilds them in the new space.
+    if embedding_changed {
+        if let Ok(conn) = get_db_conn(&app_handle) {
+            let _ = conn.execute("DELETE FROM rag_chunks", []);
+            let _ = conn.execute("DELETE FROM rag_files", []);
+            let _ = conn.execute("UPDATE memories SET embedding = NULL", []);
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1830,17 +1993,39 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "recall",
-                    "description": "Searches this project's long-term memory by keyword (topic and content, case-insensitive) and returns the most recent matches. Call with an empty query to see the latest memories. Check memory before exploring from scratch.",
+                    "description": "Searches this project's long-term memory and returns the most relevant matches. When an embedding provider is configured the ranking is semantic (by meaning, so related wording matches even without shared keywords); otherwise it falls back to keyword match. Call with an empty query to see the latest memories. Check memory before exploring from scratch.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "Keyword to search for. Empty returns the most recent memories."
+                                "description": "What to look for, in natural language or keywords. Empty returns the most recent memories."
                             },
                             "limit": {
                                 "type": "integer",
                                 "description": "Optional max results 1-10 (default 5)."
+                            }
+                        },
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "search_codebase" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "search_codebase",
+                    "description": "Semantic search over the project's indexed code and docs. Embeds your query and returns the most relevant chunks by meaning (with file:line ranges), so it finds code by concept even when you don't know the exact identifier. Best for 'where is X handled?' / 'how does Y work?' questions. For exact strings or symbol names, prefer search_grep / find_symbol. Returns nothing if the project hasn't been indexed yet.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural-language description of what you're looking for."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Optional max results 1-15 (default 6)."
                             }
                         },
                         "required": ["query"],
@@ -2648,6 +2833,786 @@ fn http_agent() -> ureq::Agent {
         .build()
 }
 
+// ---------------------------------------------------------------------------
+// Embeddings (RAG)
+//
+// A separate, narrow API surface from chat: no streaming, no tools, just
+// text-in / vector-out. Two request shapes cover every provider we support:
+//   * Ollama native   -> POST /api/embed        { model, input: [..] } -> { embeddings: [[..]] }
+//   * OpenAI-compatible-> POST /v1/embeddings    { model, input: [..] } -> { data: [{ embedding: [..] }] }
+// "voyage", "openai", "lmstudio", "custom" all speak the OpenAI shape; only
+// "ollama" diverges. Keeping this independent of the chat ProviderKind means an
+// Anthropic-driven run (Anthropic has no embeddings endpoint) can still embed
+// via a local Ollama model or Voyage.
+// ---------------------------------------------------------------------------
+
+fn resolve_embedding_endpoint(provider: &str, base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if provider == "ollama" {
+        if base.ends_with("/api/embed") {
+            base.to_string()
+        } else {
+            let root = base.trim_end_matches("/v1").trim_end_matches('/');
+            format!("{}/api/embed", root)
+        }
+    } else {
+        // OpenAI-compatible: openai, voyage, lmstudio, custom, anything unknown.
+        if base.ends_with("/embeddings") {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{}/embeddings", base)
+        } else {
+            format!("{}/v1/embeddings", base)
+        }
+    }
+}
+
+fn embed_http_err(label: &str, e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            format!("{} embedding API error {}: {}", label, code, body)
+        }
+        other => format!("{} embedding request failed: {}", label, other),
+    }
+}
+
+fn json_to_f32_vec(arr: &[serde_json::Value]) -> Result<Vec<f32>, String> {
+    let mut v = Vec::with_capacity(arr.len());
+    for n in arr {
+        let f = n
+            .as_f64()
+            .ok_or_else(|| "embedding contained a non-numeric value".to_string())?;
+        v.push(f as f32);
+    }
+    Ok(v)
+}
+
+/// Generate embeddings for a batch of texts using the configured embedding
+/// provider. Returns one vector per input, in the same order. Any failure
+/// (unconfigured, network, unexpected response shape) is returned as an Err so
+/// callers can degrade to keyword search rather than silently storing empties.
+fn call_embedding(settings: &LlmSettings, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !settings.embedding_configured() {
+        return Err(
+            "Embedding provider is not configured (Settings → Embeddings & RAG).".to_string(),
+        );
+    }
+    let provider = settings.embedding_provider.trim().to_lowercase();
+    let url = resolve_embedding_endpoint(&provider, settings.embedding_api_url.trim());
+    let model = settings.embedding_model.trim();
+    let key = settings.embedding_api_key.trim();
+    let agent = http_agent();
+
+    let mut req = agent.post(&url).set("Content-Type", "application/json");
+    // Ollama needs no auth for the common localhost case; everything else uses
+    // Bearer. Only attach the header when a key is present so an empty key
+    // doesn't turn into a malformed "Bearer " that some servers reject.
+    if !key.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", key));
+    }
+    let payload = serde_json::json!({ "model": model, "input": texts });
+    let resp = req
+        .send_json(payload)
+        .map_err(|e| embed_http_err(&provider, e))?;
+    let body: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("embedding response was not valid JSON: {}", e))?;
+
+    if provider == "ollama" {
+        let arr = body
+            .get("embeddings")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("Ollama response missing 'embeddings': {}", body))?;
+        let mut out = Vec::with_capacity(arr.len());
+        for row in arr {
+            let inner = row
+                .as_array()
+                .ok_or_else(|| "Ollama 'embeddings' row was not an array".to_string())?;
+            out.push(json_to_f32_vec(inner)?);
+        }
+        Ok(out)
+    } else {
+        let data = body
+            .get("data")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("embedding response missing 'data': {}", body))?;
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let emb = item
+                .get("embedding")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "embedding item missing 'embedding' array".to_string())?;
+            out.push(json_to_f32_vec(emb)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Cosine similarity between two equal-length vectors. Returns 0.0 for a
+/// length mismatch or a zero-magnitude vector rather than NaN, so a bad row
+/// just sorts to the bottom instead of poisoning the ranking.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Pack an f32 vector into a little-endian byte BLOB for SQLite storage.
+fn embedding_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    bytes
+}
+
+/// Unpack a little-endian byte BLOB back into an f32 vector. A length that
+/// isn't a multiple of 4 yields an empty vec (treated as a non-match).
+fn blob_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    if bytes.len() % 4 != 0 {
+        return Vec::new();
+    }
+    let mut v = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    v
+}
+
+/// Test the embedding configuration by embedding a probe string. Returns the
+/// vector dimension on success so the UI can confirm the model is reachable and
+/// report what it's working with. Takes settings directly from the form so the
+/// user can verify before saving.
+#[tauri::command]
+pub async fn test_embedding(settings: LlmSettings) -> Result<usize, String> {
+    let vecs = call_embedding(
+        &settings,
+        &["BeetleAI embedding connectivity test.".to_string()],
+    )?;
+    let dim = vecs.first().map(|v| v.len()).unwrap_or(0);
+    if dim == 0 {
+        return Err("Provider returned no embedding vector.".to_string());
+    }
+    Ok(dim)
+}
+
+// ---------------------------------------------------------------------------
+// RAG ingestion: walk a project's text files, chunk them, embed the chunks, and
+// store them in rag_chunks for later semantic retrieval. Incremental — a file
+// whose content hash is unchanged since the last index is skipped, and files
+// that have disappeared have their chunks purged.
+// ---------------------------------------------------------------------------
+
+const RAG_CHUNK_LINES: usize = 60;
+const RAG_CHUNK_OVERLAP: usize = 12;
+const RAG_MAX_FILE_BYTES: u64 = 1_000_000;
+const RAG_EMBED_BATCH: usize = 16;
+
+#[derive(Serialize, Clone, Default, Debug)]
+pub struct RagIndexStats {
+    pub files_indexed: usize,
+    pub files_skipped: usize,
+    pub files_removed: usize,
+    pub chunks: usize,
+}
+
+struct RagChunk {
+    start_line: usize,
+    end_line: usize,
+    kind: String,
+    content: String,
+}
+
+/// Non-cryptographic content hash for change detection. DefaultHasher is not
+/// guaranteed stable across Rust releases; the only consequence of a change is
+/// a one-time full reindex after a toolchain bump, which is acceptable.
+fn content_hash(s: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+fn is_indexable_ext(path: &Path) -> bool {
+    const EXTS: &[&str] = &[
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "kts",
+        "scala", "c", "h", "cpp", "hpp", "cc", "hh", "cs", "rb", "php", "swift", "m",
+        "mm", "sh", "bash", "ps1", "sql", "toml", "yaml", "yml", "json", "jsonc", "md",
+        "markdown", "txt", "rst", "html", "htm", "css", "scss", "sass", "less", "vue",
+        "svelte", "xml", "ini", "cfg",
+    ];
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(ext) => EXTS.contains(&ext.to_lowercase().as_str()),
+        None => false,
+    }
+}
+
+/// Project-relative, forward-slashed path for a file under `root`, or None if
+/// it's outside the root or inside a harness worktree sandbox (which we never
+/// index — they're transient duplicates). Shared by indexing and status checks.
+fn rag_rel_path(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+    if rel.starts_with(".harness/") || rel.contains("/.harness/") {
+        return None;
+    }
+    Some(rel)
+}
+
+/// Walk a project's indexable files and return rel_path -> content_hash for the
+/// current on-disk state. No network, no DB — used to compute index staleness.
+fn current_project_hashes(root: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for result in ignore::WalkBuilder::new(root).build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() || !is_indexable_ext(path) {
+            continue;
+        }
+        if entry.metadata().map(|m| m.len() > RAG_MAX_FILE_BYTES).unwrap_or(true) {
+            continue;
+        }
+        let rel = match rag_rel_path(root, path) {
+            Some(r) => r,
+            None => continue,
+        };
+        if let Ok(content) = fs::read_to_string(path) {
+            map.insert(rel, content_hash(&content));
+        }
+    }
+    map
+}
+
+/// Sliding line-window chunker for code/plain text.
+fn chunk_by_lines(content: &str, kind: &str, base_line: usize) -> Vec<RagChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut chunks = Vec::new();
+    if lines.is_empty() {
+        return chunks;
+    }
+    let step = RAG_CHUNK_LINES.saturating_sub(RAG_CHUNK_OVERLAP).max(1);
+    let mut start = 0usize;
+    loop {
+        let end = (start + RAG_CHUNK_LINES).min(lines.len());
+        let text = lines[start..end].join("\n");
+        if !text.trim().is_empty() {
+            chunks.push(RagChunk {
+                start_line: base_line + start,
+                end_line: base_line + end - 1,
+                kind: kind.to_string(),
+                content: text,
+            });
+        }
+        if end >= lines.len() {
+            break;
+        }
+        start += step;
+    }
+    chunks
+}
+
+/// Markdown chunker: split on headers, sub-splitting any section that's too
+/// large to embed as a single window.
+fn chunk_markdown(content: &str) -> Vec<RagChunk> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut chunks = Vec::new();
+    let mut sec_start = 0usize;
+    let emit = |s: usize, e: usize, chunks: &mut Vec<RagChunk>| {
+        if e <= s {
+            return;
+        }
+        let text = lines[s..e].join("\n");
+        if text.trim().is_empty() {
+            return;
+        }
+        if e - s > RAG_CHUNK_LINES * 2 {
+            // Section too big: window it, keeping line numbers anchored to `s`.
+            chunks.extend(chunk_by_lines(&text, "doc", s + 1));
+        } else {
+            chunks.push(RagChunk {
+                start_line: s + 1,
+                end_line: e,
+                kind: "doc".to_string(),
+                content: text,
+            });
+        }
+    };
+    for i in 0..lines.len() {
+        if lines[i].starts_with('#') && i > sec_start {
+            emit(sec_start, i, &mut chunks);
+            sec_start = i;
+        }
+    }
+    emit(sec_start, lines.len(), &mut chunks);
+    chunks
+}
+
+fn chunk_file(content: &str, path: &Path) -> Vec<RagChunk> {
+    let is_md = matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .as_deref(),
+        Some("md") | Some("markdown")
+    );
+    if is_md {
+        chunk_markdown(content)
+    } else {
+        chunk_by_lines(content, "code", 1)
+    }
+}
+
+fn upsert_rag_file(
+    conn: &rusqlite::Connection,
+    project_path: &str,
+    rel: &str,
+    hash: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO rag_files (project_path, file_path, hash, indexed_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(project_path, file_path) DO UPDATE SET hash = excluded.hash, indexed_at = excluded.indexed_at",
+        (project_path, rel, hash, chrono::Utc::now().to_rfc3339()),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// The blocking core of project indexing. Walks the workspace honoring
+/// .gitignore (via the `ignore` crate), re-embeds only changed files, and
+/// emits `rag-index-progress` events so the UI can show a live count.
+fn index_project_blocking(
+    app_handle: &tauri::AppHandle,
+    project_path: &str,
+    settings: &LlmSettings,
+) -> Result<RagIndexStats, String> {
+    let root = clean_project_path(project_path);
+    let conn = get_db_conn(app_handle)?;
+    let mut stats = RagIndexStats::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Snapshot the previously-indexed file hashes so we can skip unchanged
+    // files and detect deletions.
+    let existing: std::collections::HashMap<String, String> = {
+        let mut m = std::collections::HashMap::new();
+        let mut stmt = conn
+            .prepare("SELECT file_path, hash FROM rag_files WHERE project_path = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([project_path], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.flatten() {
+            m.insert(row.0, row.1);
+        }
+        m
+    };
+
+    for result in ignore::WalkBuilder::new(&root).build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() || !is_indexable_ext(path) {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.len() > RAG_MAX_FILE_BYTES {
+            continue;
+        }
+        let rel = match rag_rel_path(&root, path) {
+            Some(r) => r,
+            None => continue,
+        };
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue, // binary / unreadable -> skip
+        };
+        seen.insert(rel.clone());
+        let hash = content_hash(&content);
+        if existing.get(&rel).map(|h| h == &hash).unwrap_or(false) {
+            stats.files_skipped += 1;
+            continue;
+        }
+
+        let chunks = chunk_file(&content, path);
+        // Replace any prior chunks for this file before inserting fresh ones.
+        let _ = conn.execute(
+            "DELETE FROM rag_chunks WHERE project_path = ?1 AND file_path = ?2",
+            (project_path, &rel),
+        );
+
+        if !chunks.is_empty() {
+            let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+            let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+            for batch in texts.chunks(RAG_EMBED_BATCH) {
+                vectors.extend(call_embedding(settings, batch)?);
+            }
+            if vectors.len() != chunks.len() {
+                return Err(format!(
+                    "embedding count mismatch for {} ({} vectors / {} chunks)",
+                    rel,
+                    vectors.len(),
+                    chunks.len()
+                ));
+            }
+            for (c, v) in chunks.iter().zip(vectors.iter()) {
+                let blob = embedding_to_blob(v);
+                conn.execute(
+                    "INSERT INTO rag_chunks (project_path, file_path, start_line, end_line, kind, content, embedding) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (
+                        project_path,
+                        &rel,
+                        c.start_line as i64,
+                        c.end_line as i64,
+                        c.kind.as_str(),
+                        c.content.as_str(),
+                        &blob,
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
+                stats.chunks += 1;
+            }
+        }
+
+        upsert_rag_file(&conn, project_path, &rel, &hash)?;
+        stats.files_indexed += 1;
+        let _ = app_handle.emit(
+            "rag-index-progress",
+            serde_json::json!({
+                "project_path": project_path,
+                "file": rel,
+                "files_indexed": stats.files_indexed,
+                "files_skipped": stats.files_skipped,
+                "chunks": stats.chunks,
+            }),
+        );
+    }
+
+    // Purge files that have been deleted since the last index.
+    for f in existing.keys() {
+        if !seen.contains(f) {
+            let _ = conn.execute(
+                "DELETE FROM rag_chunks WHERE project_path = ?1 AND file_path = ?2",
+                (project_path, f),
+            );
+            let _ = conn.execute(
+                "DELETE FROM rag_files WHERE project_path = ?1 AND file_path = ?2",
+                (project_path, f),
+            );
+            stats.files_removed += 1;
+        }
+    }
+
+    // Opportunistically backfill embeddings for memories saved before RAG was
+    // configured, so semantic recall covers historical insights too.
+    backfill_memory_embeddings(&conn, project_path, settings);
+
+    Ok(stats)
+}
+
+/// Embed any memories for this project that lack a vector (e.g. created while
+/// RAG was off). Best-effort: failures on individual rows are skipped.
+fn backfill_memory_embeddings(
+    conn: &rusqlite::Connection,
+    project_path: &str,
+    settings: &LlmSettings,
+) {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id, topic, content FROM memories WHERE project_path = ?1 AND embedding IS NULL LIMIT 1000",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mapped = stmt.query_map([project_path], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        });
+        match mapped {
+            Ok(it) => it.flatten().collect(),
+            Err(_) => return,
+        }
+    };
+    for (id, topic, content) in rows {
+        if let Some(blob) = embed_memory_text(settings, &topic, &content) {
+            let _ = conn.execute("UPDATE memories SET embedding = ?1 WHERE id = ?2", (&blob, id));
+        }
+    }
+}
+
+/// Reindex a project's codebase for RAG. Runs the (network- and IO-heavy) work
+/// on a blocking thread so it doesn't stall the async runtime, and returns
+/// summary stats to the UI.
+#[tauri::command]
+pub async fn reindex_project(
+    app_handle: tauri::AppHandle,
+    project_path: String,
+) -> Result<RagIndexStats, String> {
+    let settings = load_config(&app_handle).settings;
+    if !settings.embedding_configured() {
+        return Err(
+            "Embedding provider not configured (Settings → Embeddings & RAG).".to_string(),
+        );
+    }
+    let scope = clean_project_path(&project_path)
+        .to_string_lossy()
+        .into_owned();
+    let handle = app_handle.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        index_project_blocking(&handle, &scope, &settings)
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("indexing task failed: {}", e)),
+    }
+}
+
+/// Semantic search over a project's indexed chunks. Embeds the query, then
+/// brute-force scores every chunk by cosine similarity (fast enough for the
+/// per-project chunk counts we deal with) and returns the top `k`.
+/// Each hit: (file_path, start_line, end_line, content, score).
+/// Tokenize a query into lowercase terms for keyword matching. Splits on
+/// non-identifier characters so `fetch_local_models` stays one token (matching
+/// an exact identifier), while dropping very short tokens and a few stopwords.
+fn query_terms(query: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "this", "that", "from", "into", "are", "was",
+        "how", "does", "where", "what", "when", "which", "you", "your", "use",
+    ];
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let t = raw.to_lowercase();
+        if t.len() < 2 || STOP.contains(&t.as_str()) {
+            continue;
+        }
+        if seen.insert(t.clone()) {
+            terms.push(t);
+        }
+    }
+    terms
+}
+
+/// Count how many distinct query terms occur in the (already-lowercased) text.
+fn keyword_overlap(text_lower: &str, terms: &[String]) -> usize {
+    terms.iter().filter(|t| text_lower.contains(t.as_str())).count()
+}
+
+/// Reciprocal-rank fusion of a cosine ranking and a keyword-overlap ranking.
+/// Returns row indices ordered best-first. Items with zero keyword overlap just
+/// don't contribute to the keyword list, so behavior collapses to pure-vector
+/// ranking when no query term hits anything.
+fn rrf_order(cosines: &[f32], keywords: &[usize]) -> Vec<usize> {
+    let n = cosines.len();
+    let mut by_vec: Vec<usize> = (0..n).collect();
+    by_vec.sort_by(|&a, &b| {
+        cosines[b].partial_cmp(&cosines[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut by_kw: Vec<usize> = (0..n).filter(|&i| keywords[i] > 0).collect();
+    by_kw.sort_by(|&a, &b| keywords[b].cmp(&keywords[a]));
+    const K: f32 = 60.0; // standard RRF damping constant
+    let mut score = vec![0.0f32; n];
+    for (rank, &i) in by_vec.iter().enumerate() {
+        score[i] += 1.0 / (K + rank as f32 + 1.0);
+    }
+    for (rank, &i) in by_kw.iter().enumerate() {
+        score[i] += 1.0 / (K + rank as f32 + 1.0);
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order
+}
+
+/// Hybrid search over a project's indexed chunks: embeds the query for cosine
+/// similarity, scores keyword overlap (so exact identifiers rank too), and fuses
+/// the two rankings with RRF. Each returned hit carries its cosine score for
+/// display. (file_path, start_line, end_line, content, cosine).
+fn search_codebase(
+    app_handle: &tauri::AppHandle,
+    settings: &LlmSettings,
+    project_path: &str,
+    query: &str,
+    k: usize,
+) -> Result<Vec<(String, i64, i64, String, f32)>, String> {
+    let qvec = call_embedding(settings, &[query.to_string()])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no query embedding returned".to_string())?;
+    let conn = get_db_conn(app_handle)?;
+    let mut stmt = conn
+        .prepare("SELECT file_path, start_line, end_line, content, embedding FROM rag_chunks WHERE project_path = ?1")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([project_path], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let terms = query_terms(query);
+    let mut metas: Vec<(String, i64, i64, String)> = Vec::new();
+    let mut cosines: Vec<f32> = Vec::new();
+    let mut keywords: Vec<usize> = Vec::new();
+    for row in rows.flatten() {
+        let (fp, s, e, content, blob) = row;
+        let cos = cosine_similarity(&qvec, &blob_to_embedding(&blob));
+        let kw = if terms.is_empty() {
+            0
+        } else {
+            keyword_overlap(&content.to_lowercase(), &terms)
+        };
+        cosines.push(cos);
+        keywords.push(kw);
+        metas.push((fp, s, e, content));
+    }
+
+    let order = rrf_order(&cosines, &keywords);
+    let mut out: Vec<(String, i64, i64, String, f32)> = Vec::with_capacity(k.min(order.len()));
+    for &i in order.iter().take(k) {
+        let (fp, s, e, content) = metas[i].clone();
+        out.push((fp, s, e, content, cosines[i]));
+    }
+    Ok(out)
+}
+
+#[derive(Serialize, Clone, Default, Debug)]
+pub struct RagStatus {
+    /// Whether an embedding provider is configured (RAG usable at all).
+    pub configured: bool,
+    /// Files currently represented in the index.
+    pub indexed_files: usize,
+    /// Total embedded chunks in the index.
+    pub chunks: usize,
+    /// Most recent indexed_at timestamp across the project's files, if any.
+    pub last_indexed_at: Option<String>,
+    /// Files that differ from the index right now (new + modified + deleted).
+    pub stale_files: usize,
+    /// Convenience flag for the UI: there is on-disk work the index doesn't reflect.
+    pub needs_index: bool,
+}
+
+fn rag_status_blocking(
+    app_handle: &tauri::AppHandle,
+    root: &Path,
+    scope: &str,
+    configured: bool,
+) -> Result<RagStatus, String> {
+    let conn = get_db_conn(app_handle)?;
+
+    let existing: std::collections::HashMap<String, String> = {
+        let mut m = std::collections::HashMap::new();
+        let mut stmt = conn
+            .prepare("SELECT file_path, hash FROM rag_files WHERE project_path = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([scope], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows.flatten() {
+            m.insert(row.0, row.1);
+        }
+        m
+    };
+    let chunks: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rag_chunks WHERE project_path = ?1",
+            [scope],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let last_indexed_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(indexed_at) FROM rag_files WHERE project_path = ?1",
+            [scope],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+
+    // Compare the current tree against the index: new/modified files differ in
+    // hash; deleted files are in the index but no longer on disk.
+    let current = current_project_hashes(root);
+    let mut stale = 0usize;
+    for (rel, h) in &current {
+        if existing.get(rel).map(|old| old == h).unwrap_or(false) {
+            continue;
+        }
+        stale += 1;
+    }
+    for rel in existing.keys() {
+        if !current.contains_key(rel) {
+            stale += 1;
+        }
+    }
+
+    Ok(RagStatus {
+        configured,
+        indexed_files: existing.len(),
+        chunks: chunks as usize,
+        last_indexed_at,
+        stale_files: stale,
+        needs_index: stale > 0,
+    })
+}
+
+/// Report the RAG index state for a project: how much is indexed and whether the
+/// on-disk tree has drifted since (so the UI can show a "reindex" nudge). The
+/// staleness check walks + hashes files (no network) on a blocking thread.
+#[tauri::command]
+pub async fn rag_index_status(
+    app_handle: tauri::AppHandle,
+    project_path: String,
+) -> Result<RagStatus, String> {
+    let configured = load_config(&app_handle).settings.embedding_configured();
+    let root = clean_project_path(&project_path);
+    let scope = root.to_string_lossy().into_owned();
+    let handle = app_handle.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        rag_status_blocking(&handle, &root, &scope, configured)
+    })
+    .await
+    {
+        Ok(inner) => inner,
+        Err(e) => Err(format!("status task failed: {}", e)),
+    }
+}
+
 fn run_is_cancelled(app_handle: &tauri::AppHandle, run_id: &str) -> bool {
     if let Some(state_val) = app_handle.try_state::<AppState>() {
         let cancelled = state_val.cancelled_runs.lock().unwrap();
@@ -2803,6 +3768,14 @@ fn assist_as_primary(s: &LlmSettings) -> LlmSettings {
         // The frontier/assist model has its own (typically large) window; we
         // don't track it separately, so leave 0 -> legacy threshold fallback.
         context_tokens: 0,
+        // Embedding config is orthogonal to which chat model is driving; carry
+        // it through so a frontier-driven run still indexes/retrieves normally.
+        embedding_provider: s.embedding_provider.clone(),
+        embedding_api_url: s.embedding_api_url.clone(),
+        embedding_api_key: s.embedding_api_key.clone(),
+        embedding_model: s.embedding_model.clone(),
+        embedding_auto_inject: s.embedding_auto_inject,
+        embedding_auto_index: s.embedding_auto_index,
     }
 }
 
@@ -3868,6 +4841,7 @@ pub async fn send_design_chat(
                 "find_symbol",
                 "remember",
                 "recall",
+                "search_codebase",
                 "list_cards",
                 "create_card",
                 "update_card",
@@ -4137,6 +5111,7 @@ pub async fn send_code_chat(
                 "find_symbol",
                 "remember",
                 "recall",
+                "search_codebase",
                 "list_cards",
                 "create_card",
                 "update_card",
@@ -4561,6 +5536,21 @@ pub async fn start_run(
         drop(cards);
         drop(logs);
 
+        // Best-effort background RAG refresh so the agent's search_codebase tool
+        // sees the project's current code. Indexing is incremental (only changed
+        // files are re-embedded), so this is cheap when nothing has changed, and
+        // it runs off-thread so it never delays the run starting.
+        {
+            let cfg = load_config(&app_handle).settings;
+            if cfg.embedding_configured() && cfg.embedding_auto_index {
+                let handle = app_handle.clone();
+                let scope = repo_path.to_string_lossy().into_owned();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ = index_project_blocking(&handle, &scope, &cfg);
+                });
+            }
+        }
+
         run_agent_loop(app_handle, run_id.clone(), card_id);
 
         Ok(run_id)
@@ -4785,14 +5775,18 @@ pub async fn accept_run(
         if let Ok(conn) = get_db_conn(&app_handle) {
             if let Some(summary) = latest_run_summary(&conn, &run_id) {
                 let scope = repo_path.to_string_lossy().into_owned();
+                let topic = format!("Completed: {}", card.title);
+                let settings = load_config(&app_handle).settings;
+                let emb = embed_memory_text(&settings, &topic, &summary);
                 let _ = insert_memory(
                     &conn,
                     &scope,
-                    &format!("Completed: {}", card.title),
+                    &topic,
                     &summary,
                     "run_accept",
                     Some(&run_id),
                     Some(&card.id),
+                    emb.as_deref(),
                 );
             }
         }
@@ -5637,12 +6631,13 @@ fn construct_agent_system_prompt(
          16. `find_file(name: String, path?: String)`: Finds files by name. Give a fragment of the filename (case-insensitive) and get matching relative paths back. The fastest way to locate a file you know exists.\n\
          17. `find_symbol(name: String, path?: String)`: Finds where a function, struct, class, or other declaration is DEFINED. Returns file:line: signature. Faster and more precise than search_grep when you want a definition rather than usages.\n\
          18. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared across runs and chat modes. Use it when you learn something worth keeping: how a subsystem works, a decision made, a pitfall discovered.\n\
-         19. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword and returns the most recent matches (empty query = latest memories). Past runs may have already mapped the territory — check before exploring from scratch.\n\
-         20. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
-         21. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
-         22. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
-         23. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
-         Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
+         19. `recall(query: String, limit?: Int)`: Searches this project's long-term memory and returns the most relevant matches — ranked semantically (by meaning) when an embedding provider is configured, else by keyword (empty query = latest memories). Past runs may have already mapped the territory — check before exploring from scratch.\n\
+         20. `search_codebase(query: String, limit?: Int)`: Semantic search over the project's INDEXED code and docs. Finds code by concept and returns the most relevant chunks as file:line ranges — ideal for \"where is X handled?\" / \"how does Y work?\". For exact strings or symbol names, prefer search_grep/find_symbol. Returns nothing if the project hasn't been indexed yet.\n\
+         21. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
+         22. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
+         23. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
+         24. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first, and search_codebase() to locate relevant code by concept — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     );
     if assist_available {
@@ -5755,7 +6750,7 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
-const KNOWN_TOOLS: [&str; 23] = [
+const KNOWN_TOOLS: [&str; 24] = [
     "read_file",
     "outline_file",
     "write_file",
@@ -5767,6 +6762,7 @@ const KNOWN_TOOLS: [&str; 23] = [
     "find_symbol",
     "remember",
     "recall",
+    "search_codebase",
     "list_cards",
     "create_card",
     "update_card",
@@ -7229,12 +8225,12 @@ fn patch_file_impl(
 /// The canonical tool names the parser/dispatcher knows. Used by
 /// `looks_like_malformed_tool_call` to tell a botched call (the model named a
 /// real tool but mangled the syntax) apart from ordinary prose.
-const KNOWN_TOOL_NAMES: [&str; 23] = [
+const KNOWN_TOOL_NAMES: [&str; 24] = [
     "read_file", "outline_file", "write_file", "list_dir", "git_status",
     "git_diff", "run_command", "web_search", "send_notification", "task_complete",
     "search_grep", "find_file", "find_symbol", "remember", "recall", "list_cards",
     "create_card", "update_card", "delete_card", "read_card", "set_todo",
-    "replace_lines", "patch_file",
+    "replace_lines", "patch_file", "search_codebase",
 ];
 
 /// Bucket a tool result into a coarse, STABLE `failure_reason` for harness
@@ -7353,9 +8349,10 @@ fn edit_failure_signature(tool_name: &str, args: &serde_json::Value) -> Option<S
 /// (run_command, web_search, notifications, task_complete) is not a "read";
 /// only the mutating set counts as a "write". The read:write ratio is a
 /// retrieval-quality proxy — lots of reads per write means she's hunting.
-const READ_TOOLS: [&str; 11] = [
+const READ_TOOLS: [&str; 12] = [
     "read_file", "outline_file", "list_dir", "git_status", "git_diff",
     "search_grep", "find_file", "find_symbol", "read_card", "list_cards", "recall",
+    "search_codebase",
 ];
 const WRITE_TOOLS: [&str; 8] = [
     "write_file", "replace_lines", "patch_file", "create_card", "update_card",
@@ -7797,6 +8794,8 @@ fn execute_tool(
             let topic: String = topic.chars().take(120).collect();
             let content: String = content.chars().take(2000).collect();
             let (scope, card_id) = memory_scope(app_handle, worktree_path, run_id);
+            let settings = load_config(app_handle).settings;
+            let emb = embed_memory_text(&settings, &topic, &content);
             match get_db_conn(app_handle) {
                 Ok(conn) => match insert_memory(
                     &conn,
@@ -7806,6 +8805,7 @@ fn execute_tool(
                     "agent",
                     Some(run_id),
                     card_id.as_deref(),
+                    emb.as_deref(),
                 ) {
                     Ok(_) => format!(
                         "Success: remembered under topic '{}'. This memory persists across runs and chat modes for this project.",
@@ -7832,6 +8832,98 @@ fn execute_tool(
                 Ok(c) => c,
                 Err(e) => return format!("Error: {}", e),
             };
+
+            // Semantic path: rank by meaning when a query is given and an
+            // embedding provider is configured. Memories with stored vectors are
+            // scored by cosine similarity; older rows without a vector fall back
+            // to a keyword hit at a low fixed score so they can still surface.
+            // Any failure here silently drops to the keyword path below.
+            let settings = load_config(app_handle).settings;
+            if !query.is_empty() && settings.embedding_configured() {
+                if let Ok(mut qv) = call_embedding(&settings, &[query.to_string()]) {
+                    if let Some(qvec) = qv.pop() {
+                        // Collect candidates, then fuse cosine + keyword rankings
+                        // (RRF) — the same hybrid scheme as search_codebase. Rows
+                        // without a vector still rank via keyword overlap.
+                        let rows: Result<
+                            Vec<(String, String, String, String, Option<Vec<u8>>)>,
+                            rusqlite::Error,
+                        > = (|| {
+                            let mut stmt = conn.prepare(
+                                "SELECT topic, content, source, created_at, embedding FROM memories WHERE project_path = ?1 ORDER BY id DESC LIMIT 500",
+                            )?;
+                            let it = stmt.query_map([&scope], |row| {
+                                Ok((
+                                    row.get::<_, String>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                    row.get::<_, Option<Vec<u8>>>(4)?,
+                                ))
+                            })?;
+                            let mut v = Vec::new();
+                            for r in it {
+                                v.push(r?);
+                            }
+                            Ok(v)
+                        })();
+                        if let Ok(rows) = rows {
+                            let terms = query_terms(query);
+                            let mut metas: Vec<(String, String, String, String)> = Vec::new();
+                            let mut cosines: Vec<f32> = Vec::new();
+                            let mut keywords: Vec<usize> = Vec::new();
+                            for (topic, content, source, created, blob) in rows {
+                                let cos = match blob {
+                                    Some(ref b) if !b.is_empty() => {
+                                        cosine_similarity(&qvec, &blob_to_embedding(b))
+                                    }
+                                    _ => 0.0,
+                                };
+                                let kw = if terms.is_empty() {
+                                    0
+                                } else {
+                                    keyword_overlap(
+                                        &format!("{}\n{}", topic, content).to_lowercase(),
+                                        &terms,
+                                    )
+                                };
+                                cosines.push(cos);
+                                keywords.push(kw);
+                                metas.push((topic, content, source, created));
+                            }
+                            let order = rrf_order(&cosines, &keywords);
+                            let mut picked: Vec<usize> = Vec::new();
+                            for &i in &order {
+                                if cosines[i] <= 0.0 && keywords[i] == 0 {
+                                    continue; // no signal from either ranker
+                                }
+                                picked.push(i);
+                                if picked.len() >= limit {
+                                    break;
+                                }
+                            }
+                            if !picked.is_empty() {
+                                let mut out = vec![format!(
+                                    "{} memor{} (most relevant first):",
+                                    picked.len(),
+                                    if picked.len() == 1 { "y" } else { "ies" }
+                                )];
+                                for &i in &picked {
+                                    let (topic, content, source, created) = &metas[i];
+                                    let date = created.split('T').next().unwrap_or("");
+                                    out.push(format!(
+                                        "[{} | {} | {:.2}] {}: {}",
+                                        date, source, cosines[i], topic, content
+                                    ));
+                                }
+                                return out.join("\n");
+                            }
+                            // Nothing scored: fall through to the keyword path.
+                        }
+                    }
+                }
+            }
+
             let result: Result<Vec<(String, String, String, String)>, rusqlite::Error> = (|| {
                 let mut rows = Vec::new();
                 if query.is_empty() {
@@ -7887,6 +8979,50 @@ fn execute_tool(
                     out.push(format!("[{} | {}] {}: {}", date, source, topic, content));
                 }
                 out.join("\n")
+            }
+        }
+        "search_codebase" => {
+            let query = args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .trim();
+            if query.is_empty() {
+                return "Error: search_codebase requires a non-empty 'query' string describing what you're looking for.".to_string();
+            }
+            let k = args
+                .get("limit")
+                .or_else(|| args.get("k"))
+                .and_then(|v| v.as_u64())
+                .map(|v| (v as usize).clamp(1, 15))
+                .unwrap_or(6);
+            let settings = load_config(app_handle).settings;
+            if !settings.embedding_configured() {
+                return "Error: codebase search is unavailable — no embedding provider is configured (Settings → Embeddings & RAG). Use search_grep or find_symbol for exact text instead.".to_string();
+            }
+            let (scope, _) = memory_scope(app_handle, worktree_path, run_id);
+            match search_codebase(app_handle, &settings, &scope, query, k) {
+                Ok(hits) if hits.is_empty() => format!(
+                    "No indexed matches for \"{}\". The project may not be indexed yet (Settings → Embeddings & RAG → Reindex), or try search_grep for exact strings.",
+                    query
+                ),
+                Ok(hits) => {
+                    let mut out = vec![format!(
+                        "{} semantic match{} for \"{}\" (most relevant first):",
+                        hits.len(),
+                        if hits.len() == 1 { "" } else { "es" },
+                        query
+                    )];
+                    for (fp, s, e, content, score) in hits {
+                        let snippet: String = content.chars().take(800).collect();
+                        out.push(format!(
+                            "\n--- {}:{}-{} (score {:.2}) ---\n{}",
+                            fp, s, e, score, snippet
+                        ));
+                    }
+                    out.join("\n")
+                }
+                Err(e) => format!("Error searching codebase: {}", e),
             }
         }
         "list_cards" => {
@@ -8522,6 +9658,37 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
             );
         }
 
+        // Auto-injected RAG context: the top codebase matches for this task,
+        // retrieved ONCE (the query is the static task) and reused every turn, so
+        // it costs a single embedding call rather than one per step. Gated by the
+        // embedding_auto_inject setting; the on-demand search_codebase tool is
+        // always available regardless. Empty string when disabled/unconfigured/no hits.
+        let rag_context: String = {
+            let cfg = load_config(&app_handle_clone).settings;
+            if cfg.embedding_configured() && cfg.embedding_auto_inject {
+                let (scope, _) = memory_scope(&app_handle_clone, &worktree_path, &run_id_clone);
+                let query = format!("{}\n{}", card_title, card_desc);
+                match search_codebase(&app_handle_clone, &cfg, &scope, &query, 5) {
+                    Ok(hits) if !hits.is_empty() => {
+                        let mut out = String::from(
+                            "\n\nRELEVANT CODE (auto-retrieved for this task by semantic similarity; may be incomplete — call search_codebase for more or different angles):\n",
+                        );
+                        for (fp, s, e, content, score) in hits {
+                            let snippet: String = content.chars().take(600).collect();
+                            out.push_str(&format!(
+                                "\n--- {}:{}-{} (score {:.2}) ---\n{}\n",
+                                fp, s, e, score, snippet
+                            ));
+                        }
+                        out
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            }
+        };
+
         'run: loop {
             {
                 let cards = state.cards.lock().unwrap();
@@ -8592,8 +9759,8 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
             let system_prompt =
                 construct_agent_system_prompt(&worktree_path, &card_title, &card_desc, assist_available);
             let system_prompt = format!(
-                "{}\n\nYou are on step {} of a maximum of {} for this run. Pace your work to finish and call task_complete before hitting the ceiling.",
-                system_prompt, step, max_steps
+                "{}\n\nYou are on step {} of a maximum of {} for this run. Pace your work to finish and call task_complete before hitting the ceiling.{}",
+                system_prompt, step, max_steps, rag_context
             );
             let tools_schema = get_openai_tools_schema(&[
                 "read_file",
@@ -8611,6 +9778,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "find_symbol",
                 "remember",
                 "recall",
+                "search_codebase",
                 "list_cards",
                 "create_card",
                 "update_card",
@@ -9066,11 +10234,12 @@ fn construct_architect_system_prompt(project_path: &Path, doc_name: &str) -> Str
          9. `web_search(query: String)`: Searches the web for APIs, libraries, architectural patterns, and programming guides.\n\
          10. `send_notification(message: String)`: Sends a system alert/notification to the developer.\n\
          11. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with code chat and agent runs. Record design decisions and their reasons here.\n\
-         12. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before proposing from scratch.\n\
-         13. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
-         14. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. When a design discussion produces actionable work, FILE IT as a card with a clear description, priority, and todos — that is how plans become runs.\n\
-         15. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
-         16. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         12. `recall(query: String, limit?: Int)`: Searches this project's long-term memory — ranked semantically (by meaning) when an embedding provider is configured, else by keyword (empty query = most recent). Check what past runs and chats already learned before proposing from scratch.\n\
+         13. `search_codebase(query: String, limit?: Int)`: Semantic search over the project's INDEXED code and docs; finds code by concept and returns the most relevant chunks as file:line ranges. Use it to ground proposals in how the code actually works. Returns nothing if the project hasn't been indexed yet.\n\
+         14. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
+         15. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. When a design discussion produces actionable work, FILE IT as a card with a clear description, priority, and todos — that is how plans become runs.\n\
+         16. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
+         17. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your ideas, proposals, or questions.",
         doc_name, project_path.to_string_lossy()
     )
@@ -9108,11 +10277,12 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
          11. `run_command(command: String)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests!\n\
          12. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\
          13. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with design chat and agent runs. Record how subsystems work and pitfalls you discover.\n\
-         14. `recall(query: String, limit?: Int)`: Searches this project's long-term memory by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
-         15. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
-         16. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. If a fix you're discussing is bigger than the current conversation, file it as a card so it gets scheduled instead of forgotten.\n\
-         17. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
-         18. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         14. `recall(query: String, limit?: Int)`: Searches this project's long-term memory — ranked semantically (by meaning) when an embedding provider is configured, else by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
+         15. `search_codebase(query: String, limit?: Int)`: Semantic search over the project's INDEXED code and docs; finds code by concept and returns the most relevant chunks as file:line ranges. Ideal for \"where is X handled?\" / \"how does Y work?\". For exact strings or symbol names prefer search_grep/find_symbol. Returns nothing if the project hasn't been indexed yet.\n\
+         16. `list_cards()`: Shows the project's kanban board grouped by status, with card ids and todo progress.\n\
+         17. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog. If a fix you're discussing is bigger than the current conversation, file it as a card so it gets scheduled instead of forgotten.\n\
+         18. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
+         19. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
          If you want to talk to the user, output a regular text response explaining your changes or asking questions.",
         target, project_path.to_string_lossy()
     )
@@ -9631,5 +10801,138 @@ BeetleAI
         // 4. Test patch_file_impl non-unique target
         let res_patch_non_unique = patch_file_impl(wt_path, "file_a.txt", "is", "was");
         assert!(res_patch_non_unique.contains("Error: Target text occurs"));
+    }
+
+    // ----- RAG / embeddings unit tests (pure, no network) -----
+
+    #[test]
+    fn test_embedding_blob_roundtrip() {
+        let v = vec![0.0f32, 1.5, -2.25, 3.125, f32::MIN, f32::MAX];
+        let blob = embedding_to_blob(&v);
+        assert_eq!(blob.len(), v.len() * 4);
+        assert_eq!(blob_to_embedding(&blob), v);
+        // A truncated/garbage blob (not a multiple of 4) yields an empty vec.
+        assert!(blob_to_embedding(&[1, 2, 3]).is_empty());
+    }
+
+    #[test]
+    fn test_cosine_similarity() {
+        let a = vec![1.0f32, 0.0, 0.0];
+        // Identical direction -> 1.0
+        assert!((cosine_similarity(&a, &a) - 1.0).abs() < 1e-6);
+        // Orthogonal -> 0.0
+        assert!(cosine_similarity(&a, &[0.0, 1.0, 0.0]).abs() < 1e-6);
+        // Opposite -> -1.0
+        assert!((cosine_similarity(&a, &[-1.0, 0.0, 0.0]) + 1.0).abs() < 1e-6);
+        // Length mismatch and zero vector -> 0.0 (never NaN)
+        assert_eq!(cosine_similarity(&a, &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&a, &[0.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn test_content_hash_stable_and_distinct() {
+        assert_eq!(content_hash("hello world"), content_hash("hello world"));
+        assert_ne!(content_hash("hello world"), content_hash("hello world!"));
+    }
+
+    #[test]
+    fn test_chunk_by_lines_windows_and_lines() {
+        // 150 numbered lines -> overlapping windows of <=60 lines.
+        let body: String = (1..=150)
+            .map(|n| format!("line {}", n))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = chunk_by_lines(&body, "code", 1);
+        assert!(chunks.len() >= 3, "expected multiple windows");
+        // First chunk is anchored at line 1 and spans at most RAG_CHUNK_LINES.
+        assert_eq!(chunks[0].start_line, 1);
+        assert!(chunks[0].end_line <= RAG_CHUNK_LINES);
+        // Consecutive windows overlap (next start is before prev end).
+        assert!(chunks[1].start_line <= chunks[0].end_line);
+        // Last chunk reaches the final line.
+        assert_eq!(chunks.last().unwrap().end_line, 150);
+        // Empty input -> no chunks.
+        assert!(chunk_by_lines("", "code", 1).is_empty());
+    }
+
+    #[test]
+    fn test_chunk_markdown_splits_on_headers() {
+        let md = "# Title\nintro\n\n## Section A\naaa\nbbb\n\n## Section B\nccc";
+        let chunks = chunk_markdown(md);
+        // One chunk per header section.
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.kind == "doc"));
+        assert!(chunks[1].content.contains("Section A"));
+        assert!(chunks[2].content.contains("Section B"));
+    }
+
+    #[test]
+    fn test_is_indexable_ext() {
+        assert!(is_indexable_ext(Path::new("src/main.rs")));
+        assert!(is_indexable_ext(Path::new("README.md")));
+        assert!(is_indexable_ext(Path::new("a/b/c.tsx")));
+        assert!(!is_indexable_ext(Path::new("image.png")));
+        assert!(!is_indexable_ext(Path::new("binary")));
+    }
+
+    #[test]
+    fn test_resolve_embedding_endpoint() {
+        // Ollama uses /api/embed off the root, stripping a /v1 suffix.
+        assert_eq!(
+            resolve_embedding_endpoint("ollama", "http://localhost:11434"),
+            "http://localhost:11434/api/embed"
+        );
+        assert_eq!(
+            resolve_embedding_endpoint("ollama", "http://localhost:11434/v1"),
+            "http://localhost:11434/api/embed"
+        );
+        // OpenAI-compatible appends /v1/embeddings, or /embeddings to a /v1 root.
+        assert_eq!(
+            resolve_embedding_endpoint("openai", "https://api.openai.com"),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            resolve_embedding_endpoint("voyage", "https://api.voyageai.com/v1"),
+            "https://api.voyageai.com/v1/embeddings"
+        );
+        // A fully-specified endpoint is respected verbatim.
+        assert_eq!(
+            resolve_embedding_endpoint("custom", "http://x/v1/embeddings"),
+            "http://x/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn test_query_terms() {
+        // Stopwords + short tokens dropped; identifiers kept whole; deduped.
+        let terms = query_terms("How does fetch_local_models work?");
+        assert!(terms.contains(&"fetch_local_models".to_string()));
+        assert!(terms.contains(&"work".to_string()));
+        assert!(!terms.contains(&"how".to_string())); // stopword
+        assert!(!terms.contains(&"does".to_string())); // stopword
+        // Dedup: repeated term appears once.
+        let dup = query_terms("cache cache CACHE");
+        assert_eq!(dup, vec!["cache".to_string()]);
+    }
+
+    #[test]
+    fn test_keyword_overlap() {
+        let terms = vec!["fetch_local_models".to_string(), "work".to_string()];
+        let text = "fn fetch_local_models() { /* how models work */ }".to_lowercase();
+        assert_eq!(keyword_overlap(&text, &terms), 2);
+        assert_eq!(keyword_overlap("nothing relevant here", &terms), 0);
+    }
+
+    #[test]
+    fn test_rrf_order_boosts_keyword_hits() {
+        // idx1 has a weak cosine but a strong keyword hit; fusion should lift it
+        // above idx2 (mid cosine, no keyword) and even idx0 (top cosine alone).
+        let cosines = vec![0.9f32, 0.1, 0.5];
+        let keywords = vec![0usize, 5, 0];
+        let order = rrf_order(&cosines, &keywords);
+        assert_eq!(order[0], 1, "keyword-matched row should rank first");
+        // With no keyword signal at all, order collapses to pure cosine.
+        let pure = rrf_order(&cosines, &vec![0, 0, 0]);
+        assert_eq!(pure, vec![0, 2, 1]);
     }
 }

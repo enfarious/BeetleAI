@@ -459,6 +459,14 @@ interface LlmSettings {
   // Primary model's usable context window (tokens); drives the compaction
   // threshold. 0/absent = legacy fixed threshold.
   context_tokens?: number;
+  // Embedding model for RAG (semantic recall + search_codebase). Optional;
+  // empty embedding_provider/url/model means RAG is disabled.
+  embedding_provider?: string;
+  embedding_api_url?: string;
+  embedding_api_key?: string;
+  embedding_model?: string;
+  embedding_auto_inject?: boolean;
+  embedding_auto_index?: boolean;
 }
 
 // App State
@@ -566,6 +574,89 @@ const settingsAssistProvider = document.getElementById("settings-assist-provider
 const settingsAssistUrl = document.getElementById("settings-assist-url") as HTMLInputElement;
 const settingsAssistKey = document.getElementById("settings-assist-key") as HTMLInputElement;
 const settingsAssistModel = document.getElementById("settings-assist-model") as HTMLInputElement;
+const settingsEmbeddingProvider = document.getElementById("settings-embedding-provider") as HTMLSelectElement;
+const settingsEmbeddingUrl = document.getElementById("settings-embedding-url") as HTMLInputElement;
+const settingsEmbeddingKey = document.getElementById("settings-embedding-key") as HTMLInputElement;
+const settingsEmbeddingModel = document.getElementById("settings-embedding-model") as HTMLInputElement;
+const settingsEmbeddingAutoInject = document.getElementById("settings-embedding-auto-inject") as HTMLInputElement;
+const settingsEmbeddingAutoIndex = document.getElementById("settings-embedding-auto-index") as HTMLInputElement;
+const btnTestEmbedding = document.getElementById("btn-test-embedding") as HTMLButtonElement;
+const embeddingTestInfo = document.getElementById("embedding-test-info") as HTMLSpanElement;
+const btnReindex = document.getElementById("btn-reindex") as HTMLButtonElement;
+const ragStatusEl = document.getElementById("rag-status") as HTMLSpanElement;
+const ragStatusText = document.getElementById("rag-status-text") as HTMLSpanElement;
+
+interface RagStatus {
+  configured: boolean;
+  indexed_files: number;
+  chunks: number;
+  last_indexed_at: string | null;
+  stale_files: number;
+  needs_index: boolean;
+}
+
+function setRagStatusClass(state: "ok" | "stale" | "off" | "busy") {
+  ragStatusEl.classList.remove(
+    "rag-status--ok",
+    "rag-status--stale",
+    "rag-status--off",
+    "rag-status--busy",
+  );
+  ragStatusEl.classList.add(`rag-status--${state}`);
+}
+
+function applyRagStatus(s: RagStatus) {
+  if (!s.configured) {
+    setRagStatusClass("off");
+    ragStatusText.textContent = "RAG off";
+    ragStatusEl.title = "No embedding provider configured. Set one in Settings → Embeddings & RAG.";
+    btnReindex.disabled = true;
+    return;
+  }
+  btnReindex.disabled = false;
+  if (s.indexed_files === 0) {
+    setRagStatusClass("stale");
+    ragStatusText.textContent = "Not indexed";
+    ragStatusEl.title = "This project hasn't been indexed yet — click Reindex.";
+  } else if (s.stale_files > 0) {
+    setRagStatusClass("stale");
+    ragStatusText.textContent = `${s.stale_files} changed`;
+    ragStatusEl.title =
+      `${s.stale_files} file(s) changed since the last index — Reindex to refresh. ` +
+      `${s.indexed_files} files / ${s.chunks} chunks indexed.`;
+  } else {
+    setRagStatusClass("ok");
+    ragStatusText.textContent = "Indexed";
+    const when = s.last_indexed_at ? ` (last ${s.last_indexed_at.split("T")[0]})` : "";
+    ragStatusEl.title = `Up to date — ${s.indexed_files} files / ${s.chunks} chunks indexed${when}.`;
+  }
+}
+
+async function refreshRagStatus() {
+  const path = currentProject?.path;
+  if (!path) return;
+  try {
+    const s = await invoke<RagStatus>("rag_index_status", { projectPath: path });
+    applyRagStatus(s);
+  } catch (err) {
+    console.error("Failed to fetch RAG status:", err);
+  }
+}
+
+// Settings tab switching: toggle .active on buttons + panels.
+const settingsTabBtns = Array.from(
+  document.querySelectorAll<HTMLButtonElement>(".settings-tab-btn"),
+);
+const settingsTabPanels = Array.from(
+  document.querySelectorAll<HTMLDivElement>(".settings-tab-panel"),
+);
+function activateSettingsTab(tab: string) {
+  settingsTabBtns.forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+  settingsTabPanels.forEach(p => p.classList.toggle("active", p.dataset.panel === tab));
+}
+settingsTabBtns.forEach(btn => {
+  btn.addEventListener("click", () => activateSettingsTab(btn.dataset.tab || "model"));
+});
 
 // Mode tabs
 const tabPlan = document.getElementById("tab-plan") as HTMLButtonElement;
@@ -784,6 +875,9 @@ async function setupTauriEventListeners() {
           await refreshState();
           renderRightPanel();
         }
+        // A finished run may have changed files (after accept/merge); refresh
+        // the index staleness indicator.
+        refreshRagStatus();
       });
       
       await listen("run-updated", async () => {
@@ -804,6 +898,13 @@ async function setupTauriEventListeners() {
 
       await listen("notification", (event: any) => {
         showSystemNotification(event.payload);
+      });
+
+      await listen("rag-index-progress", (event: any) => {
+        const p = event.payload || {};
+        setRagStatusClass("busy");
+        ragStatusText.textContent = `Indexing… ${p.files_indexed ?? 0}`;
+        ragStatusEl.title = `Indexing ${p.file ?? ""} — ${p.chunks ?? 0} chunks so far`;
       });
     } catch (err) {
       console.error("Failed to register Tauri event listener:", err);
@@ -905,6 +1006,17 @@ function setupEventListeners() {
     saveSettings();
   });
   btnFetchModels.addEventListener("click", () => fetchModels());
+  btnTestEmbedding.addEventListener("click", () => testEmbedding());
+  btnReindex.addEventListener("click", () => reindexCodebase());
+  // Returning from an external editor is a good moment to re-check index drift.
+  // Debounced so rapid focus changes don't trigger repeated file walks.
+  let lastRagFocusCheck = 0;
+  window.addEventListener("focus", () => {
+    const now = performance.now();
+    if (now - lastRagFocusCheck < 15000) return;
+    lastRagFocusCheck = now;
+    refreshRagStatus();
+  });
   settingsModelSelect.addEventListener("change", () => onModelSelectChange());
   btnToggleModelInput.addEventListener("click", () => toggleModelInput(true));
 
@@ -1192,7 +1304,17 @@ async function openSettingsModal() {
     settingsAssistUrl.value = settings.assist_api_url || "";
     settingsAssistKey.value = settings.assist_api_key || "";
     settingsAssistModel.value = settings.assist_model || "";
+    settingsEmbeddingProvider.value = settings.embedding_provider || "";
+    settingsEmbeddingUrl.value = settings.embedding_api_url || "";
+    settingsEmbeddingKey.value = settings.embedding_api_key || "";
+    settingsEmbeddingModel.value = settings.embedding_model || "";
+    settingsEmbeddingAutoInject.checked = settings.embedding_auto_inject !== false;
+    settingsEmbeddingAutoIndex.checked = settings.embedding_auto_index !== false;
+    embeddingTestInfo.style.display = "none";
+    embeddingTestInfo.textContent = "";
 
+    // Always open on the Model tab.
+    activateSettingsTab("model");
     // Reset model selection view states
     toggleModelInput(true);
     settingsModal.style.display = "flex";
@@ -1222,15 +1344,97 @@ async function saveSettings() {
     assist_api_url: settingsAssistUrl.value,
     assist_api_key: settingsAssistKey.value,
     assist_model: settingsAssistModel.value,
+    embedding_provider: settingsEmbeddingProvider.value,
+    embedding_api_url: settingsEmbeddingUrl.value,
+    embedding_api_key: settingsEmbeddingKey.value,
+    embedding_model: settingsEmbeddingModel.value,
+    embedding_auto_inject: settingsEmbeddingAutoInject.checked,
+    embedding_auto_index: settingsEmbeddingAutoIndex.checked,
   };
 
   try {
     await invoke("save_settings", { settings });
     closeSettingsModal();
-    showToast("LLM settings saved", "success");
+    showToast("Settings saved", "success");
   } catch (err) {
     console.error("Failed to save settings:", err);
     showToast("Error saving settings: " + err, "error");
+  }
+}
+
+// Probe the embedding provider with the values currently in the form (so the
+// user can verify before saving). Reports the returned vector dimension on
+// success, the error otherwise.
+async function testEmbedding() {
+  const settings: LlmSettings = {
+    provider: settingsProvider.value,
+    api_url: settingsUrl.value,
+    api_key: settingsKey.value,
+    model: settingsModel.value,
+    max_steps: parseInt(settingsSteps.value, 10) || 50,
+    context_tokens: parseInt(settingsContextTokens.value, 10) || 0,
+    assist_provider: settingsAssistProvider.value,
+    assist_api_url: settingsAssistUrl.value,
+    assist_api_key: settingsAssistKey.value,
+    assist_model: settingsAssistModel.value,
+    embedding_provider: settingsEmbeddingProvider.value,
+    embedding_api_url: settingsEmbeddingUrl.value,
+    embedding_api_key: settingsEmbeddingKey.value,
+    embedding_model: settingsEmbeddingModel.value,
+    embedding_auto_inject: settingsEmbeddingAutoInject.checked,
+    embedding_auto_index: settingsEmbeddingAutoIndex.checked,
+  };
+
+  btnTestEmbedding.disabled = true;
+  btnTestEmbedding.textContent = "Testing...";
+  embeddingTestInfo.style.display = "block";
+  embeddingTestInfo.style.color = "var(--text-muted)";
+  embeddingTestInfo.textContent = "Embedding probe string...";
+
+  try {
+    const dim = await invoke<number>("test_embedding", { settings });
+    embeddingTestInfo.style.color = "var(--status-review, #22c55e)";
+    embeddingTestInfo.textContent = `✓ Connected — ${dim}-dimensional vectors.`;
+  } catch (err) {
+    embeddingTestInfo.style.color = "var(--status-failed, #ef4444)";
+    embeddingTestInfo.textContent = "✗ " + err;
+  } finally {
+    btnTestEmbedding.disabled = false;
+    btnTestEmbedding.textContent = "Test";
+  }
+}
+
+// Build/refresh the RAG index for the current project. Live progress arrives via
+// the "rag-index-progress" event; the status pill reflects the outcome.
+async function reindexCodebase() {
+  const path = currentProject?.path;
+  if (!path) {
+    showToast("Open a project first.", "info");
+    return;
+  }
+  btnReindex.disabled = true;
+  setRagStatusClass("busy");
+  ragStatusText.textContent = "Indexing…";
+
+  try {
+    const stats = await invoke<{
+      files_indexed: number;
+      files_skipped: number;
+      files_removed: number;
+      chunks: number;
+    }>("reindex_project", { projectPath: path });
+    showToast(
+      `Indexed ${stats.files_indexed} file(s), ${stats.files_skipped} unchanged — ${stats.chunks} chunks`,
+      "success",
+    );
+    await refreshRagStatus();
+  } catch (err) {
+    setRagStatusClass("off");
+    ragStatusText.textContent = "Index failed";
+    ragStatusEl.title = String(err);
+    showToast("Indexing failed: " + err, "error");
+  } finally {
+    btnReindex.disabled = false;
   }
 }
 
@@ -1444,6 +1648,9 @@ async function selectProject(project: Project) {
 
   // Switch to Kanban mode so cards are immediately visible!
   switchMode("kanban");
+
+  // Refresh the RAG index indicator for the newly-active project.
+  refreshRagStatus();
 }
 
 // Reload cards, controls and chat transcript
@@ -3152,6 +3359,61 @@ function applyInlineMd(escaped: string): string {
   return out.replace(/\u0000IC(\d+)\u0000/g, (_m, i) => codeSpans[Number(i)]);
 }
 
+// Pull GFM tables out of already-escaped + inline-formatted markdown, replacing
+// each with a fenced-block placeholder so the line parser treats it atomically.
+// Rendered <table> HTML is appended to `blocks`; the caller restores them via the
+// same  FB{n}  placeholder pass used for code fences.
+function extractMarkdownTables(html: string, blocks: string[]): string {
+  const looksLikeRow = (s: string): boolean => {
+    const t = s.trim();
+    return t.startsWith("|") && t.endsWith("|") && t.length > 1;
+  };
+  const isSeparator = (s: string): boolean => {
+    const t = s.trim();
+    if (!t.includes("-") || !t.includes("|")) return false;
+    const cells = t.replace(/^\|/, "").replace(/\|$/, "").split("|");
+    return cells.length > 0 && cells.every(c => /^\s*:?-{1,}:?\s*$/.test(c));
+  };
+  const splitRow = (s: string): string[] =>
+    s.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim());
+  const alignOf = (spec: string): string => {
+    const t = spec.trim();
+    const left = t.startsWith(":");
+    const right = t.endsWith(":");
+    if (left && right) return "center";
+    if (right) return "right";
+    return ""; // default / left
+  };
+
+  const lines = html.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (looksLikeRow(lines[i]) && i + 1 < lines.length && isSeparator(lines[i + 1])) {
+      const headers = splitRow(lines[i]);
+      const aligns = splitRow(lines[i + 1]).map(alignOf);
+      i += 1; // consume separator
+      const body: string[][] = [];
+      while (i + 1 < lines.length && looksLikeRow(lines[i + 1])) {
+        i += 1;
+        body.push(splitRow(lines[i]));
+      }
+      const styleFor = (idx: number) =>
+        aligns[idx] ? ` style="text-align:${aligns[idx]}"` : "";
+      const thead = `<thead><tr>${headers
+        .map((h, idx) => `<th${styleFor(idx)}>${h}</th>`)
+        .join("")}</tr></thead>`;
+      const tbody = `<tbody>${body
+        .map(r => `<tr>${r.map((c, idx) => `<td${styleFor(idx)}>${c}</td>`).join("")}</tr>`)
+        .join("")}</tbody>`;
+      blocks.push(`<table class="md-table">${thead}${tbody}</table>`);
+      out.push(` FB${blocks.length - 1} `);
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  return out.join("\n");
+}
+
 function parseMarkdown(md: string): string {
   // Extract fenced code blocks FIRST so inline rules can't mangle their
   // contents. (Previously the single-backtick inline rule ran before fenced
@@ -3167,6 +3429,10 @@ function parseMarkdown(md: string): string {
 
   // Inline formatting rules (shared with chat rendering)
   html = applyInlineMd(html);
+
+  // Pull GFM tables out into placeholders (reusing the fenced-block restore
+  // pass) so the line-based block parser below treats each table as one unit.
+  html = extractMarkdownTables(html, fencedBlocks);
 
   // Split into lines to process block elements (headers, lists, blockquotes)
   const lines = html.split("\n");
@@ -3327,12 +3593,20 @@ function formatPlainMarkdown(text: string): string {
   
   // Inline formatting rules (shared with doc/card rendering)
   escaped = applyInlineMd(escaped);
-  
+
+  // Extract GFM tables into placeholders so the per-line pass treats each table
+  // as a single unit; restored after the join below.
+  const tableBlocks: string[] = [];
+  escaped = extractMarkdownTables(escaped, tableBlocks);
+
   // Split into lines to process block elements (headers, lists)
   const lines = escaped.split("\n");
   const processedLines = lines.map(line => {
     let trimmed = line.trim();
-    
+
+    // Table placeholders contain no markdown prefixes, so they fall through
+    // unchanged and are restored after the join below.
+
     // Headers: # Header, ## Header, etc.
     if (trimmed.startsWith("###### ")) {
       return `<h6>${trimmed.slice(7)}</h6>`;
@@ -3371,8 +3645,11 @@ function formatPlainMarkdown(text: string): string {
     
     return line;
   });
-  
-  return processedLines.join("<br>");
+
+  const nul = String.fromCharCode(0);
+  return processedLines
+    .join("<br>")
+    .replace(new RegExp(nul + "FB(\\d+)" + nul, "g"), (_m, i) => tableBlocks[Number(i)]);
 }
 
 // Escape HTML utility

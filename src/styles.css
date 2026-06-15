@@ -758,6 +758,32 @@ body.resizing-active .resizer {
   margin-bottom: 6px;
 }
 
+table.md-table {
+  border-collapse: collapse;
+  margin: 14px 0;
+  font-size: 0.9em;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+table.md-table th,
+table.md-table td {
+  border: 1px solid var(--border-color);
+  padding: 6px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+table.md-table th {
+  background: var(--bg-tertiary);
+  font-weight: 600;
+}
+
+table.md-table tr:nth-child(even) td {
+  background: var(--bg-secondary);
+}
+
 .markdown-body blockquote {
   border-left: 4px solid var(--accent-primary);
   padding-left: 16px;
@@ -1202,6 +1228,105 @@ body.resizing-active .resizer {
   margin-top: 24px;
   border-top: 1px solid var(--border-color);
   padding-top: 16px;
+}
+
+/* RAG index bar (under the project selector) */
+.rag-index-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.rag-index-bar #btn-reindex {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  font-size: 0.78rem;
+}
+
+.rag-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.rag-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.rag-status--ok .rag-dot {
+  background: var(--status-review, #22c55e);
+}
+.rag-status--stale .rag-dot {
+  background: #f59e0b;
+}
+.rag-status--off .rag-dot {
+  background: var(--text-muted);
+}
+.rag-status--busy .rag-dot {
+  background: var(--accent-primary);
+  animation: rag-pulse 1s ease-in-out infinite;
+}
+
+@keyframes rag-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+/* Settings tabs */
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 18px;
+}
+
+.settings-tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  padding: 8px 14px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  margin-bottom: -1px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.settings-tab-btn:hover {
+  color: var(--text-primary);
+}
+
+.settings-tab-btn.active {
+  color: var(--accent-primary);
+  border-bottom-color: var(--accent-primary);
+}
+
+.settings-tab-panel {
+  display: none;
+}
+
+.settings-tab-panel.active {
+  display: block;
+}
+
+.settings-tab-hint {
+  display: block;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin: 0 0 14px;
+  line-height: 1.45;
 }
 
 /* Form Styling */

@@ -812,9 +812,18 @@ async function setupTauriEventListeners() {
           stream = { text: "", bubbleElement: null };
           activeStreams.set(runId, stream);
         }
-        
+
+        // A transient model error is being retried: drop the abandoned partial
+        // so the resent response doesn't render on top of it.
+        if (payload.reset) {
+          stream.text = "";
+          const resetDiv = stream.bubbleElement?.querySelector(".bubble-content-text") as HTMLDivElement | null;
+          if (resetDiv) resetDiv.innerHTML = "";
+          return;
+        }
+
         stream.text += payload.chunk;
-        
+
         const activeKey = getCurrentLogKey();
         if (activeKey === runId) {
           if (!stream.bubbleElement) {
@@ -919,9 +928,17 @@ async function setupTauriEventListeners() {
         stream = { text: "", bubbleElement: null };
         activeStreams.set(runId, stream);
       }
-      
+
+      // Retry after a transient error: discard the abandoned partial.
+      if (payload.reset) {
+        stream.text = "";
+        const resetDiv = stream.bubbleElement?.querySelector(".bubble-content-text") as HTMLDivElement | null;
+        if (resetDiv) resetDiv.innerHTML = "";
+        return;
+      }
+
       stream.text += payload.chunk;
-      
+
       const activeKey = getCurrentLogKey();
       if (activeKey === runId) {
         if (!stream.bubbleElement) {

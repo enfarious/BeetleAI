@@ -3757,6 +3757,22 @@ fn emit_chunk(app_handle: &tauri::AppHandle, run_id: &str, chunk: &str, done: bo
     );
 }
 
+/// Tell the frontend to discard the partial assistant text streamed so far for
+/// this run. Emitted between retry attempts so a resent request doesn't append
+/// its tokens onto the abandoned partial of the attempt that failed.
+fn emit_stream_reset(app_handle: &tauri::AppHandle, run_id: &str) {
+    let _ = app_handle.emit(
+        "chat-chunk",
+        serde_json::json!({
+            "run_id": run_id,
+            "chunk": "",
+            "done": false,
+            "reset": true,
+            "error": serde_json::Value::Null
+        }),
+    );
+}
+
 /// Convert the OpenAI function-tools schema into Anthropic's tool format
 /// (top-level name/description with `input_schema` instead of nested
 /// `function.parameters`).
@@ -3902,6 +3918,57 @@ fn assist_as_primary(s: &LlmSettings) -> LlmSettings {
     }
 }
 
+/// Extract the numeric HTTP status from a provider error string of the shape
+/// "{Provider} API error {code}: ...". Returns None for transport faults and
+/// for the no-code variant ("... API error: <body>").
+fn parse_http_status(err: &str) -> Option<u16> {
+    let marker = " API error ";
+    let idx = err.find(marker)?;
+    let rest = &err[idx + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u16>().ok()
+}
+
+/// Decide whether a failed model call is worth retrying. Permanent failures —
+/// user cancellation, auth, bad request, missing model, or an unconfigured
+/// endpoint — fail identically on resend, so we surface them at once. Transport
+/// faults (timeouts, dropped/reset connections, mid-stream read failures) and
+/// 5xx/429-class statuses are transient and worth a retry.
+fn llm_error_is_transient(err: &str) -> bool {
+    let e = err.to_lowercase();
+
+    if e.contains("cancelled by user")
+        || e.contains("api url is empty")
+        || e.contains("api key")
+    {
+        return false;
+    }
+
+    if let Some(code) = parse_http_status(err) {
+        // 4xx are caller faults (400 bad request, 401/403 auth, 404 no model,
+        // 422 unprocessable) — never retried. 408/425/429 and 5xx are transient.
+        return matches!(code, 408 | 425 | 429) || code >= 500;
+    }
+
+    // No HTTP status parsed → a transport/stream fault. Retry.
+    true
+}
+
+/// Sleep for `total_ms`, waking early if the run is cancelled so backoff never
+/// delays a cancel.
+fn sleep_unless_cancelled(app_handle: &tauri::AppHandle, run_id: &str, total_ms: u64) {
+    let mut waited = 0u64;
+    while waited < total_ms {
+        if let Some(st) = app_handle.try_state::<AppState>() {
+            if st.cancelled_runs.lock().unwrap().contains(run_id) {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        waited += 250;
+    }
+}
+
 fn call_llm(
     app_handle: &tauri::AppHandle,
     run_id: &str,
@@ -3950,30 +4017,69 @@ fn call_llm(
     })];
     messages.append(&mut chat_history);
 
-    match kind {
-        ProviderKind::Anthropic => call_anthropic(
-            app_handle,
-            run_id,
-            &url,
-            &settings,
-            system_prompt,
-            messages,
-            tools,
-        ),
-        ProviderKind::OllamaNative => {
-            call_ollama_native(app_handle, run_id, &url, &settings, messages, tools)
+    // Resend on transient faults so a network blip no longer drops the whole run
+    // to `blocked`. Attempts: initial + 2 retries, backing off 1s then 3s. The
+    // request is identical each time; only the per-attempt clones of the moved
+    // args differ. Permanent errors (auth, bad request) and user cancellation
+    // short-circuit immediately via llm_error_is_transient.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let result = match kind {
+            ProviderKind::Anthropic => call_anthropic(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                system_prompt,
+                messages.clone(),
+                tools.clone(),
+            ),
+            ProviderKind::OllamaNative => call_ollama_native(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                messages.clone(),
+                tools.clone(),
+            ),
+            ProviderKind::LmStudioStateful => call_lmstudio_stateful(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                system_prompt,
+                &messages,
+            ),
+            ProviderKind::OpenAiCompat => call_openai_compat(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                messages.clone(),
+                tools.clone(),
+            ),
+        };
+
+        let err = match result {
+            Ok(reply) => return Ok(reply),
+            Err(e) => e,
+        };
+
+        if attempt >= MAX_ATTEMPTS || !llm_error_is_transient(&err) {
+            return Err(err);
         }
-        ProviderKind::LmStudioStateful => call_lmstudio_stateful(
-            app_handle,
-            run_id,
-            &url,
-            &settings,
-            system_prompt,
-            &messages,
-        ),
-        ProviderKind::OpenAiCompat => {
-            call_openai_compat(app_handle, run_id, &url, &settings, messages, tools)
-        }
+
+        // Discard the failed attempt's partial stream from the UI, back off, and
+        // resend. sleep_unless_cancelled keeps a mid-backoff cancel responsive.
+        emit_stream_reset(app_handle, run_id);
+        log_error(&format!(
+            "Transient model error on attempt {}/{}, retrying: {}",
+            attempt, MAX_ATTEMPTS, err
+        ));
+        let backoff_ms = if attempt == 1 { 1000 } else { 3000 };
+        sleep_unless_cancelled(app_handle, run_id, backoff_ms);
     }
 }
 
@@ -10428,6 +10534,36 @@ mod tests {
 
         let reap = worktrees_to_reap(&on_disk, &keep);
         assert_eq!(reap, vec!["run_b".to_string()]);
+    }
+
+    #[test]
+    fn test_llm_error_transient_classification() {
+        // Permanent: cancellation, config, and 4xx caller faults.
+        assert!(!llm_error_is_transient("Cancelled by user"));
+        assert!(!llm_error_is_transient(
+            "API URL is empty. Please configure it in settings."
+        ));
+        assert!(!llm_error_is_transient("Anthropic API error 401: bad key"));
+        assert!(!llm_error_is_transient("Ollama API error 404: no such model"));
+        assert!(!llm_error_is_transient("LLM API error 400: bad request"));
+
+        // Transient: 5xx / 429 statuses and transport/stream faults.
+        assert!(llm_error_is_transient("LLM API error 503: unavailable"));
+        assert!(llm_error_is_transient("Ollama API error 500: boom"));
+        assert!(llm_error_is_transient("LM Studio API error 429: slow down"));
+        assert!(llm_error_is_transient("Network request failed: timed out"));
+        assert!(llm_error_is_transient(
+            "LM Studio stream read failed: connection reset"
+        ));
+    }
+
+    #[test]
+    fn test_parse_http_status() {
+        assert_eq!(parse_http_status("Anthropic API error 503: x"), Some(503));
+        assert_eq!(parse_http_status("LLM API error 429: x"), Some(429));
+        // No-code variant and transport faults carry no status.
+        assert_eq!(parse_http_status("Ollama API error: text"), None);
+        assert_eq!(parse_http_status("Network request failed: oops"), None);
     }
 
     #[test]

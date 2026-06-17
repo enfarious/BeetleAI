@@ -1162,6 +1162,129 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
     Ok(())
 }
 
+/// Pure decision core for the startup reaper: given the run-id worktree
+/// directories found on disk for a project and the set of run-ids that a live
+/// card still owns (and may resume), return the run-ids whose worktrees are safe
+/// to delete. A worktree is an orphan if no live card references it — its owning
+/// card was deleted or reached a terminal state (`done`/`failed`).
+fn worktrees_to_reap(on_disk: &[String], keep: &std::collections::HashSet<String>) -> Vec<String> {
+    on_disk
+        .iter()
+        .filter(|run_id| !keep.contains(*run_id))
+        .cloned()
+        .collect()
+}
+
+/// List the run-id subdirectories under a project's `.harness/worktrees/`.
+fn worktree_dirs_on_disk(repo_path: &Path) -> Vec<String> {
+    let root = repo_path.join(".harness").join("worktrees");
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Reconcile run state and worktrees left behind by a previous session. The run
+/// loop is an in-memory `tokio` task that dies with the process, so any card
+/// persisted as `running` has a dead loop and is stuck: `unblock_run` only
+/// resumes `blocked`/`review`. We demote those crash-orphaned `running` cards to
+/// `blocked` so the user can resume them — their worktree and full transcript are
+/// still on disk. Then, per project, we delete worktree directories that no live
+/// card owns (deleted or terminal cards) and prune git's worktree bookkeeping.
+///
+/// Runs AFTER `load_state_from_db`, so cards and run logs are already in memory.
+pub fn reconcile_runs_on_startup(app_handle: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    // Phase 1: demote crash-orphaned `running` cards to `blocked`.
+    let mut demoted: Vec<(String, String)> = Vec::new(); // (card_id, run_id)
+    let mut keep_by_project: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut project_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    {
+        let mut cards = state.cards.lock().unwrap();
+        for card in cards.iter_mut() {
+            project_paths.insert(card.project_path.clone());
+            if card.status == "running" {
+                card.status = "blocked".to_string();
+                if let Some(run_id) = card.run_id.clone() {
+                    demoted.push((card.id.clone(), run_id));
+                }
+            }
+            // A live card (now including freshly-demoted ones) keeps its worktree.
+            if matches!(card.status.as_str(), "blocked" | "review") {
+                if let Some(run_id) = card.run_id.clone() {
+                    keep_by_project
+                        .entry(card.project_path.clone())
+                        .or_default()
+                        .insert(run_id);
+                }
+            }
+        }
+    }
+
+    // Persist demotions + leave a transcript breadcrumb so the run reads clearly.
+    if let Ok(conn) = get_db_conn(app_handle) {
+        for (card_id, run_id) in &demoted {
+            let _ = conn.execute(
+                "UPDATE cards SET status = 'blocked' WHERE id = ?1",
+                [card_id],
+            );
+            let _ = conn.execute(
+                "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("run", card_id, run_id, "status", "blocked"),
+            );
+            let msg = "{\"role\":\"agent\",\"content\":\"Run interrupted by an app restart. The previous session ended before this run finished — its worktree and transcript are intact. Resume to continue, or reject to discard.\"}";
+            let _ = conn.execute(
+                "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("run", card_id, run_id, "message", msg),
+            );
+        }
+    }
+
+    // Mirror the breadcrumb into the in-memory log so a freshly-loaded UI shows it.
+    if !demoted.is_empty() {
+        let mut logs = state.run_logs.lock().unwrap();
+        for (card_id, run_id) in &demoted {
+            let events = logs.entry(card_id.clone()).or_default();
+            events.push(RunEvent {
+                run_id: run_id.clone(),
+                event_type: "status".to_string(),
+                payload: "blocked".to_string(),
+            });
+            events.push(RunEvent {
+                run_id: run_id.clone(),
+                event_type: "message".to_string(),
+                payload: "{\"role\":\"agent\",\"content\":\"Run interrupted by an app restart. The previous session ended before this run finished — its worktree and transcript are intact. Resume to continue, or reject to discard.\"}".to_string(),
+            });
+        }
+    }
+
+    // Phase 2: per project, reap worktrees no live card owns, then prune.
+    let empty = std::collections::HashSet::new();
+    for project_path in &project_paths {
+        let repo_path = clean_project_path(project_path);
+        if !git::is_git_repo(&repo_path) {
+            continue;
+        }
+        let on_disk = worktree_dirs_on_disk(&repo_path);
+        let keep = keep_by_project.get(project_path).unwrap_or(&empty);
+        for run_id in worktrees_to_reap(&on_disk, keep) {
+            // Best-effort: a failure here shouldn't abort startup.
+            let _ = git::remove_worktree(&repo_path, &run_id);
+        }
+        let _ = git::prune_worktrees(&repo_path);
+    }
+
+    Ok(())
+}
+
 fn get_config_path(app_handle: &tauri::AppHandle) -> PathBuf {
     let mut path = app_handle
         .path()
@@ -10291,6 +10414,30 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_worktrees_to_reap_keeps_live_drops_orphans() {
+        let on_disk = vec![
+            "run_a".to_string(), // owned by a blocked card -> keep
+            "run_b".to_string(), // terminal/deleted card    -> reap
+            "run_c".to_string(), // owned by an in-review card -> keep
+        ];
+        let mut keep = std::collections::HashSet::new();
+        keep.insert("run_a".to_string());
+        keep.insert("run_c".to_string());
+
+        let reap = worktrees_to_reap(&on_disk, &keep);
+        assert_eq!(reap, vec!["run_b".to_string()]);
+    }
+
+    #[test]
+    fn test_worktrees_to_reap_empty_keep_reaps_all() {
+        let on_disk = vec!["run_x".to_string(), "run_y".to_string()];
+        let keep = std::collections::HashSet::new();
+        let mut reap = worktrees_to_reap(&on_disk, &keep);
+        reap.sort();
+        assert_eq!(reap, vec!["run_x".to_string(), "run_y".to_string()]);
+    }
 
     #[test]
     fn test_parse_tool_call_simple() {

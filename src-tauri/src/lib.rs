@@ -111,6 +111,9 @@ pub fn run() {
                 let state = app.state::<commands::AppState>();
                 if let Err(e) = commands::load_state_from_db(&app_handle, &state) {
                     eprintln!("Failed to load state from database: {}", e);
+                } else if let Err(e) = commands::reconcile_runs_on_startup(&app_handle, &state) {
+                    // Reaping orphaned worktrees is best-effort; never block launch.
+                    eprintln!("Failed to reconcile runs on startup: {}", e);
                 }
             }
             Ok(())

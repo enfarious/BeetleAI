@@ -8496,6 +8496,175 @@ fn run_verification(worktree_path: &Path) -> Result<String, String> {
     }
 }
 
+/// Byte spans of each line's content, excluding its trailing `\n`/`\r\n` — the
+/// same line set as `str::lines()` (a final newline yields no trailing empty
+/// line). The patch_file fuzzy fallback compares on these spans and splices on
+/// their byte offsets, so a line-level match maps back to an exact byte range.
+fn line_content_spans(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for i in 0..b.len() {
+        if b[i] == b'\n' {
+            let mut end = i;
+            if end > start && b[end - 1] == b'\r' {
+                end -= 1;
+            }
+            spans.push((start, end));
+            start = i + 1;
+        }
+    }
+    if start < b.len() {
+        let mut end = b.len();
+        if end > start && b[end - 1] == b'\r' {
+            end -= 1;
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// Split a model-supplied target into comparison lines: drop `\r`, trim trailing
+/// whitespace, and discard the trailing empty line a stray final newline leaves.
+fn target_compare_lines(target: &str) -> Vec<String> {
+    let mut lines: Vec<String> = target
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').trim_end().to_string())
+        .collect();
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines
+}
+
+/// If every target line carries a `read_file`-style `"<n>: "` prefix with
+/// consecutive ascending numbers, return the lines with those prefixes removed
+/// (preserving each line's own indentation). Returns None when the pattern
+/// isn't a clean run — so a genuine `42: value` code line is never mis-stripped.
+fn strip_read_file_line_numbers(lines: &[String]) -> Option<Vec<String>> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut prev: Option<u64> = None;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let t = line.trim_start();
+        let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        // read_file emits `format!("{}: {}", n, line)`, so the separator is a
+        // colon plus one space; the rest is the line's own (preserved) text.
+        let code = match t[digits.len()..].strip_prefix(':') {
+            Some(after) => after.strip_prefix(' ').unwrap_or(after),
+            None => return None,
+        };
+        let n: u64 = digits.parse().ok()?;
+        if let Some(p) = prev {
+            if n != p + 1 {
+                return None;
+            }
+        }
+        prev = Some(n);
+        out.push(code.to_string());
+    }
+    Some(out)
+}
+
+/// Start indices of every window in `norm_file` matching `target` line-for-line.
+fn line_window_matches(norm_file: &[&str], target: &[String]) -> Vec<usize> {
+    if target.is_empty() || target.len() > norm_file.len() {
+        return Vec::new();
+    }
+    (0..=norm_file.len() - target.len())
+        .filter(|&i| (0..target.len()).all(|k| norm_file[i + k] == target[k]))
+        .collect()
+}
+
+/// Where a patch target lands in the file.
+enum PatchLocation {
+    /// Unique byte range to replace. `line_based` is true when the match came
+    /// from the whitespace/line-ending-tolerant fallback rather than an exact
+    /// byte match — it changes how the replacement is spliced.
+    Unique {
+        start: usize,
+        end: usize,
+        line_based: bool,
+    },
+    None,
+    Ambiguous(usize),
+}
+
+/// Locate `target` in `content`. Exact byte match first — preserving the old
+/// behavior and partial-line patches. Only when that finds nothing do we fall
+/// back to line-level matching that tolerates the three artifacts a model
+/// introduces when reconstructing a snippet from line-numbered read_file
+/// output: LF where the file on disk has CRLF (read_file shows lines via
+/// `str::lines()`, so the model never even sees the `\r`), copied `"<n>: "`
+/// prefixes, and dropped trailing whitespace. The fallback keeps the uniqueness
+/// guarantee — an ambiguous fuzzy match still asks for more context rather than
+/// guessing which occurrence was meant.
+fn locate_patch_target(content: &str, target: &str) -> PatchLocation {
+    let exact: Vec<usize> = content.match_indices(target).map(|(i, _)| i).collect();
+    match exact.len() {
+        1 => {
+            return PatchLocation::Unique {
+                start: exact[0],
+                end: exact[0] + target.len(),
+                line_based: false,
+            }
+        }
+        0 => {}
+        n => return PatchLocation::Ambiguous(n),
+    }
+
+    let spans = line_content_spans(content);
+    let norm_file: Vec<&str> = spans
+        .iter()
+        .map(|&(s, e)| content[s..e].trim_end())
+        .collect();
+
+    let base = target_compare_lines(target);
+    let mut candidates = vec![base.clone()];
+    if let Some(stripped) = strip_read_file_line_numbers(&base) {
+        if stripped != base {
+            candidates.push(stripped);
+        }
+    }
+
+    let mut saw_ambiguous = 0usize;
+    for cand in &candidates {
+        let hits = line_window_matches(&norm_file, cand);
+        match hits.len() {
+            1 => {
+                let i = hits[0];
+                return PatchLocation::Unique {
+                    start: spans[i].0,
+                    end: spans[i + cand.len() - 1].1,
+                    line_based: true,
+                };
+            }
+            0 => {}
+            n => saw_ambiguous = saw_ambiguous.max(n),
+        }
+    }
+    if saw_ambiguous > 0 {
+        PatchLocation::Ambiguous(saw_ambiguous)
+    } else {
+        PatchLocation::None
+    }
+}
+
+/// Re-encode `s` to the file's dominant line ending (`crlf` true => CRLF).
+fn normalize_line_endings(s: &str, crlf: bool) -> String {
+    let lf = s.replace("\r\n", "\n");
+    if crlf {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
+    }
+}
+
 fn patch_file_impl(
     worktree_path: &Path,
     path: &str,
@@ -8508,26 +8677,50 @@ fn patch_file_impl(
         Err(e) => return format!("Error: {}", e),
     };
 
-    match fs::read_to_string(&target_file) {
-        Ok(content) => {
-            let matches: Vec<_> = content.match_indices(target_str).collect();
-            if matches.is_empty() {
-                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If you copied the target from read_file output, remove the leading line numbers — target must match the file's RAW text. If the snippet contains quotes or escapes you cannot reproduce exactly, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.", path);
-            }
-            if matches.len() > 1 {
-                return format!(
-                    "Error: Target text occurs {} times in '{}'. Please provide more surrounding lines of context to ensure the match is unique.",
-                    matches.len(),
-                    path
-                );
-            }
-            let updated = content.replacen(target_str, replacement_str, 1);
+    let content = match fs::read_to_string(&target_file) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading file: {}", e),
+    };
+
+    match locate_patch_target(&content, target_str) {
+        PatchLocation::None => format!(
+            "Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If you copied the target from read_file output, remove the leading line numbers — target must match the file's RAW text. If the snippet contains quotes or escapes you cannot reproduce exactly, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.",
+            path
+        ),
+        PatchLocation::Ambiguous(n) => format!(
+            "Error: Target text occurs {} times in '{}'. Please provide more surrounding lines of context to ensure the match is unique.",
+            n, path
+        ),
+        PatchLocation::Unique {
+            start,
+            end,
+            line_based,
+        } => {
+            // Exact matches splice byte-for-byte (behavior unchanged). Line-based
+            // matches replace whole-line content while preserving the block's
+            // surrounding newlines, so drop one trailing newline from the
+            // replacement and re-encode it to the file's line ending — otherwise
+            // a fuzzy patch would inject LF into a CRLF file or add a blank line.
+            let replacement = if line_based {
+                let crlf = content.contains("\r\n");
+                let trimmed = replacement_str
+                    .strip_suffix("\r\n")
+                    .or_else(|| replacement_str.strip_suffix('\n'))
+                    .unwrap_or(replacement_str);
+                normalize_line_endings(trimmed, crlf)
+            } else {
+                replacement_str.to_string()
+            };
+            let mut updated = String::with_capacity(content.len() + replacement.len());
+            updated.push_str(&content[..start]);
+            updated.push_str(&replacement);
+            updated.push_str(&content[end..]);
             match fs::write(&target_file, updated) {
+                Ok(_) if line_based => "Success: File patched (target matched after normalizing line endings and whitespace).".to_string(),
                 Ok(_) => "Success: File patched successfully".to_string(),
                 Err(e) => format!("Error writing file: {}", e),
             }
         }
-        Err(e) => format!("Error reading file: {}", e),
     }
 }
 
@@ -11241,6 +11434,66 @@ BeetleAI
         // 4. Test patch_file_impl non-unique target
         let res_patch_non_unique = patch_file_impl(wt_path, "file_a.txt", "is", "was");
         assert!(res_patch_non_unique.contains("Error: Target text occurs"));
+    }
+
+    #[test]
+    fn test_patch_file_fuzzy_match() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wt = dir.path();
+
+        // 1. CRLF file, multi-line LF target — the dominant Windows miss. The
+        //    model only ever saw LF (read_file uses str::lines()), so its target
+        //    has bare \n that no longer byte-matches the file's \r\n.
+        let crlf = wt.join("crlf.rs");
+        fs::write(&crlf, "fn main() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n").unwrap();
+        let res = patch_file_impl(
+            wt,
+            "crlf.rs",
+            "    let x = 1;\n    let y = 2;",
+            "    let x = 10;\n    let y = 20;",
+        );
+        assert!(res.starts_with("Success"), "got: {res}");
+        let after = fs::read_to_string(&crlf).unwrap();
+        assert_eq!(after, "fn main() {\r\n    let x = 10;\r\n    let y = 20;\r\n}\r\n");
+
+        // 2. Target carrying read_file's "<n>: " line-number prefixes.
+        let f = wt.join("nums.txt");
+        fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let res = patch_file_impl(wt, "nums.txt", "2: beta\n3: gamma", "BETA\nGAMMA");
+        assert!(res.starts_with("Success"), "got: {res}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "alpha\nBETA\nGAMMA\n");
+
+        // 3. Trailing-whitespace drift: a file line has trailing spaces the model
+        //    dropped, breaking the exact byte match of the multi-line target.
+        let f = wt.join("trail.txt");
+        fs::write(&f, "keep\nedit me   \ntail\n").unwrap();
+        let res = patch_file_impl(wt, "trail.txt", "edit me\ntail", "edited\nTAIL");
+        assert!(res.starts_with("Success"), "got: {res}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "keep\nedited\nTAIL\n");
+
+        // 4. Fuzzy match that is ambiguous still refuses rather than guessing.
+        let f = wt.join("dup.txt");
+        fs::write(&f, "x = 1\r\ny = 2\r\nx = 1\r\n").unwrap();
+        let res = patch_file_impl(wt, "dup.txt", "x = 1", "x = 99");
+        assert!(res.contains("Target text occurs 2 times"), "got: {res}");
+
+        // 5. A genuinely absent target still reports not-found.
+        let res = patch_file_impl(wt, "dup.txt", "nonexistent line", "z");
+        assert!(res.contains("Target text not found"), "got: {res}");
+
+        // 6. A line that merely looks like a numbered prefix but isn't a clean
+        //    consecutive run is matched literally, not mis-stripped.
+        let f = wt.join("dict.txt");
+        // CRLF so the exact tier misses and the line-based fallback runs: the
+        // literal candidate must match before any prefix-stripping is attempted.
+        fs::write(&f, "config = {\r\n  42: \"answer\",\r\n}\r\n").unwrap();
+        let res = patch_file_impl(wt, "dict.txt", "  42: \"answer\",", "  42: \"forty-two\",");
+        assert!(res.starts_with("Success"), "got: {res}");
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "config = {\r\n  42: \"forty-two\",\r\n}\r\n"
+        );
     }
 
     // ----- RAG / embeddings unit tests (pure, no network) -----

@@ -108,6 +108,10 @@ pub fn run() {
             if let Err(e) = commands::init_db(&app_handle) {
                 eprintln!("Failed to initialize database: {}", e);
             } else {
+                // Trim the logs table before it's replayed into memory.
+                if let Err(e) = commands::prune_old_run_logs(&app_handle) {
+                    eprintln!("Failed to prune old run logs: {}", e);
+                }
                 let state = app.state::<commands::AppState>();
                 if let Err(e) = commands::load_state_from_db(&app_handle, &state) {
                     eprintln!("Failed to load state from database: {}", e);

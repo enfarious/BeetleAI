@@ -1175,6 +1175,78 @@ fn worktrees_to_reap(on_disk: &[String], keep: &std::collections::HashSet<String
         .collect()
 }
 
+/// Pure decision core for log retention: given distinct run-ids ordered
+/// most-recent-first, keep the newest `keep` of them plus every protected
+/// (resumable) run, and return the run-ids whose transcripts may be deleted.
+fn run_logs_to_prune(
+    recent_first: &[String],
+    keep: usize,
+    protected: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    recent_first
+        .iter()
+        .skip(keep)
+        .filter(|run_id| !protected.contains(*run_id))
+        .cloned()
+        .collect()
+}
+
+/// Bound the otherwise-unbounded `logs` table. Each run appends a few hundred
+/// event rows; left unchecked they slow startup (the whole table replays into
+/// memory) and run-replay queries. We keep the most recent `KEEP_RUNS` run
+/// transcripts plus every resumable run (blocked/review/etc., which still need
+/// replay) and delete the rest — whole runs at a time, so a transcript is never
+/// half-truncated. Only run logs are touched; design/code chat logs are bounded
+/// by doc count and left alone.
+///
+/// Runs BEFORE load_state_from_db so the trimmed set is what gets loaded.
+pub fn prune_old_run_logs(app_handle: &tauri::AppHandle) -> Result<usize, String> {
+    const KEEP_RUNS: usize = 200;
+    let conn = get_db_conn(app_handle)?;
+
+    // Resumable runs keep their transcript regardless of age.
+    let mut protected = std::collections::HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM cards WHERE run_id IS NOT NULL AND status IN ('running','queued','blocked','review')")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            protected.insert(r.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // Distinct run transcripts, most-recent first (by their latest row id).
+    let mut recent_first = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM logs WHERE log_type = 'run' GROUP BY run_id ORDER BY MAX(id) DESC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            recent_first.push(r.map_err(|e| e.to_string())?);
+        }
+    }
+
+    let mut pruned = 0usize;
+    for run_id in run_logs_to_prune(&recent_first, KEEP_RUNS, &protected) {
+        let n = conn
+            .execute(
+                "DELETE FROM logs WHERE log_type = 'run' AND run_id = ?1",
+                [&run_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if n > 0 {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 /// List the run-id subdirectories under a project's `.harness/worktrees/`.
 fn worktree_dirs_on_disk(repo_path: &Path) -> Vec<String> {
     let root = repo_path.join(".harness").join("worktrees");
@@ -10564,6 +10636,31 @@ mod tests {
         // No-code variant and transport faults carry no status.
         assert_eq!(parse_http_status("Ollama API error: text"), None);
         assert_eq!(parse_http_status("Network request failed: oops"), None);
+    }
+
+    #[test]
+    fn test_run_logs_to_prune_keeps_recent_and_protected() {
+        // recent_first: r1 newest ... r5 oldest. Keep 2 newest; r5 is resumable.
+        let recent = vec![
+            "r1".to_string(),
+            "r2".to_string(),
+            "r3".to_string(),
+            "r4".to_string(),
+            "r5".to_string(),
+        ];
+        let mut protected = std::collections::HashSet::new();
+        protected.insert("r5".to_string());
+
+        let prune = run_logs_to_prune(&recent, 2, &protected);
+        // r1,r2 kept by recency; r5 kept by protection; r3,r4 pruned.
+        assert_eq!(prune, vec!["r3".to_string(), "r4".to_string()]);
+    }
+
+    #[test]
+    fn test_run_logs_to_prune_under_cap_prunes_nothing() {
+        let recent = vec!["r1".to_string(), "r2".to_string()];
+        let protected = std::collections::HashSet::new();
+        assert!(run_logs_to_prune(&recent, 200, &protected).is_empty());
     }
 
     #[test]

@@ -2056,6 +2056,32 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                     }
                 }
             }),
+            "screenshot" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "screenshot",
+                    "description": "Renders a running web page in a headless browser and captures a PNG. The dev server must already be serving the URL. If the loaded model is vision-capable the image is shown to you on your next turn (so you can SEE the rendered UI); otherwise it is saved as an artifact for your human. Use it to check layout, alignment, and visual regressions instead of guessing from CSS.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL of a page the dev server is already serving, e.g. http://localhost:5173/"
+                            },
+                            "width": {
+                                "type": "integer",
+                                "description": "Viewport width in px (default 1280, 320-2560)"
+                            },
+                            "height": {
+                                "type": "integer",
+                                "description": "Viewport height in px (default 800, 240-2000)"
+                            }
+                        },
+                        "required": ["url"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
             "send_notification" => serde_json::json!({
                 "type": "function",
                 "function": {
@@ -4514,6 +4540,14 @@ fn call_openai_compat(
     tools: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let messages = normalize_for_strict_templates(messages);
+    // Vision: if the agent just took a screenshot and the loaded model can see,
+    // attach the PNG to that turn. Probe capability only when an image is
+    // actually pending, so the common no-screenshot turn pays no latency.
+    let messages = if last_screenshot(&messages).is_some() {
+        attach_recent_screenshot(messages, model_supports_vision(settings))
+    } else {
+        messages
+    };
     let mut payload = serde_json::json!({
     "model": settings.model,
     "messages": messages,
@@ -6941,7 +6975,8 @@ fn construct_agent_system_prompt(
          21. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
          22. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
          23. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
-         24. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         24. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\
+         25. `screenshot(url: String, width?: Int, height?: Int)`: Renders a page the dev server is ALREADY serving (e.g. http://localhost:5173/) in a headless browser and captures it. If the loaded model is vision-capable, the image is shown to you next turn so you can SEE the rendered UI — use it to check layout/alignment instead of guessing from CSS. It does NOT start the dev server.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first, and search_codebase() to locate relevant code by concept — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     );
@@ -7055,7 +7090,7 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
-const KNOWN_TOOLS: [&str; 24] = [
+const KNOWN_TOOLS: [&str; 25] = [
     "read_file",
     "outline_file",
     "write_file",
@@ -7075,6 +7110,7 @@ const KNOWN_TOOLS: [&str; 24] = [
     "git_status",
     "git_diff",
     "run_command",
+    "screenshot",
     "web_search",
     "send_notification",
     "read_card",
@@ -7873,6 +7909,233 @@ fn run_shell_command<P: AsRef<Path>>(
         }
     };
     Ok(format!("{}\n{}", header, body))
+}
+
+/// Standard base64 (RFC 4648, with padding, no line wrapping). Hand-rolled to
+/// avoid a new dependency; the only use is encoding a screenshot PNG into a
+/// data: URI for vision-capable models.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+static SHOT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Locate an installed headless-capable Chromium browser (Chrome preferred,
+/// then Edge). v1 targets the user's Windows environment with POSIX fallbacks.
+fn find_headless_browser() -> Option<std::path::PathBuf> {
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+    } else {
+        &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+        ]
+    };
+    candidates
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// Capture `url` to a PNG via headless Chrome/Edge and return the file path.
+/// Saved under a per-run temp dir (NOT the worktree, so it never shows up in
+/// git_status). The throwaway --user-data-dir is load-bearing: without it a
+/// browser already running on the user's desktop hands the request off to that
+/// instance and the headless invocation no-ops without writing a file.
+fn capture_screenshot(run_id: &str, url: &str, width: u32, height: u32) -> Result<std::path::PathBuf, String> {
+    use std::time::{Duration, Instant};
+    let browser = find_headless_browser()
+        .ok_or("no headless browser found (install Google Chrome or Microsoft Edge)")?;
+    let dir = std::env::temp_dir().join("beetleai-shots").join(run_id);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let n = SHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shot = dir.join(format!("shot-{}.png", n));
+    let profile = dir.join("browser-profile");
+    let _ = fs::remove_file(&shot);
+
+    let mut cmd = Command::new(&browser);
+    cmd.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--hide-scrollbars",
+        &format!("--user-data-dir={}", profile.display()),
+        &format!("--screenshot={}", shot.display()),
+        &format!("--window-size={},{}", width, height),
+        url,
+    ]);
+    crate::configure_no_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("failed to launch browser: {}", e))?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("screenshot timed out after 30s".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    if shot.exists() {
+        Ok(shot)
+    } else {
+        Err(format!("browser exited without writing a screenshot — is '{}' reachable?", url))
+    }
+}
+
+/// Marker the screenshot tool prepends to its result so the image can be
+/// re-attached to the model's next turn. Kept at the HEAD of the result because
+/// truncate_tool_result clips the tail.
+const SHOT_MARKER_OPEN: &str = "[screenshot:";
+
+fn parse_screenshot_path(content: &str) -> Option<String> {
+    let start = content.find(SHOT_MARKER_OPEN)? + SHOT_MARKER_OPEN.len();
+    let rest = &content[start..];
+    let end = rest.find(']')?;
+    let p = rest[..end].trim();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p.to_string())
+    }
+}
+
+/// Index + path of the LAST message carrying a screenshot marker, if any.
+fn last_screenshot(messages: &[serde_json::Value]) -> Option<(usize, String)> {
+    let mut found = None;
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
+            if let Some(p) = parse_screenshot_path(c) {
+                found = Some((i, p));
+            }
+        }
+    }
+    found
+}
+
+/// Read `capabilities.vision` for `model` out of LM Studio's /api/v1/models
+/// payload. Matches by exact key first, then falls back to any loaded
+/// vision-capable model (the configured id can differ from the registry key).
+fn vision_from_models_json(json: &serde_json::Value, model: &str) -> bool {
+    let models = match json.get("models").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return false,
+    };
+    let cap_vision = |m: &serde_json::Value| {
+        m.get("capabilities")
+            .and_then(|c| c.get("vision"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    for m in models {
+        if m.get("key").and_then(|k| k.as_str()) == Some(model) {
+            return cap_vision(m);
+        }
+    }
+    for m in models {
+        let loaded = m
+            .get("loaded_instances")
+            .and_then(|a| a.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if loaded && cap_vision(m) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort: does the configured chat model accept images? Only the
+/// OpenAI-compat path carries images in v1; for it we ask LM Studio's native
+/// /api/v1/models. Fails CLOSED on any other provider or any error — we never
+/// send an image to a model that can't take one.
+fn model_supports_vision(settings: &LlmSettings) -> bool {
+    if provider_kind(&settings.provider.to_lowercase()) != ProviderKind::OpenAiCompat {
+        return false;
+    }
+    let root = settings
+        .api_url
+        .trim_end_matches('/')
+        .trim_end_matches("/api/v1/chat")
+        .trim_end_matches("/api/v1")
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let url = format!("{}/api/v1/models", root);
+    let resp = match ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    match resp.into_json::<serde_json::Value>() {
+        Ok(json) => vision_from_models_json(&json, &settings.model),
+        Err(_) => false,
+    }
+}
+
+/// If a recent screenshot exists and `vision` is on, rewrite that message's
+/// content from a plain string into an OpenAI multimodal array (text + the PNG
+/// as a base64 data: URI). Only the most recent screenshot is attached, and
+/// only while it's near the tail, so we don't re-send a large image every turn
+/// for the rest of the run. A no-op when there's no screenshot, vision is off,
+/// or the file is gone — the text marker simply remains.
+fn attach_recent_screenshot(mut messages: Vec<serde_json::Value>, vision: bool) -> Vec<serde_json::Value> {
+    let (idx, path) = match last_screenshot(&messages) {
+        Some(x) => x,
+        None => return messages,
+    };
+    if !vision || messages.len().saturating_sub(idx) > 6 {
+        return messages;
+    }
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return messages,
+    };
+    let data_uri = format!("data:image/png;base64,{}", base64_encode(&bytes));
+    let role = messages[idx]
+        .get("role")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("user"));
+    let text = messages[idx]
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    messages[idx] = serde_json::json!({
+        "role": role,
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "image_url", "image_url": { "url": data_uri } }
+        ]
+    });
+    messages
 }
 
 fn strip_html_tags(html: &str) -> String {
@@ -8814,12 +9077,12 @@ fn patch_file_impl(
 /// The canonical tool names the parser/dispatcher knows. Used by
 /// `looks_like_malformed_tool_call` to tell a botched call (the model named a
 /// real tool but mangled the syntax) apart from ordinary prose.
-const KNOWN_TOOL_NAMES: [&str; 24] = [
+const KNOWN_TOOL_NAMES: [&str; 25] = [
     "read_file", "outline_file", "write_file", "list_dir", "git_status",
-    "git_diff", "run_command", "web_search", "send_notification", "task_complete",
-    "search_grep", "find_file", "find_symbol", "remember", "recall", "list_cards",
-    "create_card", "update_card", "delete_card", "read_card", "set_todo",
-    "replace_lines", "patch_file", "search_codebase",
+    "git_diff", "run_command", "screenshot", "web_search", "send_notification",
+    "task_complete", "search_grep", "find_file", "find_symbol", "remember",
+    "recall", "list_cards", "create_card", "update_card", "delete_card",
+    "read_card", "set_todo", "replace_lines", "patch_file", "search_codebase",
 ];
 
 /// Bucket a tool result into a coarse, STABLE `failure_reason` for harness
@@ -9285,6 +9548,33 @@ fn execute_tool(
             match run_shell_command(worktree_path, command, timeout_secs) {
                 Ok(out) => out,
                 Err(e) => format!("Error executing command: {}", e),
+            }
+        }
+        "screenshot" => {
+            let url = match args.get("url").and_then(|u| u.as_str()) {
+                Some(u) if !u.trim().is_empty() => u.trim(),
+                _ => return "Error: Missing 'url' argument. Pass a URL the dev server is already serving, e.g. http://localhost:5173/. (This tool does not start the server.)".to_string(),
+            };
+            let width = args
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1280)
+                .clamp(320, 2560) as u32;
+            let height = args
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(800)
+                .clamp(240, 2000) as u32;
+            match capture_screenshot(run_id, url, width, height) {
+                Ok(path) => format!(
+                    "{}{}]\nCaptured {} at {}x{}. If the loaded model is vision-capable, the image is attached to this turn so you can see the rendered UI; otherwise it is saved as an artifact for your human.",
+                    SHOT_MARKER_OPEN,
+                    path.display(),
+                    url,
+                    width,
+                    height
+                ),
+                Err(e) => format!("Error: screenshot failed — {}", e),
             }
         }
         "web_search" => {
@@ -10150,7 +10440,7 @@ fn execute_tool(
             }
         }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, screenshot, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -10360,6 +10650,7 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "git_status",
                 "git_diff",
                 "run_command",
+                "screenshot",
                 "web_search",
                 "send_notification",
                 "task_complete",
@@ -11622,6 +11913,84 @@ BeetleAI
         };
         let timed = run_shell_command(wt, sleep, Some(1)).unwrap();
         assert!(timed.contains("timed out after 1s"), "got: {timed}");
+    }
+
+    #[test]
+    fn test_base64_encode_known_vectors() {
+        // RFC 4648 test vectors, including the two padding cases.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_parse_screenshot_path() {
+        assert_eq!(
+            parse_screenshot_path("[screenshot:C:\\tmp\\shot-0.png]\nCaptured ...").as_deref(),
+            Some("C:\\tmp\\shot-0.png")
+        );
+        assert_eq!(parse_screenshot_path("Tool 'read_file' returned:\nfn main"), None);
+        assert_eq!(parse_screenshot_path("[screenshot:]"), None);
+    }
+
+    #[test]
+    fn test_vision_from_models_json() {
+        // Shape mirrors LM Studio's /api/v1/models: vision lives under
+        // capabilities.vision, NOT the misleading top-level `type`/`vision`.
+        let json = serde_json::json!({
+            "models": [
+                { "key": "text-embedding", "type": "embedding", "vision": null,
+                  "loaded_instances": [{}], "capabilities": null },
+                { "key": "google/gemma-4-26b-a4b-qat", "type": "llm", "vision": null,
+                  "loaded_instances": [{}],
+                  "capabilities": { "vision": true, "trained_for_tool_use": true } },
+                { "key": "some/text-coder", "type": "llm", "vision": null,
+                  "loaded_instances": [], "capabilities": { "vision": false } }
+            ]
+        });
+        assert!(vision_from_models_json(&json, "google/gemma-4-26b-a4b-qat"));
+        assert!(!vision_from_models_json(&json, "some/text-coder"));
+        // Unknown id falls back to a loaded vision-capable model.
+        assert!(vision_from_models_json(&json, "mystery-model"));
+        // No models at all -> fail closed.
+        assert!(!vision_from_models_json(&serde_json::json!({}), "x"));
+    }
+
+    #[test]
+    fn test_attach_recent_screenshot() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let marker = format!("[screenshot:{}]\nCaptured.", png.display());
+        let base = vec![
+            serde_json::json!({ "role": "user", "content": "do the thing" }),
+            serde_json::json!({ "role": "user", "content": marker }),
+        ];
+
+        // vision on + recent -> content becomes [text, image_url(data uri)].
+        let out = attach_recent_screenshot(base.clone(), true);
+        let content = out[1].get("content").unwrap().as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        // vision off -> untouched (text marker stays a plain string).
+        let out = attach_recent_screenshot(base.clone(), false);
+        assert!(out[1].get("content").unwrap().is_string());
+
+        // Too far from the tail -> not re-attached (bounds repeated image cost).
+        let mut old = vec![base[1].clone()];
+        for _ in 0..8 {
+            old.push(serde_json::json!({ "role": "user", "content": "later" }));
+        }
+        let out = attach_recent_screenshot(old, true);
+        assert!(out[0].get("content").unwrap().is_string());
     }
 
     // ----- RAG / embeddings unit tests (pure, no network) -----

@@ -7110,7 +7110,15 @@ fn fn_ident_ok(s: &str) -> bool {
 }
 
 fn parse_fn_scalar_value(val_str: &str) -> serde_json::Value {
-    let v = val_str.trim();
+    // The key/value split (in parse_fn_args_strict/_lenient) consumes only the
+    // FIRST `=`/`:`. When the model emits a redundant separator —
+    // `read_file(path == "x")` or `path := "x"` — the second one stays fused to
+    // the value as `="x"`, so the quote-stripping branch below never fires and
+    // the literal `="x"` (quotes and all) reaches the tool. Any leading
+    // separator/whitespace run on the value is junk at this point (the real
+    // separator is already gone), so drop it before classifying.
+    let v = val_str.trim_start_matches(|c: char| c == '=' || c == ':' || c.is_whitespace());
+    let v = v.trim_end();
     if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
         serde_json::from_str(v)
             .unwrap_or_else(|_| serde_json::Value::String(v[1..v.len() - 1].to_string()))
@@ -10927,6 +10935,58 @@ BeetleAI
             args3.get("topic").unwrap().as_str().unwrap(),
             "beetle's law"
         );
+    }
+
+    #[test]
+    fn test_parse_tool_call_redundant_separator() {
+        // Field failure: the model emitted a doubled separator and read_file was
+        // handed the literal `="src/patterns/wave.py"` (quotes included), which
+        // the OS rejected as a malformed path. The redundant `=`/`:` must be
+        // stripped so the real path comes through.
+        for input in [
+            "read_file(path == \"src/patterns/wave.py\")",
+            "read_file(path := \"src/patterns/wave.py\")",
+            "read_file(path: = \"src/patterns/wave.py\")",
+        ] {
+            let (name, args, _) = parse_tool_call_spanned(input).unwrap();
+            assert_eq!(name, "read_file");
+            assert_eq!(
+                args.get("path").unwrap().as_str().unwrap(),
+                "src/patterns/wave.py",
+                "input: {input}"
+            );
+        }
+
+        // The well-formed single-separator forms must keep parsing identically.
+        for input in [
+            "read_file(path = \"src/main.ts\")",
+            "read_file(path: \"src/main.ts\")",
+        ] {
+            let (_, args, _) = parse_tool_call_spanned(input).unwrap();
+            assert_eq!(args.get("path").unwrap().as_str().unwrap(), "src/main.ts");
+        }
+    }
+
+    #[test]
+    fn test_parse_replace_lines_content_no_quote_leak() {
+        // Field failure (Beetle's report): a malformed separator on `content`
+        // leaked the literal `= "..."` — quotes and all — into the file, breaking
+        // its syntax. The leading-separator strip in parse_fn_scalar_value must
+        // cover content, not just read_file's path: the value the tool receives
+        // is the bare code, with no `=` and no surrounding quotes.
+        for input in [
+            "replace_lines(path=\"a.rs\", start_line=1, end_line=1, content== \"let x = 1;\")",
+            "replace_lines(path=\"a.rs\", start_line=1, end_line=1, content := \"let x = 1;\")",
+            "replace_lines(path=\"a.rs\", start_line=1, end_line=1, content: \"let x = 1;\")",
+        ] {
+            let (name, args, _) = parse_tool_call_spanned(input).unwrap();
+            assert_eq!(name, "replace_lines");
+            assert_eq!(
+                args.get("content").unwrap().as_str().unwrap(),
+                "let x = 1;",
+                "input: {input}"
+            );
+        }
     }
 
     #[test]

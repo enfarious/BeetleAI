@@ -2020,13 +2020,17 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "run_command",
-                    "description": "Runs a build, test, or check shell command in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\").",
+                    "description": "Runs a build, test, or check shell command in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Output is prefixed with the exit code (0 = success) and clipped from BOTH ends, so the error at the tail is preserved.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "command": {
                                 "type": "string",
                                 "description": "The exact shell command to run"
+                            },
+                            "timeout_secs": {
+                                "type": "integer",
+                                "description": "Optional wall-clock cap in seconds (default 300, max 1800). Raise it for known-slow builds; the process is killed if it overruns."
                             }
                         },
                         "required": ["command"],
@@ -6921,7 +6925,7 @@ fn construct_agent_system_prompt(
          5. `search_grep(query: String, path?: String, context?: Int, case_sensitive?: Bool)`: Searches file contents for a substring (case-insensitive by default) across the repo or under a path. Results are grouped by file with line numbers. Pass context: 2 to see surrounding lines without a follow-up read_file. Do NOT use shell grep.\n\
          6. `git_status()`: Runs `git status` in the sandbox.\n\
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
-         8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
+         8. `run_command(command: String, timeout_secs?: Int)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! The result starts with the exit code (`[exit code: 0]` means success) and the output is clipped from both ends, so the error at the bottom survives. timeout_secs defaults to 300 (max 1800). NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
          9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. THE tool for a SINGLE-LINE fix: target = the exact TEXT of the broken line (copied without read_file's line-number prefix — target is text, NEVER a line number), replacement = the corrected line — no line numbers involved, so it either lands exactly or refuses cleanly; it cannot hit the wrong line. The target must match byte-for-byte including quotes and whitespace; if you cannot reproduce the snippet exactly, use replace_lines. Also the safest way to INSERT new lines (a missing brace, an import): target = an existing anchor line, replacement = that same line plus the new content — anchored insertion can't land in the wrong place and survives line-number drift.\n\
          10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). To INSERT without deleting, replace one anchor line with itself plus the new lines. THE tool for multi-line edits and for fixes where the broken text is hard to quote exactly: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. For a single broken line you CAN quote exactly, prefer patch_file. NEVER rewrite a whole file to fix a one-line error, and NEVER widen the range when an edit misses — the result message echoes the edit site with current numbers: verify, aim, and fix the ONE line. Line numbers SHIFT after any edit that changes line count, and the harness REFUSES an edit made with stale numbers — to make several edits to one file in a row, work bottom-to-top (highest line numbers first; lines below an edit keep their numbers), or re-read between edits.\n\
          11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
@@ -7765,7 +7769,34 @@ fn run_git_command<P: AsRef<Path>>(dir: P, args: &[&str]) -> Result<String, Stri
     }
 }
 
-fn run_shell_command<P: AsRef<Path>>(dir: P, command_str: &str) -> Result<String, String> {
+/// Truncate keeping BOTH ends. Build/test runners echo the command and progress
+/// at the top but print the actual error at the BOTTOM, so the old head-only clip
+/// routinely threw away the one chunk the model needed to diagnose a failure.
+fn clip_head_tail(s: &str, budget: usize) -> String {
+    let total = s.chars().count();
+    if total <= budget {
+        return s.to_string();
+    }
+    let head_len = budget / 4;
+    let tail_len = budget - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(total - tail_len).collect();
+    let omitted = total - head_len - tail_len;
+    format!("{}\n... [{} chars omitted] ...\n{}", head, omitted, tail)
+}
+
+/// Run a shell command in `dir`, returning the exit code plus head+tail-clipped
+/// output. `timeout_secs` caps wall-clock (default 300s, clamped to [1, 1800]);
+/// a command that overruns is killed so a hung build can't wedge the whole run.
+fn run_shell_command<P: AsRef<Path>>(
+    dir: P,
+    command_str: &str,
+    timeout_secs: Option<u64>,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd.exe");
         c.arg("/c").arg(command_str);
@@ -7776,16 +7807,72 @@ fn run_shell_command<P: AsRef<Path>>(dir: P, command_str: &str) -> Result<String
         c
     };
     cmd.current_dir(dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::configure_no_window(&mut cmd);
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    let out = String::from_utf8_lossy(&output.stdout).to_string();
-    let err = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let mut combined = format!("{}\n{}", out, err);
-    if combined.len() > 3000 {
-        combined = format!("{}... [TRUNCATED]", &combined[..3000]);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+
+    // Drain both streams on their own threads: a command that outfills the pipe
+    // buffer (~64KB) blocks waiting for us to read, which would defeat the
+    // timeout. Cap each stream so a runaway command can't exhaust memory while
+    // we keep draining it to EOF.
+    const STREAM_CAP: usize = 256 * 1024;
+    fn drain_capped<R: Read>(mut r: R, cap: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = r.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if buf.len() < cap {
+                let take = (cap - buf.len()).min(n);
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        buf
     }
-    Ok(combined)
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let t_out = std::thread::spawn(move || so.map(|r| drain_capped(r, STREAM_CAP)).unwrap_or_default());
+    let t_err = std::thread::spawn(move || se.map(|r| drain_capped(r, STREAM_CAP)).unwrap_or_default());
+
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(300).clamp(1, 1800));
+    let start = Instant::now();
+    let (status_opt, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), false),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (None, true);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+
+    let out = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
+    let err = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
+    // stderr last, so the tail-biased clip preserves it — that's where cargo/tsc
+    // and most runners put the error.
+    let combined = if err.trim().is_empty() {
+        out
+    } else {
+        format!("{}\n{}", out, err)
+    };
+    let body = clip_head_tail(combined.trim_end(), 4000);
+
+    let header = if timed_out {
+        format!("[command timed out after {}s — process killed]", timeout.as_secs())
+    } else {
+        match status_opt.and_then(|s| s.code()) {
+            Some(code) => format!("[exit code: {}]", code),
+            None => "[process terminated by signal]".to_string(),
+        }
+    };
+    Ok(format!("{}\n{}", header, body))
 }
 
 fn strip_html_tags(html: &str) -> String {
@@ -9194,7 +9281,8 @@ fn execute_tool(
                 Some(c) => c,
                 None => return "Error: Missing command argument".to_string(),
             };
-            match run_shell_command(worktree_path, command) {
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+            match run_shell_command(worktree_path, command, timeout_secs) {
                 Ok(out) => out,
                 Err(e) => format!("Error executing command: {}", e),
             }
@@ -10776,7 +10864,7 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
          8. `find_symbol(name: String, path?: String)`: Finds where a function, struct, class, or other declaration is DEFINED. Returns file:line: signature — then range-read around that line.\n\
          9. `git_status()`: Runs `git status` in the repository.\n\
          10. `git_diff()`: Runs `git diff` to view code changes.\n\
-         11. `run_command(command: String)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests!\n\
+         11. `run_command(command: String, timeout_secs?: Int)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests! The result starts with the exit code (`[exit code: 0]` means success); output is clipped from both ends so the trailing error survives. timeout_secs defaults to 300 (max 1800).\n\
          12. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\
          13. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with design chat and agent runs. Record how subsystems work and pitfalls you discover.\n\
          14. `recall(query: String, limit?: Int)`: Searches this project's long-term memory — ranked semantically (by meaning) when an embedding provider is configured, else by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
@@ -11494,6 +11582,46 @@ BeetleAI
             fs::read_to_string(&f).unwrap(),
             "config = {\r\n  42: \"forty-two\",\r\n}\r\n"
         );
+    }
+
+    #[test]
+    fn test_clip_head_tail_keeps_the_error_at_the_bottom() {
+        // Under budget: returned verbatim.
+        assert_eq!(clip_head_tail("short", 100), "short");
+
+        // Over budget: both ends survive (the old head-only clip dropped the
+        // tail, which is exactly where build errors live).
+        let s = format!("{}error: cannot find value `x`", "A".repeat(5000));
+        let clipped = clip_head_tail(&s, 4000);
+        assert!(clipped.starts_with("AAAA"), "head kept");
+        assert!(clipped.ends_with("error: cannot find value `x`"), "tail kept");
+        assert!(clipped.contains("chars omitted"));
+        assert!(clipped.chars().count() < s.chars().count());
+    }
+
+    #[test]
+    fn test_run_shell_command_reports_exit_code_and_timeout() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wt = dir.path();
+
+        // Success: exit code 0 plus the command's stdout.
+        let ok = run_shell_command(wt, "echo hello", None).unwrap();
+        assert!(ok.starts_with("[exit code: 0]"), "got: {ok}");
+        assert!(ok.contains("hello"), "got: {ok}");
+
+        // Failure: a non-zero exit is surfaced (was invisible before).
+        let bad = run_shell_command(wt, "exit 3", None).unwrap();
+        assert!(bad.starts_with("[exit code: 3]"), "got: {bad}");
+
+        // Timeout: a command that overruns is killed and reported, not hung.
+        let sleep = if cfg!(target_os = "windows") {
+            "ping -n 5 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        };
+        let timed = run_shell_command(wt, sleep, Some(1)).unwrap();
+        assert!(timed.contains("timed out after 1s"), "got: {timed}");
     }
 
     // ----- RAG / embeddings unit tests (pure, no network) -----

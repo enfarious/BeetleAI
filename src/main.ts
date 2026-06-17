@@ -1160,6 +1160,33 @@ function setupEventListeners() {
   });
   chatInput.addEventListener("input", () => autosizeChatInput());
 
+  // Global keyboard shortcuts.
+  document.addEventListener("keydown", (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    const settingsOpen = !!settingsModal.style.display && settingsModal.style.display !== "none";
+    const fsOpen = !!fsModal.style.display && fsModal.style.display !== "none";
+
+    // Cmd/Ctrl+K — jump to the chat composer.
+    if (mod && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      chatInput.focus();
+      return;
+    }
+
+    // Cmd/Ctrl+, — open settings (the conventional preferences shortcut).
+    if (mod && e.key === ",") {
+      e.preventDefault();
+      if (!settingsOpen) openSettingsModal();
+      return;
+    }
+
+    // Escape — dismiss whichever modal is open.
+    if (e.key === "Escape") {
+      if (settingsOpen) closeSettingsModal();
+      else if (fsOpen) closeFsDialog();
+    }
+  });
+
   // Viewer back button
   btnViewerBack.addEventListener("click", () => popView());
 
@@ -3004,11 +3031,12 @@ async function renderRightPanel() {
       break;
 
     case "card_detail":
-      viewerTitle.textContent = "Card Details";
       const card = cardsList.find((c) => c.id === currentView.cardId);
       if (card) {
+        viewerTitle.textContent = card.title ? `Card — ${card.title}` : "Card Details";
         renderCardDetail(card);
       } else {
+        viewerTitle.textContent = "Card Details";
         viewerContainer.innerHTML = `<div class="empty-state">Card not found</div>`;
       }
       break;

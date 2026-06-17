@@ -1068,14 +1068,21 @@ function setupEventListeners() {
   btnStartRun.addEventListener("click", async () => {
     if (!activeCard) return;
     try {
+      btnStartRun.disabled = true;
       const runId = await invoke<string>("start_run", { cardId: activeCard.id });
       activeCard.status = "running";
       activeCard.run_id = runId;
       await refreshState();
       pushView({ kind: "diff", runId });
+      // Instant feedback: a local model's first token can be many seconds out,
+      // so show the thinking bubble now rather than leaving the chat dead. The
+      // first streamed chunk / re-render clears it.
+      renderThinkingBubble();
     } catch (err) {
       console.error(err);
       showToast("Failed to start run: " + err, "error");
+    } finally {
+      btnStartRun.disabled = false;
     }
   });
 
@@ -2797,12 +2804,20 @@ function createFileNode(entry: DirEntry): HTMLElement {
 
     const loadChildren = async () => {
       if (loaded) return;
-      const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
-      childrenContainer.innerHTML = "";
-      children.forEach((child) => {
-        childrenContainer.appendChild(createFileNode(child));
-      });
-      loaded = true;
+      // Transient feedback while list_dir is in flight, so expanding a large or
+      // slow directory doesn't look like a dead click.
+      childrenContainer.innerHTML = `<div class="tree-loading">Loading…</div>`;
+      try {
+        const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
+        childrenContainer.innerHTML = "";
+        children.forEach((child) => {
+          childrenContainer.appendChild(createFileNode(child));
+        });
+        loaded = true;
+      } catch (err) {
+        childrenContainer.innerHTML = `<div class="tree-loading" style="color: var(--status-failed)">Failed to load</div>`;
+        throw err;
+      }
     };
 
     // Expansion as a named operation so tree re-renders can programmatically

@@ -103,6 +103,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::new())
+        .on_window_event(|window, event| {
+            // Safety net for the graceful-close path: kill any dev servers the
+            // agent left running so they don't outlive the app. The per-run
+            // ActiveRunGuard already handles normal run teardown.
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<commands::AppState>() {
+                    commands::kill_all_background_processes(&state);
+                }
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
             if let Err(e) = commands::init_db(&app_handle) {

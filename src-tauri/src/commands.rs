@@ -252,6 +252,10 @@ pub struct AppState {
     /// run/chat key → file key → line-number drift since last read. Guards
     /// replace_lines against the classic two-edits-same-file stale-line bug.
     pub line_shift_state: Mutex<HashMap<String, HashMap<String, LineShift>>>,
+    /// run_id → long-lived background processes (dev servers, watchers) the
+    /// agent started via start_server. Killed when the run ends (ActiveRunGuard)
+    /// or the app closes (on_window_event) so a `npm run dev` never outlives it.
+    pub bg_processes: Mutex<HashMap<String, Vec<BgProcess>>>,
 }
 
 impl AppState {
@@ -272,6 +276,7 @@ impl AppState {
             paused_runs: Mutex::new(std::collections::HashSet::new()),
             lmstudio_response_ids: Mutex::new(HashMap::new()),
             line_shift_state: Mutex::new(HashMap::new()),
+            bg_processes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -2078,6 +2083,53 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                             }
                         },
                         "required": ["url"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "start_server" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "start_server",
+                    "description": "Starts a long-running process (e.g. a dev server like \"npm run dev\") in the background and waits until `port` accepts connections. Use this — NOT run_command — for anything that doesn't exit on its own, since run_command blocks and kills long-running commands. Once it's ready you can screenshot http://localhost:<port>/. The process keeps running across turns and is stopped automatically when the run ends.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "The shell command that starts the server, e.g. \"npm run dev\"" },
+                            "port": { "type": "integer", "description": "The port the server listens on (e.g. 5173); used to detect readiness" },
+                            "timeout_secs": { "type": "integer", "description": "How long to wait for the port to open before returning (default 60, max 180)" }
+                        },
+                        "required": ["command", "port"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "stop_server" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "stop_server",
+                    "description": "Stops background server(s) started with start_server. Stops all of them if no port is given.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "port": { "type": "integer", "description": "Only stop the server on this port (optional; omit to stop all)" }
+                        },
+                        "required": [],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "server_logs" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "server_logs",
+                    "description": "Shows recent stdout/stderr from your background server(s) — use it to see why a server failed to start or to read a runtime error it logged.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "port": { "type": "integer", "description": "Only show this port's server (optional; omit for all)" }
+                        },
+                        "required": [],
                         "additionalProperties": false
                     }
                 }
@@ -6866,6 +6918,9 @@ impl Drop for ActiveRunGuard {
             let mut active = state.active_runs.lock().unwrap();
             active.remove(&self.run_id);
         }
+        // Kill any dev server / watcher this run started so it never outlives
+        // the run (completion, error, cancel, and pause all land here).
+        kill_run_background_processes(&self.app_handle, &self.run_id);
     }
 }
 
@@ -6976,7 +7031,10 @@ fn construct_agent_system_prompt(
          22. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
          23. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
          24. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\
-         25. `screenshot(url: String, width?: Int, height?: Int)`: Renders a page the dev server is ALREADY serving (e.g. http://localhost:5173/) in a headless browser and captures it. If the loaded model is vision-capable, the image is shown to you next turn so you can SEE the rendered UI — use it to check layout/alignment instead of guessing from CSS. It does NOT start the dev server.\n\n\
+         25. `screenshot(url: String, width?: Int, height?: Int)`: Renders a page the dev server is ALREADY serving (e.g. http://localhost:5173/) in a headless browser and captures it. If the loaded model is vision-capable, the image is shown to you next turn so you can SEE the rendered UI — use it to check layout/alignment instead of guessing from CSS. It does NOT start the dev server — use start_server for that.\n\
+         26. `start_server(command: String, port: Int, timeout_secs?: Int)`: Starts a long-running process (e.g. \"npm run dev\") in the background and waits until `port` accepts connections, so you can then screenshot http://localhost:<port>/. Use this — NOT run_command — for dev servers and watchers, because run_command blocks and kills long-running commands. The server keeps running across turns and is stopped automatically when the run ends.\n\
+         27. `stop_server(port?: Int)`: Stops background server(s) you started (all of them if no port is given).\n\
+         28. `server_logs(port?: Int)`: Shows recent stdout/stderr from your background server(s) — use it to diagnose a server that didn't come up or a runtime error it logged.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first, and search_codebase() to locate relevant code by concept — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     );
@@ -7090,7 +7148,7 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
-const KNOWN_TOOLS: [&str; 25] = [
+const KNOWN_TOOLS: [&str; 28] = [
     "read_file",
     "outline_file",
     "write_file",
@@ -7111,6 +7169,9 @@ const KNOWN_TOOLS: [&str; 25] = [
     "git_diff",
     "run_command",
     "screenshot",
+    "start_server",
+    "stop_server",
+    "server_logs",
     "web_search",
     "send_notification",
     "read_card",
@@ -8138,6 +8199,217 @@ fn attach_recent_screenshot(mut messages: Vec<serde_json::Value>, vision: bool) 
     messages
 }
 
+/// A long-lived process the agent started (e.g. `npm run dev`). Held in
+/// AppState so it survives across turns and can be killed on run teardown.
+pub struct BgProcess {
+    pub label: String,
+    pub port: u16,
+    pub command: String,
+    pub child: std::process::Child,
+    /// Capped tail of the process's combined stdout+stderr, filled by drain
+    /// threads so a server's startup/runtime errors are inspectable.
+    pub output: std::sync::Arc<Mutex<String>>,
+}
+
+const BG_LOG_CAP: usize = 8192;
+
+fn append_capped(buf: &std::sync::Arc<Mutex<String>>, chunk: &str) {
+    if let Ok(mut s) = buf.lock() {
+        s.push_str(chunk);
+        let len = s.chars().count();
+        if len > BG_LOG_CAP {
+            *s = s.chars().skip(len - BG_LOG_CAP).collect();
+        }
+    }
+}
+
+/// Is something accepting TCP connections on localhost:`port`? Used as the
+/// readiness signal for a freshly started server — more reliable than scraping
+/// log output for a "listening on" line that varies per framework.
+fn port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// Kill a process AND its descendants. The dev server runs under a `cmd.exe`/
+/// `sh` wrapper that spawns node etc.; killing only the wrapper would orphan the
+/// real server, so on Windows we use `taskkill /T` to take down the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let mut k = Command::new("taskkill");
+        k.args(["/F", "/T", "/PID", &child.id().to_string()]);
+        crate::configure_no_window(&mut k);
+        let _ = k.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn spawn_background(
+    worktree: &Path,
+    command: &str,
+) -> Result<(std::process::Child, std::sync::Arc<Mutex<String>>), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(command);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    cmd.current_dir(worktree)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::configure_no_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let buf = std::sync::Arc::new(Mutex::new(String::new()));
+    for stream in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let b = buf.clone();
+        let mut r = stream;
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = r.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                append_capped(&b, &String::from_utf8_lossy(&chunk[..n]));
+            }
+        });
+    }
+    Ok((child, buf))
+}
+
+/// Start `command` as a background process in `worktree`, register it under
+/// `run_id`, and wait until `port` is accepting connections (or `timeout_secs`
+/// elapses). Any existing server on the same port for this run is replaced.
+fn bg_start(
+    state: &AppState,
+    run_id: &str,
+    worktree: &Path,
+    command: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> String {
+    use std::time::{Duration, Instant};
+    bg_stop(state, run_id, Some(port));
+    let (child, output) = match spawn_background(worktree, command) {
+        Ok(x) => x,
+        Err(e) => return format!("Error: failed to start '{}' — {}", command, e),
+    };
+    {
+        let mut map = state.bg_processes.lock().unwrap();
+        map.entry(run_id.to_string()).or_default().push(BgProcess {
+            label: format!("port {}", port),
+            port,
+            command: command.to_string(),
+            child,
+            output: output.clone(),
+        });
+    }
+    let deadline = Duration::from_secs(timeout_secs.clamp(1, 180));
+    let start = Instant::now();
+    loop {
+        if port_open(port) {
+            return format!(
+                "[server ready] http://localhost:{}/ is accepting connections. Screenshot it with screenshot(\"http://localhost:{}/\"). It keeps running across turns and is stopped automatically when this run ends (or call stop_server).",
+                port, port
+            );
+        }
+        if start.elapsed() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let logs = output.lock().map(|s| s.clone()).unwrap_or_default();
+    let tail = clip_head_tail(logs.trim(), 1500);
+    format!(
+        "[server started, but port {} did not open within {}s] It may still be building, or it failed to launch. It is still running (stop_server to kill it). Recent output:\n{}",
+        port,
+        deadline.as_secs(),
+        if tail.is_empty() { "(no output captured yet)" } else { &tail }
+    )
+}
+
+/// Kill background processes for `run_id`: those matching `port`, or all when
+/// `port` is None. Returns how many were killed.
+fn bg_stop(state: &AppState, run_id: &str, port: Option<u16>) -> usize {
+    let mut map = state.bg_processes.lock().unwrap();
+    let mut killed = 0;
+    if let Some(list) = map.get_mut(run_id) {
+        let mut keep = Vec::new();
+        for mut p in list.drain(..) {
+            if port.is_none_or(|pt| pt == p.port) {
+                kill_process_tree(&mut p.child);
+                killed += 1;
+            } else {
+                keep.push(p);
+            }
+        }
+        *list = keep;
+        if list.is_empty() {
+            map.remove(run_id);
+        }
+    }
+    killed
+}
+
+fn bg_logs(state: &AppState, run_id: &str, port: Option<u16>) -> String {
+    let map = state.bg_processes.lock().unwrap();
+    match map.get(run_id) {
+        None => "No background servers are running for this run.".to_string(),
+        Some(list) => {
+            let mut out = String::new();
+            for p in list {
+                if port.is_none_or(|pt| pt == p.port) {
+                    let logs = p.output.lock().map(|s| s.clone()).unwrap_or_default();
+                    out.push_str(&format!(
+                        "=== {} ({}) ===\n{}\n",
+                        p.label,
+                        p.command,
+                        clip_head_tail(logs.trim(), 3000)
+                    ));
+                }
+            }
+            if out.is_empty() {
+                "No matching background server for this run.".to_string()
+            } else {
+                out
+            }
+        }
+    }
+}
+
+fn kill_run_background_processes(app_handle: &tauri::AppHandle, run_id: &str) {
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        bg_stop(&state, run_id, None);
+    }
+}
+
+/// Kill every tracked background process across all runs. Called on app close
+/// so a dev server never outlives the harness.
+pub fn kill_all_background_processes(state: &AppState) {
+    let run_ids: Vec<String> = state.bg_processes.lock().unwrap().keys().cloned().collect();
+    for rid in run_ids {
+        bg_stop(state, &rid, None);
+    }
+}
+
 fn strip_html_tags(html: &str) -> String {
     let mut clean = String::new();
     let mut in_tag = false;
@@ -9077,12 +9349,13 @@ fn patch_file_impl(
 /// The canonical tool names the parser/dispatcher knows. Used by
 /// `looks_like_malformed_tool_call` to tell a botched call (the model named a
 /// real tool but mangled the syntax) apart from ordinary prose.
-const KNOWN_TOOL_NAMES: [&str; 25] = [
+const KNOWN_TOOL_NAMES: [&str; 28] = [
     "read_file", "outline_file", "write_file", "list_dir", "git_status",
-    "git_diff", "run_command", "screenshot", "web_search", "send_notification",
-    "task_complete", "search_grep", "find_file", "find_symbol", "remember",
-    "recall", "list_cards", "create_card", "update_card", "delete_card",
-    "read_card", "set_todo", "replace_lines", "patch_file", "search_codebase",
+    "git_diff", "run_command", "screenshot", "start_server", "stop_server",
+    "server_logs", "web_search", "send_notification", "task_complete",
+    "search_grep", "find_file", "find_symbol", "remember", "recall",
+    "list_cards", "create_card", "update_card", "delete_card", "read_card",
+    "set_todo", "replace_lines", "patch_file", "search_codebase",
 ];
 
 /// Bucket a tool result into a coarse, STABLE `failure_reason` for harness
@@ -9576,6 +9849,34 @@ fn execute_tool(
                 ),
                 Err(e) => format!("Error: screenshot failed — {}", e),
             }
+        }
+        "start_server" => {
+            let command = match args.get("command").and_then(|c| c.as_str()) {
+                Some(c) if !c.trim().is_empty() => c.trim(),
+                _ => return "Error: Missing 'command' argument (e.g. \"npm run dev\").".to_string(),
+            };
+            let port = match args.get("port").and_then(|v| v.as_u64()) {
+                Some(p) if (1..=65535).contains(&p) => p as u16,
+                _ => return "Error: Missing or invalid 'port' — the port the server listens on (e.g. 5173). It's used to detect when the server is ready.".to_string(),
+            };
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
+            let state = app_handle.state::<AppState>();
+            bg_start(state.inner(), run_id, worktree_path, command, port, timeout_secs)
+        }
+        "stop_server" => {
+            let port = args.get("port").and_then(|v| v.as_u64()).map(|p| p as u16);
+            let state = app_handle.state::<AppState>();
+            let n = bg_stop(state.inner(), run_id, port);
+            if n == 0 {
+                "No matching background server was running.".to_string()
+            } else {
+                format!("Stopped {} background server(s).", n)
+            }
+        }
+        "server_logs" => {
+            let port = args.get("port").and_then(|v| v.as_u64()).map(|p| p as u16);
+            let state = app_handle.state::<AppState>();
+            bg_logs(state.inner(), run_id, port)
         }
         "web_search" => {
             let query = match args.get("query").and_then(|q| q.as_str()) {
@@ -10440,7 +10741,7 @@ fn execute_tool(
             }
         }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, screenshot, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, screenshot, start_server, stop_server, server_logs, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -10651,6 +10952,9 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "git_diff",
                 "run_command",
                 "screenshot",
+                "start_server",
+                "stop_server",
+                "server_logs",
                 "web_search",
                 "send_notification",
                 "task_complete",
@@ -11991,6 +12295,32 @@ BeetleAI
         }
         let out = attach_recent_screenshot(old, true);
         assert!(out[0].get("content").unwrap().is_string());
+    }
+
+    #[test]
+    fn test_append_capped_keeps_tail() {
+        let buf = std::sync::Arc::new(Mutex::new(String::new()));
+        for _ in 0..100 {
+            append_capped(&buf, &"x".repeat(200)); // 20_000 chars total
+        }
+        // Bounded to the cap, keeping the most recent bytes.
+        assert_eq!(buf.lock().unwrap().chars().count(), BG_LOG_CAP);
+
+        let small = std::sync::Arc::new(Mutex::new(String::new()));
+        append_capped(&small, "hello");
+        assert_eq!(&*small.lock().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_port_open_detects_listener() {
+        use std::net::TcpListener;
+        // An OS-assigned port with a live listener reads as open...
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_open(port));
+        // ...and as closed once nothing is listening.
+        drop(listener);
+        assert!(!port_open(port));
     }
 
     // ----- RAG / embeddings unit tests (pure, no network) -----

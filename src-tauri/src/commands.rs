@@ -9107,8 +9107,10 @@ fn run_verification(worktree_path: &Path) -> Result<String, String> {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{}\n{}", stdout, stderr);
-            let head: String = combined.chars().take(2500).collect();
-            Err(format!("{} FAILED:\n{}", label, head))
+            // Clip from both ends, not head-only: cargo/tsc print the error at the
+            // tail, and this message is what the model sees when task_complete is
+            // rejected — a head-only cut hid the very error it must fix.
+            Err(format!("{} FAILED:\n{}", label, clip_head_tail(combined.trim(), 3000)))
         }
         // Tool missing on PATH etc. — don't hard-block completion on environment problems.
         Err(e) => Ok(format!(

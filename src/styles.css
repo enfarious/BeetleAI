@@ -315,6 +315,14 @@ body.resizing-active .resizer {
   padding-left: 4px;
 }
 
+.tree-loading {
+  padding: 2px 8px;
+  font-size: 0.8rem;
+  font-style: italic;
+  color: var(--text-muted, #888);
+  opacity: 0.8;
+}
+
 .tree-node-name {
   flex: 1;
   overflow: hidden;

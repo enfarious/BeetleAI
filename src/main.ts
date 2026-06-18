@@ -812,9 +812,18 @@ async function setupTauriEventListeners() {
           stream = { text: "", bubbleElement: null };
           activeStreams.set(runId, stream);
         }
-        
+
+        // A transient model error is being retried: drop the abandoned partial
+        // so the resent response doesn't render on top of it.
+        if (payload.reset) {
+          stream.text = "";
+          const resetDiv = stream.bubbleElement?.querySelector(".bubble-content-text") as HTMLDivElement | null;
+          if (resetDiv) resetDiv.innerHTML = "";
+          return;
+        }
+
         stream.text += payload.chunk;
-        
+
         const activeKey = getCurrentLogKey();
         if (activeKey === runId) {
           if (!stream.bubbleElement) {
@@ -919,9 +928,17 @@ async function setupTauriEventListeners() {
         stream = { text: "", bubbleElement: null };
         activeStreams.set(runId, stream);
       }
-      
+
+      // Retry after a transient error: discard the abandoned partial.
+      if (payload.reset) {
+        stream.text = "";
+        const resetDiv = stream.bubbleElement?.querySelector(".bubble-content-text") as HTMLDivElement | null;
+        if (resetDiv) resetDiv.innerHTML = "";
+        return;
+      }
+
       stream.text += payload.chunk;
-      
+
       const activeKey = getCurrentLogKey();
       if (activeKey === runId) {
         if (!stream.bubbleElement) {
@@ -1051,14 +1068,21 @@ function setupEventListeners() {
   btnStartRun.addEventListener("click", async () => {
     if (!activeCard) return;
     try {
+      btnStartRun.disabled = true;
       const runId = await invoke<string>("start_run", { cardId: activeCard.id });
       activeCard.status = "running";
       activeCard.run_id = runId;
       await refreshState();
       pushView({ kind: "diff", runId });
+      // Instant feedback: a local model's first token can be many seconds out,
+      // so show the thinking bubble now rather than leaving the chat dead. The
+      // first streamed chunk / re-render clears it.
+      renderThinkingBubble();
     } catch (err) {
       console.error(err);
       showToast("Failed to start run: " + err, "error");
+    } finally {
+      btnStartRun.disabled = false;
     }
   });
 
@@ -1142,6 +1166,33 @@ function setupEventListeners() {
     }
   });
   chatInput.addEventListener("input", () => autosizeChatInput());
+
+  // Global keyboard shortcuts.
+  document.addEventListener("keydown", (e) => {
+    const mod = e.metaKey || e.ctrlKey;
+    const settingsOpen = !!settingsModal.style.display && settingsModal.style.display !== "none";
+    const fsOpen = !!fsModal.style.display && fsModal.style.display !== "none";
+
+    // Cmd/Ctrl+K — jump to the chat composer.
+    if (mod && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      chatInput.focus();
+      return;
+    }
+
+    // Cmd/Ctrl+, — open settings (the conventional preferences shortcut).
+    if (mod && e.key === ",") {
+      e.preventDefault();
+      if (!settingsOpen) openSettingsModal();
+      return;
+    }
+
+    // Escape — dismiss whichever modal is open.
+    if (e.key === "Escape") {
+      if (settingsOpen) closeSettingsModal();
+      else if (fsOpen) closeFsDialog();
+    }
+  });
 
   // Viewer back button
   btnViewerBack.addEventListener("click", () => popView());
@@ -2753,12 +2804,20 @@ function createFileNode(entry: DirEntry): HTMLElement {
 
     const loadChildren = async () => {
       if (loaded) return;
-      const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
-      childrenContainer.innerHTML = "";
-      children.forEach((child) => {
-        childrenContainer.appendChild(createFileNode(child));
-      });
-      loaded = true;
+      // Transient feedback while list_dir is in flight, so expanding a large or
+      // slow directory doesn't look like a dead click.
+      childrenContainer.innerHTML = `<div class="tree-loading">Loading…</div>`;
+      try {
+        const children = await invoke<DirEntry[]>("list_dir", { path: entry.path });
+        childrenContainer.innerHTML = "";
+        children.forEach((child) => {
+          childrenContainer.appendChild(createFileNode(child));
+        });
+        loaded = true;
+      } catch (err) {
+        childrenContainer.innerHTML = `<div class="tree-loading" style="color: var(--status-failed)">Failed to load</div>`;
+        throw err;
+      }
     };
 
     // Expansion as a named operation so tree re-renders can programmatically
@@ -2987,11 +3046,12 @@ async function renderRightPanel() {
       break;
 
     case "card_detail":
-      viewerTitle.textContent = "Card Details";
       const card = cardsList.find((c) => c.id === currentView.cardId);
       if (card) {
+        viewerTitle.textContent = card.title ? `Card — ${card.title}` : "Card Details";
         renderCardDetail(card);
       } else {
+        viewerTitle.textContent = "Card Details";
         viewerContainer.innerHTML = `<div class="empty-state">Card not found</div>`;
       }
       break;

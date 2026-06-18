@@ -252,6 +252,10 @@ pub struct AppState {
     /// run/chat key → file key → line-number drift since last read. Guards
     /// replace_lines against the classic two-edits-same-file stale-line bug.
     pub line_shift_state: Mutex<HashMap<String, HashMap<String, LineShift>>>,
+    /// run_id → long-lived background processes (dev servers, watchers) the
+    /// agent started via start_server. Killed when the run ends (ActiveRunGuard)
+    /// or the app closes (on_window_event) so a `npm run dev` never outlives it.
+    pub bg_processes: Mutex<HashMap<String, Vec<BgProcess>>>,
 }
 
 impl AppState {
@@ -272,6 +276,7 @@ impl AppState {
             paused_runs: Mutex::new(std::collections::HashSet::new()),
             lmstudio_response_ids: Mutex::new(HashMap::new()),
             line_shift_state: Mutex::new(HashMap::new()),
+            bg_processes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1162,6 +1167,201 @@ pub fn load_state_from_db(app_handle: &tauri::AppHandle, state: &AppState) -> Re
     Ok(())
 }
 
+/// Pure decision core for the startup reaper: given the run-id worktree
+/// directories found on disk for a project and the set of run-ids that a live
+/// card still owns (and may resume), return the run-ids whose worktrees are safe
+/// to delete. A worktree is an orphan if no live card references it — its owning
+/// card was deleted or reached a terminal state (`done`/`failed`).
+fn worktrees_to_reap(on_disk: &[String], keep: &std::collections::HashSet<String>) -> Vec<String> {
+    on_disk
+        .iter()
+        .filter(|run_id| !keep.contains(*run_id))
+        .cloned()
+        .collect()
+}
+
+/// Pure decision core for log retention: given distinct run-ids ordered
+/// most-recent-first, keep the newest `keep` of them plus every protected
+/// (resumable) run, and return the run-ids whose transcripts may be deleted.
+fn run_logs_to_prune(
+    recent_first: &[String],
+    keep: usize,
+    protected: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    recent_first
+        .iter()
+        .skip(keep)
+        .filter(|run_id| !protected.contains(*run_id))
+        .cloned()
+        .collect()
+}
+
+/// Bound the otherwise-unbounded `logs` table. Each run appends a few hundred
+/// event rows; left unchecked they slow startup (the whole table replays into
+/// memory) and run-replay queries. We keep the most recent `KEEP_RUNS` run
+/// transcripts plus every resumable run (blocked/review/etc., which still need
+/// replay) and delete the rest — whole runs at a time, so a transcript is never
+/// half-truncated. Only run logs are touched; design/code chat logs are bounded
+/// by doc count and left alone.
+///
+/// Runs BEFORE load_state_from_db so the trimmed set is what gets loaded.
+pub fn prune_old_run_logs(app_handle: &tauri::AppHandle) -> Result<usize, String> {
+    const KEEP_RUNS: usize = 200;
+    let conn = get_db_conn(app_handle)?;
+
+    // Resumable runs keep their transcript regardless of age.
+    let mut protected = std::collections::HashSet::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM cards WHERE run_id IS NOT NULL AND status IN ('running','queued','blocked','review')")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            protected.insert(r.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // Distinct run transcripts, most-recent first (by their latest row id).
+    let mut recent_first = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM logs WHERE log_type = 'run' GROUP BY run_id ORDER BY MAX(id) DESC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            recent_first.push(r.map_err(|e| e.to_string())?);
+        }
+    }
+
+    let mut pruned = 0usize;
+    for run_id in run_logs_to_prune(&recent_first, KEEP_RUNS, &protected) {
+        let n = conn
+            .execute(
+                "DELETE FROM logs WHERE log_type = 'run' AND run_id = ?1",
+                [&run_id],
+            )
+            .map_err(|e| e.to_string())?;
+        if n > 0 {
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
+/// List the run-id subdirectories under a project's `.harness/worktrees/`.
+fn worktree_dirs_on_disk(repo_path: &Path) -> Vec<String> {
+    let root = repo_path.join(".harness").join("worktrees");
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Reconcile run state and worktrees left behind by a previous session. The run
+/// loop is an in-memory `tokio` task that dies with the process, so any card
+/// persisted as `running` has a dead loop and is stuck: `unblock_run` only
+/// resumes `blocked`/`review`. We demote those crash-orphaned `running` cards to
+/// `blocked` so the user can resume them — their worktree and full transcript are
+/// still on disk. Then, per project, we delete worktree directories that no live
+/// card owns (deleted or terminal cards) and prune git's worktree bookkeeping.
+///
+/// Runs AFTER `load_state_from_db`, so cards and run logs are already in memory.
+pub fn reconcile_runs_on_startup(app_handle: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    // Phase 1: demote crash-orphaned `running` cards to `blocked`.
+    let mut demoted: Vec<(String, String)> = Vec::new(); // (card_id, run_id)
+    let mut keep_by_project: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut project_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    {
+        let mut cards = state.cards.lock().unwrap();
+        for card in cards.iter_mut() {
+            project_paths.insert(card.project_path.clone());
+            if card.status == "running" {
+                card.status = "blocked".to_string();
+                if let Some(run_id) = card.run_id.clone() {
+                    demoted.push((card.id.clone(), run_id));
+                }
+            }
+            // A live card (now including freshly-demoted ones) keeps its worktree.
+            if matches!(card.status.as_str(), "blocked" | "review") {
+                if let Some(run_id) = card.run_id.clone() {
+                    keep_by_project
+                        .entry(card.project_path.clone())
+                        .or_default()
+                        .insert(run_id);
+                }
+            }
+        }
+    }
+
+    // Persist demotions + leave a transcript breadcrumb so the run reads clearly.
+    if let Ok(conn) = get_db_conn(app_handle) {
+        for (card_id, run_id) in &demoted {
+            let _ = conn.execute(
+                "UPDATE cards SET status = 'blocked' WHERE id = ?1",
+                [card_id],
+            );
+            let _ = conn.execute(
+                "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("run", card_id, run_id, "status", "blocked"),
+            );
+            let msg = "{\"role\":\"agent\",\"content\":\"Run interrupted by an app restart. The previous session ended before this run finished — its worktree and transcript are intact. Resume to continue, or reject to discard.\"}";
+            let _ = conn.execute(
+                "INSERT INTO logs (log_type, key, run_id, event_type, payload) VALUES (?1, ?2, ?3, ?4, ?5)",
+                ("run", card_id, run_id, "message", msg),
+            );
+        }
+    }
+
+    // Mirror the breadcrumb into the in-memory log so a freshly-loaded UI shows it.
+    if !demoted.is_empty() {
+        let mut logs = state.run_logs.lock().unwrap();
+        for (card_id, run_id) in &demoted {
+            let events = logs.entry(card_id.clone()).or_default();
+            events.push(RunEvent {
+                run_id: run_id.clone(),
+                event_type: "status".to_string(),
+                payload: "blocked".to_string(),
+            });
+            events.push(RunEvent {
+                run_id: run_id.clone(),
+                event_type: "message".to_string(),
+                payload: "{\"role\":\"agent\",\"content\":\"Run interrupted by an app restart. The previous session ended before this run finished — its worktree and transcript are intact. Resume to continue, or reject to discard.\"}".to_string(),
+            });
+        }
+    }
+
+    // Phase 2: per project, reap worktrees no live card owns, then prune.
+    let empty = std::collections::HashSet::new();
+    for project_path in &project_paths {
+        let repo_path = clean_project_path(project_path);
+        if !git::is_git_repo(&repo_path) {
+            continue;
+        }
+        let on_disk = worktree_dirs_on_disk(&repo_path);
+        let keep = keep_by_project.get(project_path).unwrap_or(&empty);
+        for run_id in worktrees_to_reap(&on_disk, keep) {
+            // Best-effort: a failure here shouldn't abort startup.
+            let _ = git::remove_worktree(&repo_path, &run_id);
+        }
+        let _ = git::prune_worktrees(&repo_path);
+    }
+
+    Ok(())
+}
+
 fn get_config_path(app_handle: &tauri::AppHandle) -> PathBuf {
     let mut path = app_handle
         .path()
@@ -1825,13 +2025,17 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                 "type": "function",
                 "function": {
                     "name": "run_command",
-                    "description": "Runs a build, test, or check shell command in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\").",
+                    "description": "Runs a build, test, or check shell command in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Output is prefixed with the exit code (0 = success) and clipped from BOTH ends, so the error at the tail is preserved.",
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "command": {
                                 "type": "string",
                                 "description": "The exact shell command to run"
+                            },
+                            "timeout_secs": {
+                                "type": "integer",
+                                "description": "Optional wall-clock cap in seconds (default 300, max 1800). Raise it for known-slow builds; the process is killed if it overruns."
                             }
                         },
                         "required": ["command"],
@@ -1853,6 +2057,79 @@ fn get_openai_tools_schema(tools: &[&str]) -> serde_json::Value {
                             }
                         },
                         "required": ["query"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "screenshot" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "screenshot",
+                    "description": "Renders a running web page in a headless browser and captures a PNG. The dev server must already be serving the URL. If the loaded model is vision-capable the image is shown to you on your next turn (so you can SEE the rendered UI); otherwise it is saved as an artifact for your human. Use it to check layout, alignment, and visual regressions instead of guessing from CSS.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL of a page the dev server is already serving, e.g. http://localhost:5173/"
+                            },
+                            "width": {
+                                "type": "integer",
+                                "description": "Viewport width in px (default 1280, 320-2560)"
+                            },
+                            "height": {
+                                "type": "integer",
+                                "description": "Viewport height in px (default 800, 240-2000)"
+                            }
+                        },
+                        "required": ["url"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "start_server" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "start_server",
+                    "description": "Starts a long-running process (e.g. a dev server like \"npm run dev\") in the background and waits until `port` accepts connections. Use this — NOT run_command — for anything that doesn't exit on its own, since run_command blocks and kills long-running commands. Once it's ready you can screenshot http://localhost:<port>/. The process keeps running across turns and is stopped automatically when the run ends.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": { "type": "string", "description": "The shell command that starts the server, e.g. \"npm run dev\"" },
+                            "port": { "type": "integer", "description": "The port the server listens on (e.g. 5173); used to detect readiness" },
+                            "timeout_secs": { "type": "integer", "description": "How long to wait for the port to open before returning (default 60, max 180)" }
+                        },
+                        "required": ["command", "port"],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "stop_server" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "stop_server",
+                    "description": "Stops background server(s) started with start_server. Stops all of them if no port is given.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "port": { "type": "integer", "description": "Only stop the server on this port (optional; omit to stop all)" }
+                        },
+                        "required": [],
+                        "additionalProperties": false
+                    }
+                }
+            }),
+            "server_logs" => serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "server_logs",
+                    "description": "Shows recent stdout/stderr from your background server(s) — use it to see why a server failed to start or to read a runtime error it logged.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "port": { "type": "integer", "description": "Only show this port's server (optional; omit for all)" }
+                        },
+                        "required": [],
                         "additionalProperties": false
                     }
                 }
@@ -3634,6 +3911,22 @@ fn emit_chunk(app_handle: &tauri::AppHandle, run_id: &str, chunk: &str, done: bo
     );
 }
 
+/// Tell the frontend to discard the partial assistant text streamed so far for
+/// this run. Emitted between retry attempts so a resent request doesn't append
+/// its tokens onto the abandoned partial of the attempt that failed.
+fn emit_stream_reset(app_handle: &tauri::AppHandle, run_id: &str) {
+    let _ = app_handle.emit(
+        "chat-chunk",
+        serde_json::json!({
+            "run_id": run_id,
+            "chunk": "",
+            "done": false,
+            "reset": true,
+            "error": serde_json::Value::Null
+        }),
+    );
+}
+
 /// Convert the OpenAI function-tools schema into Anthropic's tool format
 /// (top-level name/description with `input_schema` instead of nested
 /// `function.parameters`).
@@ -3779,6 +4072,57 @@ fn assist_as_primary(s: &LlmSettings) -> LlmSettings {
     }
 }
 
+/// Extract the numeric HTTP status from a provider error string of the shape
+/// "{Provider} API error {code}: ...". Returns None for transport faults and
+/// for the no-code variant ("... API error: <body>").
+fn parse_http_status(err: &str) -> Option<u16> {
+    let marker = " API error ";
+    let idx = err.find(marker)?;
+    let rest = &err[idx + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u16>().ok()
+}
+
+/// Decide whether a failed model call is worth retrying. Permanent failures —
+/// user cancellation, auth, bad request, missing model, or an unconfigured
+/// endpoint — fail identically on resend, so we surface them at once. Transport
+/// faults (timeouts, dropped/reset connections, mid-stream read failures) and
+/// 5xx/429-class statuses are transient and worth a retry.
+fn llm_error_is_transient(err: &str) -> bool {
+    let e = err.to_lowercase();
+
+    if e.contains("cancelled by user")
+        || e.contains("api url is empty")
+        || e.contains("api key")
+    {
+        return false;
+    }
+
+    if let Some(code) = parse_http_status(err) {
+        // 4xx are caller faults (400 bad request, 401/403 auth, 404 no model,
+        // 422 unprocessable) — never retried. 408/425/429 and 5xx are transient.
+        return matches!(code, 408 | 425 | 429) || code >= 500;
+    }
+
+    // No HTTP status parsed → a transport/stream fault. Retry.
+    true
+}
+
+/// Sleep for `total_ms`, waking early if the run is cancelled so backoff never
+/// delays a cancel.
+fn sleep_unless_cancelled(app_handle: &tauri::AppHandle, run_id: &str, total_ms: u64) {
+    let mut waited = 0u64;
+    while waited < total_ms {
+        if let Some(st) = app_handle.try_state::<AppState>() {
+            if st.cancelled_runs.lock().unwrap().contains(run_id) {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        waited += 250;
+    }
+}
+
 fn call_llm(
     app_handle: &tauri::AppHandle,
     run_id: &str,
@@ -3827,30 +4171,69 @@ fn call_llm(
     })];
     messages.append(&mut chat_history);
 
-    match kind {
-        ProviderKind::Anthropic => call_anthropic(
-            app_handle,
-            run_id,
-            &url,
-            &settings,
-            system_prompt,
-            messages,
-            tools,
-        ),
-        ProviderKind::OllamaNative => {
-            call_ollama_native(app_handle, run_id, &url, &settings, messages, tools)
+    // Resend on transient faults so a network blip no longer drops the whole run
+    // to `blocked`. Attempts: initial + 2 retries, backing off 1s then 3s. The
+    // request is identical each time; only the per-attempt clones of the moved
+    // args differ. Permanent errors (auth, bad request) and user cancellation
+    // short-circuit immediately via llm_error_is_transient.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let result = match kind {
+            ProviderKind::Anthropic => call_anthropic(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                system_prompt,
+                messages.clone(),
+                tools.clone(),
+            ),
+            ProviderKind::OllamaNative => call_ollama_native(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                messages.clone(),
+                tools.clone(),
+            ),
+            ProviderKind::LmStudioStateful => call_lmstudio_stateful(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                system_prompt,
+                &messages,
+            ),
+            ProviderKind::OpenAiCompat => call_openai_compat(
+                app_handle,
+                run_id,
+                &url,
+                &settings,
+                messages.clone(),
+                tools.clone(),
+            ),
+        };
+
+        let err = match result {
+            Ok(reply) => return Ok(reply),
+            Err(e) => e,
+        };
+
+        if attempt >= MAX_ATTEMPTS || !llm_error_is_transient(&err) {
+            return Err(err);
         }
-        ProviderKind::LmStudioStateful => call_lmstudio_stateful(
-            app_handle,
-            run_id,
-            &url,
-            &settings,
-            system_prompt,
-            &messages,
-        ),
-        ProviderKind::OpenAiCompat => {
-            call_openai_compat(app_handle, run_id, &url, &settings, messages, tools)
-        }
+
+        // Discard the failed attempt's partial stream from the UI, back off, and
+        // resend. sleep_unless_cancelled keeps a mid-backoff cancel responsive.
+        emit_stream_reset(app_handle, run_id);
+        log_error(&format!(
+            "Transient model error on attempt {}/{}, retrying: {}",
+            attempt, MAX_ATTEMPTS, err
+        ));
+        let backoff_ms = if attempt == 1 { 1000 } else { 3000 };
+        sleep_unless_cancelled(app_handle, run_id, backoff_ms);
     }
 }
 
@@ -4209,6 +4592,14 @@ fn call_openai_compat(
     tools: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let messages = normalize_for_strict_templates(messages);
+    // Vision: if the agent just took a screenshot and the loaded model can see,
+    // attach the PNG to that turn. Probe capability only when an image is
+    // actually pending, so the common no-screenshot turn pays no latency.
+    let messages = if last_screenshot(&messages).is_some() {
+        attach_recent_screenshot(messages, model_supports_vision(settings))
+    } else {
+        messages
+    };
     let mut payload = serde_json::json!({
     "model": settings.model,
     "messages": messages,
@@ -6527,6 +6918,9 @@ impl Drop for ActiveRunGuard {
             let mut active = state.active_runs.lock().unwrap();
             active.remove(&self.run_id);
         }
+        // Kill any dev server / watcher this run started so it never outlives
+        // the run (completion, error, cancel, and pause all land here).
+        kill_run_background_processes(&self.app_handle, &self.run_id);
     }
 }
 
@@ -6620,7 +7014,7 @@ fn construct_agent_system_prompt(
          5. `search_grep(query: String, path?: String, context?: Int, case_sensitive?: Bool)`: Searches file contents for a substring (case-insensitive by default) across the repo or under a path. Results are grouped by file with line numbers. Pass context: 2 to see surrounding lines without a follow-up read_file. Do NOT use shell grep.\n\
          6. `git_status()`: Runs `git status` in the sandbox.\n\
          7. `git_diff()`: Runs `git diff` to view your current sandboxed changes.\n\
-         8. `run_command(command: String)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
+         8. `run_command(command: String, timeout_secs?: Int)`: Runs a build, test, or check shell command in the workspace (e.g. \"npm run build\", \"npm test\", \"cargo check\"). Use this to verify your code compiles and passes tests! The result starts with the exit code (`[exit code: 0]` means success) and the output is clipped from both ends, so the error at the bottom survives. timeout_secs defaults to 300 (max 1800). NOTE: the shell is Windows cmd.exe — Unix tools like grep, sed, awk, and ls are NOT available. Use search_grep, patch_file, and list_dir instead.\n\
          9. `patch_file(path: String, target: String, replacement: String)`: Replaces an exact text snippet in a file. THE tool for a SINGLE-LINE fix: target = the exact TEXT of the broken line (copied without read_file's line-number prefix — target is text, NEVER a line number), replacement = the corrected line — no line numbers involved, so it either lands exactly or refuses cleanly; it cannot hit the wrong line. The target must match byte-for-byte including quotes and whitespace; if you cannot reproduce the snippet exactly, use replace_lines. Also the safest way to INSERT new lines (a missing brace, an import): target = an existing anchor line, replacement = that same line plus the new content — anchored insertion can't land in the wrong place and survives line-number drift.\n\
          10. `replace_lines(path: String, start_line: int, end_line: int, content: String)`: Replaces an inclusive 1-indexed line range with new content (empty content deletes the lines). To INSERT without deleting, replace one anchor line with itself plus the new lines. THE tool for multi-line edits and for fixes where the broken text is hard to quote exactly: the compiler reports file:line and read_file output is line-numbered — read the reported lines, then replace exactly those line numbers. For a single broken line you CAN quote exactly, prefer patch_file. NEVER rewrite a whole file to fix a one-line error, and NEVER widen the range when an edit misses — the result message echoes the edit site with current numbers: verify, aim, and fix the ONE line. Line numbers SHIFT after any edit that changes line count, and the harness REFUSES an edit made with stale numbers — to make several edits to one file in a row, work bottom-to-top (highest line numbers first; lines below an edit keep their numbers), or re-read between edits.\n\
          11. `web_search(query: String)`: Searches the web for programming queries, libraries, APIs, or documentation snippets.\n\
@@ -6636,7 +7030,11 @@ fn construct_agent_system_prompt(
          21. `list_cards()`: Shows ALL kanban cards for this project grouped by status, with ids and todo progress. (read_card shows only YOUR card.)\n\
          22. `create_card(title: String, description: String, todos?: [String], priority?: \"low\"|\"medium\"|\"high\", labels?: [String])`: Files a new card in the backlog for the developer to review. If you discover a bug or needed work OUTSIDE your current card's scope, file a card for it instead of silently expanding your task — then stay on your card.\n\
          23. `update_card(card_id: String, title?: String, description?: String, priority?: String, todos?: [String], add_todo?: String, add_label?: String)`: Edits a backlog/todo card. `todos` REPLACES the whole checklist; `add_todo` appends one item.\n\
-         24. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\n\
+         24. `delete_card(card_id: String)`: Deletes a backlog/todo card that has no run history.\n\
+         25. `screenshot(url: String, width?: Int, height?: Int)`: Renders a page the dev server is ALREADY serving (e.g. http://localhost:5173/) in a headless browser and captures it. If the loaded model is vision-capable, the image is shown to you next turn so you can SEE the rendered UI — use it to check layout/alignment instead of guessing from CSS. It does NOT start the dev server — use start_server for that.\n\
+         26. `start_server(command: String, port: Int, timeout_secs?: Int)`: Starts a long-running process (e.g. \"npm run dev\") in the background and waits until `port` accepts connections, so you can then screenshot http://localhost:<port>/. Use this — NOT run_command — for dev servers and watchers, because run_command blocks and kills long-running commands. The server keeps running across turns and is stopped automatically when the run ends.\n\
+         27. `stop_server(port?: Int)`: Stops background server(s) you started (all of them if no port is given).\n\
+         28. `server_logs(port?: Int)`: Shows recent stdout/stderr from your background server(s) — use it to diagnose a server that didn't come up or a runtime error it logged.\n\n\
          Work efficiently with context: prefer outline_file + ranged read_file over reading entire files, since large reads slow the model and crowd out useful history. Starting unfamiliar work? Call recall() first, and search_codebase() to locate relevant code by concept — and remember() durable insights as you go. When you have finished the task, you MUST call task_complete — do not simply describe that you are done in prose.",
         card_title, card_description, worktree_path.to_string_lossy()
     );
@@ -6750,7 +7148,7 @@ fn strip_lang_prefix(s: &str) -> &str {
     trimmed
 }
 
-const KNOWN_TOOLS: [&str; 24] = [
+const KNOWN_TOOLS: [&str; 28] = [
     "read_file",
     "outline_file",
     "write_file",
@@ -6770,6 +7168,10 @@ const KNOWN_TOOLS: [&str; 24] = [
     "git_status",
     "git_diff",
     "run_command",
+    "screenshot",
+    "start_server",
+    "stop_server",
+    "server_logs",
     "web_search",
     "send_notification",
     "read_card",
@@ -6809,7 +7211,15 @@ fn fn_ident_ok(s: &str) -> bool {
 }
 
 fn parse_fn_scalar_value(val_str: &str) -> serde_json::Value {
-    let v = val_str.trim();
+    // The key/value split (in parse_fn_args_strict/_lenient) consumes only the
+    // FIRST `=`/`:`. When the model emits a redundant separator —
+    // `read_file(path == "x")` or `path := "x"` — the second one stays fused to
+    // the value as `="x"`, so the quote-stripping branch below never fires and
+    // the literal `="x"` (quotes and all) reaches the tool. Any leading
+    // separator/whitespace run on the value is junk at this point (the real
+    // separator is already gone), so drop it before classifying.
+    let v = val_str.trim_start_matches(|c: char| c == '=' || c == ':' || c.is_whitespace());
+    let v = v.trim_end();
     if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
         serde_json::from_str(v)
             .unwrap_or_else(|_| serde_json::Value::String(v[1..v.len() - 1].to_string()))
@@ -7456,7 +7866,34 @@ fn run_git_command<P: AsRef<Path>>(dir: P, args: &[&str]) -> Result<String, Stri
     }
 }
 
-fn run_shell_command<P: AsRef<Path>>(dir: P, command_str: &str) -> Result<String, String> {
+/// Truncate keeping BOTH ends. Build/test runners echo the command and progress
+/// at the top but print the actual error at the BOTTOM, so the old head-only clip
+/// routinely threw away the one chunk the model needed to diagnose a failure.
+fn clip_head_tail(s: &str, budget: usize) -> String {
+    let total = s.chars().count();
+    if total <= budget {
+        return s.to_string();
+    }
+    let head_len = budget / 4;
+    let tail_len = budget - head_len;
+    let head: String = s.chars().take(head_len).collect();
+    let tail: String = s.chars().skip(total - tail_len).collect();
+    let omitted = total - head_len - tail_len;
+    format!("{}\n... [{} chars omitted] ...\n{}", head, omitted, tail)
+}
+
+/// Run a shell command in `dir`, returning the exit code plus head+tail-clipped
+/// output. `timeout_secs` caps wall-clock (default 300s, clamped to [1, 1800]);
+/// a command that overruns is killed so a hung build can't wedge the whole run.
+fn run_shell_command<P: AsRef<Path>>(
+    dir: P,
+    command_str: &str,
+    timeout_secs: Option<u64>,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = Command::new("cmd.exe");
         c.arg("/c").arg(command_str);
@@ -7467,16 +7904,510 @@ fn run_shell_command<P: AsRef<Path>>(dir: P, command_str: &str) -> Result<String
         c
     };
     cmd.current_dir(dir);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     crate::configure_no_window(&mut cmd);
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    let out = String::from_utf8_lossy(&output.stdout).to_string();
-    let err = String::from_utf8_lossy(&output.stderr).to_string();
 
-    let mut combined = format!("{}\n{}", out, err);
-    if combined.len() > 3000 {
-        combined = format!("{}... [TRUNCATED]", &combined[..3000]);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+
+    // Drain both streams on their own threads: a command that outfills the pipe
+    // buffer (~64KB) blocks waiting for us to read, which would defeat the
+    // timeout. Cap each stream so a runaway command can't exhaust memory while
+    // we keep draining it to EOF.
+    const STREAM_CAP: usize = 256 * 1024;
+    fn drain_capped<R: Read>(mut r: R, cap: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = r.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            if buf.len() < cap {
+                let take = (cap - buf.len()).min(n);
+                buf.extend_from_slice(&chunk[..take]);
+            }
+        }
+        buf
     }
-    Ok(combined)
+    let so = child.stdout.take();
+    let se = child.stderr.take();
+    let t_out = std::thread::spawn(move || so.map(|r| drain_capped(r, STREAM_CAP)).unwrap_or_default());
+    let t_err = std::thread::spawn(move || se.map(|r| drain_capped(r, STREAM_CAP)).unwrap_or_default());
+
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(300).clamp(1, 1800));
+    let start = Instant::now();
+    let (status_opt, timed_out) = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break (Some(status), false),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (None, true);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+
+    let out = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).to_string();
+    let err = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).to_string();
+    // stderr last, so the tail-biased clip preserves it — that's where cargo/tsc
+    // and most runners put the error.
+    let combined = if err.trim().is_empty() {
+        out
+    } else {
+        format!("{}\n{}", out, err)
+    };
+    let body = clip_head_tail(combined.trim_end(), 4000);
+
+    let header = if timed_out {
+        format!("[command timed out after {}s — process killed]", timeout.as_secs())
+    } else {
+        match status_opt.and_then(|s| s.code()) {
+            Some(code) => format!("[exit code: {}]", code),
+            None => "[process terminated by signal]".to_string(),
+        }
+    };
+    Ok(format!("{}\n{}", header, body))
+}
+
+/// Standard base64 (RFC 4648, with padding, no line wrapping). Hand-rolled to
+/// avoid a new dependency; the only use is encoding a screenshot PNG into a
+/// data: URI for vision-capable models.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+static SHOT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Locate an installed headless-capable Chromium browser (Chrome preferred,
+/// then Edge). v1 targets the user's Windows environment with POSIX fallbacks.
+fn find_headless_browser() -> Option<std::path::PathBuf> {
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &[
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+    } else {
+        &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+        ]
+    };
+    candidates
+        .iter()
+        .map(std::path::PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// Capture `url` to a PNG via headless Chrome/Edge and return the file path.
+/// Saved under a per-run temp dir (NOT the worktree, so it never shows up in
+/// git_status). The throwaway --user-data-dir is load-bearing: without it a
+/// browser already running on the user's desktop hands the request off to that
+/// instance and the headless invocation no-ops without writing a file.
+fn capture_screenshot(run_id: &str, url: &str, width: u32, height: u32) -> Result<std::path::PathBuf, String> {
+    use std::time::{Duration, Instant};
+    let browser = find_headless_browser()
+        .ok_or("no headless browser found (install Google Chrome or Microsoft Edge)")?;
+    let dir = std::env::temp_dir().join("beetleai-shots").join(run_id);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let n = SHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let shot = dir.join(format!("shot-{}.png", n));
+    let profile = dir.join("browser-profile");
+    let _ = fs::remove_file(&shot);
+
+    let mut cmd = Command::new(&browser);
+    cmd.args([
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--hide-scrollbars",
+        &format!("--user-data-dir={}", profile.display()),
+        &format!("--screenshot={}", shot.display()),
+        &format!("--window-size={},{}", width, height),
+        url,
+    ]);
+    crate::configure_no_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("failed to launch browser: {}", e))?;
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("screenshot timed out after 30s".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    if shot.exists() {
+        Ok(shot)
+    } else {
+        Err(format!("browser exited without writing a screenshot — is '{}' reachable?", url))
+    }
+}
+
+/// Marker the screenshot tool prepends to its result so the image can be
+/// re-attached to the model's next turn. Kept at the HEAD of the result because
+/// truncate_tool_result clips the tail.
+const SHOT_MARKER_OPEN: &str = "[screenshot:";
+
+fn parse_screenshot_path(content: &str) -> Option<String> {
+    let start = content.find(SHOT_MARKER_OPEN)? + SHOT_MARKER_OPEN.len();
+    let rest = &content[start..];
+    let end = rest.find(']')?;
+    let p = rest[..end].trim();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p.to_string())
+    }
+}
+
+/// Index + path of the LAST message carrying a screenshot marker, if any.
+fn last_screenshot(messages: &[serde_json::Value]) -> Option<(usize, String)> {
+    let mut found = None;
+    for (i, m) in messages.iter().enumerate() {
+        if let Some(c) = m.get("content").and_then(|c| c.as_str()) {
+            if let Some(p) = parse_screenshot_path(c) {
+                found = Some((i, p));
+            }
+        }
+    }
+    found
+}
+
+/// Read `capabilities.vision` for `model` out of LM Studio's /api/v1/models
+/// payload. Matches by exact key first, then falls back to any loaded
+/// vision-capable model (the configured id can differ from the registry key).
+fn vision_from_models_json(json: &serde_json::Value, model: &str) -> bool {
+    let models = match json.get("models").and_then(|m| m.as_array()) {
+        Some(m) => m,
+        None => return false,
+    };
+    let cap_vision = |m: &serde_json::Value| {
+        m.get("capabilities")
+            .and_then(|c| c.get("vision"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    for m in models {
+        if m.get("key").and_then(|k| k.as_str()) == Some(model) {
+            return cap_vision(m);
+        }
+    }
+    for m in models {
+        let loaded = m
+            .get("loaded_instances")
+            .and_then(|a| a.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
+        if loaded && cap_vision(m) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort: does the configured chat model accept images? Only the
+/// OpenAI-compat path carries images in v1; for it we ask LM Studio's native
+/// /api/v1/models. Fails CLOSED on any other provider or any error — we never
+/// send an image to a model that can't take one.
+fn model_supports_vision(settings: &LlmSettings) -> bool {
+    if provider_kind(&settings.provider.to_lowercase()) != ProviderKind::OpenAiCompat {
+        return false;
+    }
+    let root = settings
+        .api_url
+        .trim_end_matches('/')
+        .trim_end_matches("/api/v1/chat")
+        .trim_end_matches("/api/v1")
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let url = format!("{}/api/v1/models", root);
+    let resp = match ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .call()
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    match resp.into_json::<serde_json::Value>() {
+        Ok(json) => vision_from_models_json(&json, &settings.model),
+        Err(_) => false,
+    }
+}
+
+/// If a recent screenshot exists and `vision` is on, rewrite that message's
+/// content from a plain string into an OpenAI multimodal array (text + the PNG
+/// as a base64 data: URI). Only the most recent screenshot is attached, and
+/// only while it's near the tail, so we don't re-send a large image every turn
+/// for the rest of the run. A no-op when there's no screenshot, vision is off,
+/// or the file is gone — the text marker simply remains.
+fn attach_recent_screenshot(mut messages: Vec<serde_json::Value>, vision: bool) -> Vec<serde_json::Value> {
+    let (idx, path) = match last_screenshot(&messages) {
+        Some(x) => x,
+        None => return messages,
+    };
+    if !vision || messages.len().saturating_sub(idx) > 6 {
+        return messages;
+    }
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(_) => return messages,
+    };
+    let data_uri = format!("data:image/png;base64,{}", base64_encode(&bytes));
+    let role = messages[idx]
+        .get("role")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!("user"));
+    let text = messages[idx]
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .to_string();
+    messages[idx] = serde_json::json!({
+        "role": role,
+        "content": [
+            { "type": "text", "text": text },
+            { "type": "image_url", "image_url": { "url": data_uri } }
+        ]
+    });
+    messages
+}
+
+/// A long-lived process the agent started (e.g. `npm run dev`). Held in
+/// AppState so it survives across turns and can be killed on run teardown.
+pub struct BgProcess {
+    pub label: String,
+    pub port: u16,
+    pub command: String,
+    pub child: std::process::Child,
+    /// Capped tail of the process's combined stdout+stderr, filled by drain
+    /// threads so a server's startup/runtime errors are inspectable.
+    pub output: std::sync::Arc<Mutex<String>>,
+}
+
+const BG_LOG_CAP: usize = 8192;
+
+fn append_capped(buf: &std::sync::Arc<Mutex<String>>, chunk: &str) {
+    if let Ok(mut s) = buf.lock() {
+        s.push_str(chunk);
+        let len = s.chars().count();
+        if len > BG_LOG_CAP {
+            *s = s.chars().skip(len - BG_LOG_CAP).collect();
+        }
+    }
+}
+
+/// Is something accepting TCP connections on localhost:`port`? Used as the
+/// readiness signal for a freshly started server — more reliable than scraping
+/// log output for a "listening on" line that varies per framework.
+fn port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// Kill a process AND its descendants. The dev server runs under a `cmd.exe`/
+/// `sh` wrapper that spawns node etc.; killing only the wrapper would orphan the
+/// real server, so on Windows we use `taskkill /T` to take down the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let mut k = Command::new("taskkill");
+        k.args(["/F", "/T", "/PID", &child.id().to_string()]);
+        crate::configure_no_window(&mut k);
+        let _ = k.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+fn spawn_background(
+    worktree: &Path,
+    command: &str,
+) -> Result<(std::process::Child, std::sync::Arc<Mutex<String>>), String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd.exe");
+        c.arg("/c").arg(command);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    cmd.current_dir(worktree)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::configure_no_window(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let buf = std::sync::Arc::new(Mutex::new(String::new()));
+    for stream in [
+        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let b = buf.clone();
+        let mut r = stream;
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = r.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                append_capped(&b, &String::from_utf8_lossy(&chunk[..n]));
+            }
+        });
+    }
+    Ok((child, buf))
+}
+
+/// Start `command` as a background process in `worktree`, register it under
+/// `run_id`, and wait until `port` is accepting connections (or `timeout_secs`
+/// elapses). Any existing server on the same port for this run is replaced.
+fn bg_start(
+    state: &AppState,
+    run_id: &str,
+    worktree: &Path,
+    command: &str,
+    port: u16,
+    timeout_secs: u64,
+) -> String {
+    use std::time::{Duration, Instant};
+    bg_stop(state, run_id, Some(port));
+    let (child, output) = match spawn_background(worktree, command) {
+        Ok(x) => x,
+        Err(e) => return format!("Error: failed to start '{}' — {}", command, e),
+    };
+    {
+        let mut map = state.bg_processes.lock().unwrap();
+        map.entry(run_id.to_string()).or_default().push(BgProcess {
+            label: format!("port {}", port),
+            port,
+            command: command.to_string(),
+            child,
+            output: output.clone(),
+        });
+    }
+    let deadline = Duration::from_secs(timeout_secs.clamp(1, 180));
+    let start = Instant::now();
+    loop {
+        if port_open(port) {
+            return format!(
+                "[server ready] http://localhost:{}/ is accepting connections. Screenshot it with screenshot(\"http://localhost:{}/\"). It keeps running across turns and is stopped automatically when this run ends (or call stop_server).",
+                port, port
+            );
+        }
+        if start.elapsed() > deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let logs = output.lock().map(|s| s.clone()).unwrap_or_default();
+    let tail = clip_head_tail(logs.trim(), 1500);
+    format!(
+        "[server started, but port {} did not open within {}s] It may still be building, or it failed to launch. It is still running (stop_server to kill it). Recent output:\n{}",
+        port,
+        deadline.as_secs(),
+        if tail.is_empty() { "(no output captured yet)" } else { &tail }
+    )
+}
+
+/// Kill background processes for `run_id`: those matching `port`, or all when
+/// `port` is None. Returns how many were killed.
+fn bg_stop(state: &AppState, run_id: &str, port: Option<u16>) -> usize {
+    let mut map = state.bg_processes.lock().unwrap();
+    let mut killed = 0;
+    if let Some(list) = map.get_mut(run_id) {
+        let mut keep = Vec::new();
+        for mut p in list.drain(..) {
+            if port.is_none_or(|pt| pt == p.port) {
+                kill_process_tree(&mut p.child);
+                killed += 1;
+            } else {
+                keep.push(p);
+            }
+        }
+        *list = keep;
+        if list.is_empty() {
+            map.remove(run_id);
+        }
+    }
+    killed
+}
+
+fn bg_logs(state: &AppState, run_id: &str, port: Option<u16>) -> String {
+    let map = state.bg_processes.lock().unwrap();
+    match map.get(run_id) {
+        None => "No background servers are running for this run.".to_string(),
+        Some(list) => {
+            let mut out = String::new();
+            for p in list {
+                if port.is_none_or(|pt| pt == p.port) {
+                    let logs = p.output.lock().map(|s| s.clone()).unwrap_or_default();
+                    out.push_str(&format!(
+                        "=== {} ({}) ===\n{}\n",
+                        p.label,
+                        p.command,
+                        clip_head_tail(logs.trim(), 3000)
+                    ));
+                }
+            }
+            if out.is_empty() {
+                "No matching background server for this run.".to_string()
+            } else {
+                out
+            }
+        }
+    }
+}
+
+fn kill_run_background_processes(app_handle: &tauri::AppHandle, run_id: &str) {
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        bg_stop(&state, run_id, None);
+    }
+}
+
+/// Kill every tracked background process across all runs. Called on app close
+/// so a dev server never outlives the harness.
+pub fn kill_all_background_processes(state: &AppState) {
+    let run_ids: Vec<String> = state.bg_processes.lock().unwrap().keys().cloned().collect();
+    for rid in run_ids {
+        bg_stop(state, &rid, None);
+    }
 }
 
 fn strip_html_tags(html: &str) -> String {
@@ -8176,14 +9107,185 @@ fn run_verification(worktree_path: &Path) -> Result<String, String> {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = format!("{}\n{}", stdout, stderr);
-            let head: String = combined.chars().take(2500).collect();
-            Err(format!("{} FAILED:\n{}", label, head))
+            // Clip from both ends, not head-only: cargo/tsc print the error at the
+            // tail, and this message is what the model sees when task_complete is
+            // rejected — a head-only cut hid the very error it must fix.
+            Err(format!("{} FAILED:\n{}", label, clip_head_tail(combined.trim(), 3000)))
         }
         // Tool missing on PATH etc. — don't hard-block completion on environment problems.
         Err(e) => Ok(format!(
             "could not run {} ({}); verification skipped",
             label, e
         )),
+    }
+}
+
+/// Byte spans of each line's content, excluding its trailing `\n`/`\r\n` — the
+/// same line set as `str::lines()` (a final newline yields no trailing empty
+/// line). The patch_file fuzzy fallback compares on these spans and splices on
+/// their byte offsets, so a line-level match maps back to an exact byte range.
+fn line_content_spans(s: &str) -> Vec<(usize, usize)> {
+    let b = s.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    for i in 0..b.len() {
+        if b[i] == b'\n' {
+            let mut end = i;
+            if end > start && b[end - 1] == b'\r' {
+                end -= 1;
+            }
+            spans.push((start, end));
+            start = i + 1;
+        }
+    }
+    if start < b.len() {
+        let mut end = b.len();
+        if end > start && b[end - 1] == b'\r' {
+            end -= 1;
+        }
+        spans.push((start, end));
+    }
+    spans
+}
+
+/// Split a model-supplied target into comparison lines: drop `\r`, trim trailing
+/// whitespace, and discard the trailing empty line a stray final newline leaves.
+fn target_compare_lines(target: &str) -> Vec<String> {
+    let mut lines: Vec<String> = target
+        .split('\n')
+        .map(|l| l.trim_end_matches('\r').trim_end().to_string())
+        .collect();
+    while lines.last().map(|l| l.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+    lines
+}
+
+/// If every target line carries a `read_file`-style `"<n>: "` prefix with
+/// consecutive ascending numbers, return the lines with those prefixes removed
+/// (preserving each line's own indentation). Returns None when the pattern
+/// isn't a clean run — so a genuine `42: value` code line is never mis-stripped.
+fn strip_read_file_line_numbers(lines: &[String]) -> Option<Vec<String>> {
+    if lines.is_empty() {
+        return None;
+    }
+    let mut prev: Option<u64> = None;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let t = line.trim_start();
+        let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        // read_file emits `format!("{}: {}", n, line)`, so the separator is a
+        // colon plus one space; the rest is the line's own (preserved) text.
+        let code = match t[digits.len()..].strip_prefix(':') {
+            Some(after) => after.strip_prefix(' ').unwrap_or(after),
+            None => return None,
+        };
+        let n: u64 = digits.parse().ok()?;
+        if let Some(p) = prev {
+            if n != p + 1 {
+                return None;
+            }
+        }
+        prev = Some(n);
+        out.push(code.to_string());
+    }
+    Some(out)
+}
+
+/// Start indices of every window in `norm_file` matching `target` line-for-line.
+fn line_window_matches(norm_file: &[&str], target: &[String]) -> Vec<usize> {
+    if target.is_empty() || target.len() > norm_file.len() {
+        return Vec::new();
+    }
+    (0..=norm_file.len() - target.len())
+        .filter(|&i| (0..target.len()).all(|k| norm_file[i + k] == target[k]))
+        .collect()
+}
+
+/// Where a patch target lands in the file.
+enum PatchLocation {
+    /// Unique byte range to replace. `line_based` is true when the match came
+    /// from the whitespace/line-ending-tolerant fallback rather than an exact
+    /// byte match — it changes how the replacement is spliced.
+    Unique {
+        start: usize,
+        end: usize,
+        line_based: bool,
+    },
+    None,
+    Ambiguous(usize),
+}
+
+/// Locate `target` in `content`. Exact byte match first — preserving the old
+/// behavior and partial-line patches. Only when that finds nothing do we fall
+/// back to line-level matching that tolerates the three artifacts a model
+/// introduces when reconstructing a snippet from line-numbered read_file
+/// output: LF where the file on disk has CRLF (read_file shows lines via
+/// `str::lines()`, so the model never even sees the `\r`), copied `"<n>: "`
+/// prefixes, and dropped trailing whitespace. The fallback keeps the uniqueness
+/// guarantee — an ambiguous fuzzy match still asks for more context rather than
+/// guessing which occurrence was meant.
+fn locate_patch_target(content: &str, target: &str) -> PatchLocation {
+    let exact: Vec<usize> = content.match_indices(target).map(|(i, _)| i).collect();
+    match exact.len() {
+        1 => {
+            return PatchLocation::Unique {
+                start: exact[0],
+                end: exact[0] + target.len(),
+                line_based: false,
+            }
+        }
+        0 => {}
+        n => return PatchLocation::Ambiguous(n),
+    }
+
+    let spans = line_content_spans(content);
+    let norm_file: Vec<&str> = spans
+        .iter()
+        .map(|&(s, e)| content[s..e].trim_end())
+        .collect();
+
+    let base = target_compare_lines(target);
+    let mut candidates = vec![base.clone()];
+    if let Some(stripped) = strip_read_file_line_numbers(&base) {
+        if stripped != base {
+            candidates.push(stripped);
+        }
+    }
+
+    let mut saw_ambiguous = 0usize;
+    for cand in &candidates {
+        let hits = line_window_matches(&norm_file, cand);
+        match hits.len() {
+            1 => {
+                let i = hits[0];
+                return PatchLocation::Unique {
+                    start: spans[i].0,
+                    end: spans[i + cand.len() - 1].1,
+                    line_based: true,
+                };
+            }
+            0 => {}
+            n => saw_ambiguous = saw_ambiguous.max(n),
+        }
+    }
+    if saw_ambiguous > 0 {
+        PatchLocation::Ambiguous(saw_ambiguous)
+    } else {
+        PatchLocation::None
+    }
+}
+
+/// Re-encode `s` to the file's dominant line ending (`crlf` true => CRLF).
+fn normalize_line_endings(s: &str, crlf: bool) -> String {
+    let lf = s.replace("\r\n", "\n");
+    if crlf {
+        lf.replace('\n', "\r\n")
+    } else {
+        lf
     }
 }
 
@@ -8199,38 +9301,63 @@ fn patch_file_impl(
         Err(e) => return format!("Error: {}", e),
     };
 
-    match fs::read_to_string(&target_file) {
-        Ok(content) => {
-            let matches: Vec<_> = content.match_indices(target_str).collect();
-            if matches.is_empty() {
-                return format!("Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If you copied the target from read_file output, remove the leading line numbers — target must match the file's RAW text. If the snippet contains quotes or escapes you cannot reproduce exactly, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.", path);
-            }
-            if matches.len() > 1 {
-                return format!(
-                    "Error: Target text occurs {} times in '{}'. Please provide more surrounding lines of context to ensure the match is unique.",
-                    matches.len(),
-                    path
-                );
-            }
-            let updated = content.replacen(target_str, replacement_str, 1);
+    let content = match fs::read_to_string(&target_file) {
+        Ok(c) => c,
+        Err(e) => return format!("Error reading file: {}", e),
+    };
+
+    match locate_patch_target(&content, target_str) {
+        PatchLocation::None => format!(
+            "Error: Target text not found in '{}'. The target must match the file exactly, including whitespace and quotes. If you copied the target from read_file output, remove the leading line numbers — target must match the file's RAW text. If the snippet contains quotes or escapes you cannot reproduce exactly, use replace_lines(path: String, start_line: int, end_line: int, content: String) with the line numbers from read_file instead.",
+            path
+        ),
+        PatchLocation::Ambiguous(n) => format!(
+            "Error: Target text occurs {} times in '{}'. Please provide more surrounding lines of context to ensure the match is unique.",
+            n, path
+        ),
+        PatchLocation::Unique {
+            start,
+            end,
+            line_based,
+        } => {
+            // Exact matches splice byte-for-byte (behavior unchanged). Line-based
+            // matches replace whole-line content while preserving the block's
+            // surrounding newlines, so drop one trailing newline from the
+            // replacement and re-encode it to the file's line ending — otherwise
+            // a fuzzy patch would inject LF into a CRLF file or add a blank line.
+            let replacement = if line_based {
+                let crlf = content.contains("\r\n");
+                let trimmed = replacement_str
+                    .strip_suffix("\r\n")
+                    .or_else(|| replacement_str.strip_suffix('\n'))
+                    .unwrap_or(replacement_str);
+                normalize_line_endings(trimmed, crlf)
+            } else {
+                replacement_str.to_string()
+            };
+            let mut updated = String::with_capacity(content.len() + replacement.len());
+            updated.push_str(&content[..start]);
+            updated.push_str(&replacement);
+            updated.push_str(&content[end..]);
             match fs::write(&target_file, updated) {
+                Ok(_) if line_based => "Success: File patched (target matched after normalizing line endings and whitespace).".to_string(),
                 Ok(_) => "Success: File patched successfully".to_string(),
                 Err(e) => format!("Error writing file: {}", e),
             }
         }
-        Err(e) => format!("Error reading file: {}", e),
     }
 }
 
 /// The canonical tool names the parser/dispatcher knows. Used by
 /// `looks_like_malformed_tool_call` to tell a botched call (the model named a
 /// real tool but mangled the syntax) apart from ordinary prose.
-const KNOWN_TOOL_NAMES: [&str; 24] = [
+const KNOWN_TOOL_NAMES: [&str; 28] = [
     "read_file", "outline_file", "write_file", "list_dir", "git_status",
-    "git_diff", "run_command", "web_search", "send_notification", "task_complete",
-    "search_grep", "find_file", "find_symbol", "remember", "recall", "list_cards",
-    "create_card", "update_card", "delete_card", "read_card", "set_todo",
-    "replace_lines", "patch_file", "search_codebase",
+    "git_diff", "run_command", "screenshot", "start_server", "stop_server",
+    "server_logs", "web_search", "send_notification", "task_complete",
+    "search_grep", "find_file", "find_symbol", "remember", "recall",
+    "list_cards", "create_card", "update_card", "delete_card", "read_card",
+    "set_todo", "replace_lines", "patch_file", "search_codebase",
 ];
 
 /// Bucket a tool result into a coarse, STABLE `failure_reason` for harness
@@ -8692,10 +9819,66 @@ fn execute_tool(
                 Some(c) => c,
                 None => return "Error: Missing command argument".to_string(),
             };
-            match run_shell_command(worktree_path, command) {
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+            match run_shell_command(worktree_path, command, timeout_secs) {
                 Ok(out) => out,
                 Err(e) => format!("Error executing command: {}", e),
             }
+        }
+        "screenshot" => {
+            let url = match args.get("url").and_then(|u| u.as_str()) {
+                Some(u) if !u.trim().is_empty() => u.trim(),
+                _ => return "Error: Missing 'url' argument. Pass a URL the dev server is already serving, e.g. http://localhost:5173/. (This tool does not start the server.)".to_string(),
+            };
+            let width = args
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1280)
+                .clamp(320, 2560) as u32;
+            let height = args
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(800)
+                .clamp(240, 2000) as u32;
+            match capture_screenshot(run_id, url, width, height) {
+                Ok(path) => format!(
+                    "{}{}]\nCaptured {} at {}x{}. If the loaded model is vision-capable, the image is attached to this turn so you can see the rendered UI; otherwise it is saved as an artifact for your human.",
+                    SHOT_MARKER_OPEN,
+                    path.display(),
+                    url,
+                    width,
+                    height
+                ),
+                Err(e) => format!("Error: screenshot failed — {}", e),
+            }
+        }
+        "start_server" => {
+            let command = match args.get("command").and_then(|c| c.as_str()) {
+                Some(c) if !c.trim().is_empty() => c.trim(),
+                _ => return "Error: Missing 'command' argument (e.g. \"npm run dev\").".to_string(),
+            };
+            let port = match args.get("port").and_then(|v| v.as_u64()) {
+                Some(p) if (1..=65535).contains(&p) => p as u16,
+                _ => return "Error: Missing or invalid 'port' — the port the server listens on (e.g. 5173). It's used to detect when the server is ready.".to_string(),
+            };
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(60);
+            let state = app_handle.state::<AppState>();
+            bg_start(state.inner(), run_id, worktree_path, command, port, timeout_secs)
+        }
+        "stop_server" => {
+            let port = args.get("port").and_then(|v| v.as_u64()).map(|p| p as u16);
+            let state = app_handle.state::<AppState>();
+            let n = bg_stop(state.inner(), run_id, port);
+            if n == 0 {
+                "No matching background server was running.".to_string()
+            } else {
+                format!("Stopped {} background server(s).", n)
+            }
+        }
+        "server_logs" => {
+            let port = args.get("port").and_then(|v| v.as_u64()).map(|p| p as u16);
+            let state = app_handle.state::<AppState>();
+            bg_logs(state.inner(), run_id, port)
         }
         "web_search" => {
             let query = match args.get("query").and_then(|q| q.as_str()) {
@@ -9560,7 +10743,7 @@ fn execute_tool(
             }
         }
         _ => format!(
-            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
+            "Error: Unknown tool '{}'. Available tools: read_file, outline_file, write_file, patch_file, replace_lines, list_dir, search_grep, find_file, find_symbol, remember, recall, list_cards, create_card, update_card, delete_card, git_status, git_diff, run_command, screenshot, start_server, stop_server, server_logs, web_search, send_notification, read_card, set_todo, task_complete, request_assist. You may ONLY call these tools.",
             tool_name
         ),
     }
@@ -9770,6 +10953,10 @@ pub fn run_agent_loop(app_handle: tauri::AppHandle, run_id: String, card_id: Str
                 "git_status",
                 "git_diff",
                 "run_command",
+                "screenshot",
+                "start_server",
+                "stop_server",
+                "server_logs",
                 "web_search",
                 "send_notification",
                 "task_complete",
@@ -10274,7 +11461,7 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
          8. `find_symbol(name: String, path?: String)`: Finds where a function, struct, class, or other declaration is DEFINED. Returns file:line: signature — then range-read around that line.\n\
          9. `git_status()`: Runs `git status` in the repository.\n\
          10. `git_diff()`: Runs `git diff` to view code changes.\n\
-         11. `run_command(command: String)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests!\n\
+         11. `run_command(command: String, timeout_secs?: Int)`: Runs build, test, or check shell commands in the repository (e.g. \"cargo check\", \"npm run build\", \"npm test\"). Use this to verify your changes compile and pass tests! The result starts with the exit code (`[exit code: 0]` means success); output is clipped from both ends so the trailing error survives. timeout_secs defaults to 300 (max 1800).\n\
          12. `web_search(query: String)`: Searches the web for documentation, syntax guides, and examples.\n\
          13. `remember(topic: String, content: String)`: Saves a durable insight to this project's long-term memory — shared with design chat and agent runs. Record how subsystems work and pitfalls you discover.\n\
          14. `recall(query: String, limit?: Int)`: Searches this project's long-term memory — ranked semantically (by meaning) when an embedding provider is configured, else by keyword (empty query = most recent). Check what past runs and chats already learned before exploring from scratch.\n\
@@ -10291,6 +11478,85 @@ fn construct_copilot_system_prompt(project_path: &Path, file_path: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_worktrees_to_reap_keeps_live_drops_orphans() {
+        let on_disk = vec![
+            "run_a".to_string(), // owned by a blocked card -> keep
+            "run_b".to_string(), // terminal/deleted card    -> reap
+            "run_c".to_string(), // owned by an in-review card -> keep
+        ];
+        let mut keep = std::collections::HashSet::new();
+        keep.insert("run_a".to_string());
+        keep.insert("run_c".to_string());
+
+        let reap = worktrees_to_reap(&on_disk, &keep);
+        assert_eq!(reap, vec!["run_b".to_string()]);
+    }
+
+    #[test]
+    fn test_llm_error_transient_classification() {
+        // Permanent: cancellation, config, and 4xx caller faults.
+        assert!(!llm_error_is_transient("Cancelled by user"));
+        assert!(!llm_error_is_transient(
+            "API URL is empty. Please configure it in settings."
+        ));
+        assert!(!llm_error_is_transient("Anthropic API error 401: bad key"));
+        assert!(!llm_error_is_transient("Ollama API error 404: no such model"));
+        assert!(!llm_error_is_transient("LLM API error 400: bad request"));
+
+        // Transient: 5xx / 429 statuses and transport/stream faults.
+        assert!(llm_error_is_transient("LLM API error 503: unavailable"));
+        assert!(llm_error_is_transient("Ollama API error 500: boom"));
+        assert!(llm_error_is_transient("LM Studio API error 429: slow down"));
+        assert!(llm_error_is_transient("Network request failed: timed out"));
+        assert!(llm_error_is_transient(
+            "LM Studio stream read failed: connection reset"
+        ));
+    }
+
+    #[test]
+    fn test_parse_http_status() {
+        assert_eq!(parse_http_status("Anthropic API error 503: x"), Some(503));
+        assert_eq!(parse_http_status("LLM API error 429: x"), Some(429));
+        // No-code variant and transport faults carry no status.
+        assert_eq!(parse_http_status("Ollama API error: text"), None);
+        assert_eq!(parse_http_status("Network request failed: oops"), None);
+    }
+
+    #[test]
+    fn test_run_logs_to_prune_keeps_recent_and_protected() {
+        // recent_first: r1 newest ... r5 oldest. Keep 2 newest; r5 is resumable.
+        let recent = vec![
+            "r1".to_string(),
+            "r2".to_string(),
+            "r3".to_string(),
+            "r4".to_string(),
+            "r5".to_string(),
+        ];
+        let mut protected = std::collections::HashSet::new();
+        protected.insert("r5".to_string());
+
+        let prune = run_logs_to_prune(&recent, 2, &protected);
+        // r1,r2 kept by recency; r5 kept by protection; r3,r4 pruned.
+        assert_eq!(prune, vec!["r3".to_string(), "r4".to_string()]);
+    }
+
+    #[test]
+    fn test_run_logs_to_prune_under_cap_prunes_nothing() {
+        let recent = vec!["r1".to_string(), "r2".to_string()];
+        let protected = std::collections::HashSet::new();
+        assert!(run_logs_to_prune(&recent, 200, &protected).is_empty());
+    }
+
+    #[test]
+    fn test_worktrees_to_reap_empty_keep_reaps_all() {
+        let on_disk = vec!["run_x".to_string(), "run_y".to_string()];
+        let keep = std::collections::HashSet::new();
+        let mut reap = worktrees_to_reap(&on_disk, &keep);
+        reap.sort();
+        assert_eq!(reap, vec!["run_x".to_string(), "run_y".to_string()]);
+    }
 
     #[test]
     fn test_parse_tool_call_simple() {
@@ -10550,6 +11816,58 @@ BeetleAI
     }
 
     #[test]
+    fn test_parse_tool_call_redundant_separator() {
+        // Field failure: the model emitted a doubled separator and read_file was
+        // handed the literal `="src/patterns/wave.py"` (quotes included), which
+        // the OS rejected as a malformed path. The redundant `=`/`:` must be
+        // stripped so the real path comes through.
+        for input in [
+            "read_file(path == \"src/patterns/wave.py\")",
+            "read_file(path := \"src/patterns/wave.py\")",
+            "read_file(path: = \"src/patterns/wave.py\")",
+        ] {
+            let (name, args, _) = parse_tool_call_spanned(input).unwrap();
+            assert_eq!(name, "read_file");
+            assert_eq!(
+                args.get("path").unwrap().as_str().unwrap(),
+                "src/patterns/wave.py",
+                "input: {input}"
+            );
+        }
+
+        // The well-formed single-separator forms must keep parsing identically.
+        for input in [
+            "read_file(path = \"src/main.ts\")",
+            "read_file(path: \"src/main.ts\")",
+        ] {
+            let (_, args, _) = parse_tool_call_spanned(input).unwrap();
+            assert_eq!(args.get("path").unwrap().as_str().unwrap(), "src/main.ts");
+        }
+    }
+
+    #[test]
+    fn test_parse_replace_lines_content_no_quote_leak() {
+        // Field failure (Beetle's report): a malformed separator on `content`
+        // leaked the literal `= "..."` — quotes and all — into the file, breaking
+        // its syntax. The leading-separator strip in parse_fn_scalar_value must
+        // cover content, not just read_file's path: the value the tool receives
+        // is the bare code, with no `=` and no surrounding quotes.
+        for input in [
+            "replace_lines(path=\"a.rs\", start_line=1, end_line=1, content== \"let x = 1;\")",
+            "replace_lines(path=\"a.rs\", start_line=1, end_line=1, content := \"let x = 1;\")",
+            "replace_lines(path=\"a.rs\", start_line=1, end_line=1, content: \"let x = 1;\")",
+        ] {
+            let (name, args, _) = parse_tool_call_spanned(input).unwrap();
+            assert_eq!(name, "replace_lines");
+            assert_eq!(
+                args.get("content").unwrap().as_str().unwrap(),
+                "let x = 1;",
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_tool_calls_multiple() {
         // Two fenced calls in one response — both must survive, each with its
         // own preamble. This is the "she filed two great cards and we lost
@@ -10801,6 +12119,210 @@ BeetleAI
         // 4. Test patch_file_impl non-unique target
         let res_patch_non_unique = patch_file_impl(wt_path, "file_a.txt", "is", "was");
         assert!(res_patch_non_unique.contains("Error: Target text occurs"));
+    }
+
+    #[test]
+    fn test_patch_file_fuzzy_match() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wt = dir.path();
+
+        // 1. CRLF file, multi-line LF target — the dominant Windows miss. The
+        //    model only ever saw LF (read_file uses str::lines()), so its target
+        //    has bare \n that no longer byte-matches the file's \r\n.
+        let crlf = wt.join("crlf.rs");
+        fs::write(&crlf, "fn main() {\r\n    let x = 1;\r\n    let y = 2;\r\n}\r\n").unwrap();
+        let res = patch_file_impl(
+            wt,
+            "crlf.rs",
+            "    let x = 1;\n    let y = 2;",
+            "    let x = 10;\n    let y = 20;",
+        );
+        assert!(res.starts_with("Success"), "got: {res}");
+        let after = fs::read_to_string(&crlf).unwrap();
+        assert_eq!(after, "fn main() {\r\n    let x = 10;\r\n    let y = 20;\r\n}\r\n");
+
+        // 2. Target carrying read_file's "<n>: " line-number prefixes.
+        let f = wt.join("nums.txt");
+        fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let res = patch_file_impl(wt, "nums.txt", "2: beta\n3: gamma", "BETA\nGAMMA");
+        assert!(res.starts_with("Success"), "got: {res}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "alpha\nBETA\nGAMMA\n");
+
+        // 3. Trailing-whitespace drift: a file line has trailing spaces the model
+        //    dropped, breaking the exact byte match of the multi-line target.
+        let f = wt.join("trail.txt");
+        fs::write(&f, "keep\nedit me   \ntail\n").unwrap();
+        let res = patch_file_impl(wt, "trail.txt", "edit me\ntail", "edited\nTAIL");
+        assert!(res.starts_with("Success"), "got: {res}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "keep\nedited\nTAIL\n");
+
+        // 4. Fuzzy match that is ambiguous still refuses rather than guessing.
+        let f = wt.join("dup.txt");
+        fs::write(&f, "x = 1\r\ny = 2\r\nx = 1\r\n").unwrap();
+        let res = patch_file_impl(wt, "dup.txt", "x = 1", "x = 99");
+        assert!(res.contains("Target text occurs 2 times"), "got: {res}");
+
+        // 5. A genuinely absent target still reports not-found.
+        let res = patch_file_impl(wt, "dup.txt", "nonexistent line", "z");
+        assert!(res.contains("Target text not found"), "got: {res}");
+
+        // 6. A line that merely looks like a numbered prefix but isn't a clean
+        //    consecutive run is matched literally, not mis-stripped.
+        let f = wt.join("dict.txt");
+        // CRLF so the exact tier misses and the line-based fallback runs: the
+        // literal candidate must match before any prefix-stripping is attempted.
+        fs::write(&f, "config = {\r\n  42: \"answer\",\r\n}\r\n").unwrap();
+        let res = patch_file_impl(wt, "dict.txt", "  42: \"answer\",", "  42: \"forty-two\",");
+        assert!(res.starts_with("Success"), "got: {res}");
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "config = {\r\n  42: \"forty-two\",\r\n}\r\n"
+        );
+    }
+
+    #[test]
+    fn test_clip_head_tail_keeps_the_error_at_the_bottom() {
+        // Under budget: returned verbatim.
+        assert_eq!(clip_head_tail("short", 100), "short");
+
+        // Over budget: both ends survive (the old head-only clip dropped the
+        // tail, which is exactly where build errors live).
+        let s = format!("{}error: cannot find value `x`", "A".repeat(5000));
+        let clipped = clip_head_tail(&s, 4000);
+        assert!(clipped.starts_with("AAAA"), "head kept");
+        assert!(clipped.ends_with("error: cannot find value `x`"), "tail kept");
+        assert!(clipped.contains("chars omitted"));
+        assert!(clipped.chars().count() < s.chars().count());
+    }
+
+    #[test]
+    fn test_run_shell_command_reports_exit_code_and_timeout() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let wt = dir.path();
+
+        // Success: exit code 0 plus the command's stdout.
+        let ok = run_shell_command(wt, "echo hello", None).unwrap();
+        assert!(ok.starts_with("[exit code: 0]"), "got: {ok}");
+        assert!(ok.contains("hello"), "got: {ok}");
+
+        // Failure: a non-zero exit is surfaced (was invisible before).
+        let bad = run_shell_command(wt, "exit 3", None).unwrap();
+        assert!(bad.starts_with("[exit code: 3]"), "got: {bad}");
+
+        // Timeout: a command that overruns is killed and reported, not hung.
+        let sleep = if cfg!(target_os = "windows") {
+            "ping -n 5 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        };
+        let timed = run_shell_command(wt, sleep, Some(1)).unwrap();
+        assert!(timed.contains("timed out after 1s"), "got: {timed}");
+    }
+
+    #[test]
+    fn test_base64_encode_known_vectors() {
+        // RFC 4648 test vectors, including the two padding cases.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"M"), "TQ==");
+        assert_eq!(base64_encode(b"Ma"), "TWE=");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_parse_screenshot_path() {
+        assert_eq!(
+            parse_screenshot_path("[screenshot:C:\\tmp\\shot-0.png]\nCaptured ...").as_deref(),
+            Some("C:\\tmp\\shot-0.png")
+        );
+        assert_eq!(parse_screenshot_path("Tool 'read_file' returned:\nfn main"), None);
+        assert_eq!(parse_screenshot_path("[screenshot:]"), None);
+    }
+
+    #[test]
+    fn test_vision_from_models_json() {
+        // Shape mirrors LM Studio's /api/v1/models: vision lives under
+        // capabilities.vision, NOT the misleading top-level `type`/`vision`.
+        let json = serde_json::json!({
+            "models": [
+                { "key": "text-embedding", "type": "embedding", "vision": null,
+                  "loaded_instances": [{}], "capabilities": null },
+                { "key": "google/gemma-4-26b-a4b-qat", "type": "llm", "vision": null,
+                  "loaded_instances": [{}],
+                  "capabilities": { "vision": true, "trained_for_tool_use": true } },
+                { "key": "some/text-coder", "type": "llm", "vision": null,
+                  "loaded_instances": [], "capabilities": { "vision": false } }
+            ]
+        });
+        assert!(vision_from_models_json(&json, "google/gemma-4-26b-a4b-qat"));
+        assert!(!vision_from_models_json(&json, "some/text-coder"));
+        // Unknown id falls back to a loaded vision-capable model.
+        assert!(vision_from_models_json(&json, "mystery-model"));
+        // No models at all -> fail closed.
+        assert!(!vision_from_models_json(&serde_json::json!({}), "x"));
+    }
+
+    #[test]
+    fn test_attach_recent_screenshot() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        let marker = format!("[screenshot:{}]\nCaptured.", png.display());
+        let base = vec![
+            serde_json::json!({ "role": "user", "content": "do the thing" }),
+            serde_json::json!({ "role": "user", "content": marker }),
+        ];
+
+        // vision on + recent -> content becomes [text, image_url(data uri)].
+        let out = attach_recent_screenshot(base.clone(), true);
+        let content = out[1].get("content").unwrap().as_array().unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"));
+
+        // vision off -> untouched (text marker stays a plain string).
+        let out = attach_recent_screenshot(base.clone(), false);
+        assert!(out[1].get("content").unwrap().is_string());
+
+        // Too far from the tail -> not re-attached (bounds repeated image cost).
+        let mut old = vec![base[1].clone()];
+        for _ in 0..8 {
+            old.push(serde_json::json!({ "role": "user", "content": "later" }));
+        }
+        let out = attach_recent_screenshot(old, true);
+        assert!(out[0].get("content").unwrap().is_string());
+    }
+
+    #[test]
+    fn test_append_capped_keeps_tail() {
+        let buf = std::sync::Arc::new(Mutex::new(String::new()));
+        for _ in 0..100 {
+            append_capped(&buf, &"x".repeat(200)); // 20_000 chars total
+        }
+        // Bounded to the cap, keeping the most recent bytes.
+        assert_eq!(buf.lock().unwrap().chars().count(), BG_LOG_CAP);
+
+        let small = std::sync::Arc::new(Mutex::new(String::new()));
+        append_capped(&small, "hello");
+        assert_eq!(&*small.lock().unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_port_open_detects_listener() {
+        use std::net::TcpListener;
+        // An OS-assigned port with a live listener reads as open...
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(port_open(port));
+        // ...and as closed once nothing is listening.
+        drop(listener);
+        assert!(!port_open(port));
     }
 
     // ----- RAG / embeddings unit tests (pure, no network) -----

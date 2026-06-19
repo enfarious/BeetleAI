@@ -202,9 +202,19 @@ fn default_true() -> bool {
 impl LlmSettings {
     /// True only when every field the escalation call needs is present.
     pub fn assist_configured(&self) -> bool {
-        !self.assist_provider.trim().is_empty()
-            && !self.assist_api_url.trim().is_empty()
-            && !self.assist_model.trim().is_empty()
+        let provider = self.assist_provider.trim();
+        if provider.is_empty() {
+            return false;
+        }
+        // The Claude Code CLI backend needs no URL or model: the binary defaults
+        // to `claude` on PATH and the model defaults to a strong one. Selecting
+        // the provider is enough to enable it.
+        if provider.eq_ignore_ascii_case("claude_code")
+            || provider.eq_ignore_ascii_case("claude-code")
+        {
+            return true;
+        }
+        !self.assist_api_url.trim().is_empty() && !self.assist_model.trim().is_empty()
     }
 
     /// True only when every field the embedding call needs is present. Gates all
@@ -4072,6 +4082,13 @@ fn assist_as_primary(s: &LlmSettings) -> LlmSettings {
     }
 }
 
+/// True when the assist backend is the Claude Code CLI rather than an HTTP LLM
+/// endpoint. Accepts the two spellings the settings dropdown might emit.
+fn is_claude_code_assist(provider: &str) -> bool {
+    let p = provider.trim();
+    p.eq_ignore_ascii_case("claude_code") || p.eq_ignore_ascii_case("claude-code")
+}
+
 /// Extract the numeric HTTP status from a provider error string of the shape
 /// "{Provider} API error {code}: ...". Returns None for transport faults and
 /// for the no-code variant ("... API error: <body>").
@@ -4140,8 +4157,14 @@ fn call_llm(
     let config = load_config(app_handle);
     // runner="frontier" cards drive with the assist model; everything else uses
     // the primary local model. assist_configured() is re-checked so a stale flag
-    // can't route to an unconfigured endpoint.
-    let settings = if use_assist && config.settings.assist_configured() {
+    // can't route to an unconfigured endpoint. The Claude Code CLI backend is
+    // excluded here: it has no streaming/tool-call HTTP surface to drive a whole
+    // loop, so a frontier card falls back to the local model for the main loop
+    // and consults the CLI only on demand via request_assist.
+    let settings = if use_assist
+        && config.settings.assist_configured()
+        && !is_claude_code_assist(&config.settings.assist_provider)
+    {
         assist_as_primary(&config.settings)
     } else {
         config.settings
@@ -9623,12 +9646,26 @@ fn compute_run_vitals(events: &[RunEvent]) -> RunVitals {
 fn call_assist_model(
     app_handle: &tauri::AppHandle,
     run_id: &str,
+    worktree_path: &Path,
     system_prompt: &str,
     user_message: &str,
 ) -> Result<String, String> {
     let settings = load_config(app_handle).settings;
     if !settings.assist_configured() {
         return Err("no assist model configured".to_string());
+    }
+    // Claude Code CLI backend: shell out to `claude -p` inside the worktree so
+    // the friend reads the ACTUAL files the agent is stuck on, not a truncated
+    // text summary. Bypasses the HTTP dispatch entirely.
+    if is_claude_code_assist(&settings.assist_provider) {
+        return call_claude_code_assist(
+            app_handle,
+            run_id,
+            worktree_path,
+            system_prompt,
+            user_message,
+            &settings,
+        );
     }
     // Promote the assist_* fields into a primary settings object for dispatch.
     let assist = assist_as_primary(&settings);
@@ -9657,6 +9694,147 @@ fn call_assist_model(
     }?;
     let (_reasoning, answer) = extract_reasoning(&raw);
     Ok(answer)
+}
+
+/// Phone-a-friend via the Claude Code CLI. Runs `claude -p` inside the run's
+/// worktree with a read-only toolset, so the friend can actually inspect the
+/// code before answering instead of reasoning from a truncated text summary.
+/// Read-only by design: the friend advises and Beetle applies the fix with her
+/// own tools — the same contract as the HTTP assist path.
+///
+/// The assist_* settings are reused: `assist_api_url` doubles as the CLI command
+/// (default `claude` on PATH), `assist_model` picks the model (default `opus` —
+/// the point of phoning a friend is a stronger brain), and `assist_api_key`, if
+/// set, is handed over as ANTHROPIC_API_KEY (otherwise the user's existing
+/// Claude Code login is used).
+fn call_claude_code_assist(
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+    worktree_path: &Path,
+    system_prompt: &str,
+    user_message: &str,
+    settings: &LlmSettings,
+) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let bin = {
+        let b = settings.assist_api_url.trim();
+        if b.is_empty() {
+            "claude"
+        } else {
+            b
+        }
+    };
+    let model = {
+        let m = settings.assist_model.trim();
+        if m.is_empty() {
+            "opus"
+        } else {
+            m
+        }
+    };
+
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(worktree_path)
+        .arg("-p")
+        .arg(user_message)
+        .arg("--append-system-prompt")
+        .arg(system_prompt)
+        .arg("--model")
+        .arg(model)
+        // Read-only friend: no Edit/Write/Bash. In -p mode any tool outside this
+        // allowlist is auto-denied rather than prompting, so nothing can stall.
+        .arg("--allowedTools")
+        .arg("Read Grep Glob")
+        .arg("--output-format")
+        .arg("json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if !settings.assist_api_key.trim().is_empty() {
+        cmd.env("ANTHROPIC_API_KEY", settings.assist_api_key.trim());
+    }
+    crate::configure_no_window(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "could not launch Claude Code CLI ('{}'): {}. Is it installed and on PATH?",
+            bin, e
+        )
+    })?;
+
+    // Drain both pipes on threads so a chatty child can't deadlock on a full pipe.
+    let mut out_pipe = child.stdout.take().unwrap();
+    let mut err_pipe = child.stderr.take().unwrap();
+    let out_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = out_pipe.read_to_string(&mut s);
+        s
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = err_pipe.read_to_string(&mut s);
+        s
+    });
+
+    // Poll for completion, honoring cancellation and a generous ceiling (claude
+    // -p is agentic and may take several turns).
+    const TIMEOUT_SECS: u64 = 300;
+    let deadline = Instant::now() + Duration::from_secs(TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                let cancelled = app_handle
+                    .try_state::<AppState>()
+                    .map(|st| st.cancelled_runs.lock().unwrap().contains(run_id))
+                    .unwrap_or(false);
+                if cancelled {
+                    let _ = child.kill();
+                    return Err("cancelled by user".to_string());
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return Err(format!("Claude Code CLI timed out after {}s", TIMEOUT_SECS));
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("error waiting on Claude Code CLI: {}", e));
+            }
+        }
+    }
+
+    let stdout = out_handle.join().unwrap_or_default();
+    let stderr = err_handle.join().unwrap_or_default();
+
+    // `--output-format json` prints one result object: { "result": "...",
+    // "is_error": bool, ... }. Prefer that; fall back to raw output if it isn't
+    // parseable (e.g. a CLI-level failure that printed plain text).
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+        if let Some(text) = v.get("result").and_then(|r| r.as_str()) {
+            if is_error {
+                return Err(format!("Claude Code CLI reported an error: {}", text.trim()));
+            }
+            return Ok(text.trim().to_string());
+        }
+    }
+
+    let trimmed = stdout.trim();
+    if !trimmed.is_empty() {
+        Ok(trimmed.to_string())
+    } else if !stderr.trim().is_empty() {
+        Err(format!(
+            "Claude Code CLI produced no output. stderr: {}",
+            stderr.trim()
+        ))
+    } else {
+        Err("Claude Code CLI produced no output".to_string())
+    }
 }
 
 /// A compact, bounded slice of the run's recent activity — the last several
@@ -10731,7 +10909,7 @@ fn execute_tool(
                 if extra.trim().is_empty() { "(none)" } else { extra },
                 if recent.trim().is_empty() { "(none)" } else { &recent }
             );
-            match call_assist_model(app_handle, run_id, system, &user) {
+            match call_assist_model(app_handle, run_id, worktree_path, system, &user) {
                 Ok(advice) => format!(
                     "Assist from the senior model — this is ADVICE; you must apply it yourself with your normal tools:\n\n{}",
                     advice.trim()

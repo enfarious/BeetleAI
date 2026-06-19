@@ -27,5 +27,8 @@ dist-ssr
 .harness/worktrees/
 .harness/harness.db
 
+# Preview/browser tooling runtime artifacts (Chrome profile, caches)
+code/
+
 /.claude
 /memory

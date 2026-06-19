@@ -247,11 +247,13 @@
                 <label for="settings-assist-provider">Assist Provider</label>
                 <select id="settings-assist-provider" class="custom-select">
                   <option value="">(disabled)</option>
+                  <option value="claude_code">Claude Code (CLI)</option>
                   <option value="anthropic">Anthropic</option>
                   <option value="openai">OpenAI-compatible</option>
                   <option value="ollama">Ollama</option>
                   <option value="lmstudio">LM Studio</option>
                 </select>
+                <span class="settings-tab-hint" id="assist-claude-code-hint" style="display:none; margin-top:6px;">Runs <code>claude -p</code> in the run's worktree (read-only) so the friend reads your actual code. Fields below are optional: <b>CLI command</b> defaults to <code>claude</code> on PATH, <b>model</b> to <code>opus</code>, and <b>key</b> falls back to your existing Claude Code login.</span>
               </div>
               <div class="form-group">
                 <label for="settings-assist-url">Assist API Base URL</label>

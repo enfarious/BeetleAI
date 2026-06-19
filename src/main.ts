@@ -574,6 +574,22 @@ const settingsAssistProvider = document.getElementById("settings-assist-provider
 const settingsAssistUrl = document.getElementById("settings-assist-url") as HTMLInputElement;
 const settingsAssistKey = document.getElementById("settings-assist-key") as HTMLInputElement;
 const settingsAssistModel = document.getElementById("settings-assist-model") as HTMLInputElement;
+const assistClaudeCodeHint = document.getElementById("assist-claude-code-hint") as HTMLSpanElement | null;
+const assistUrlLabel = document.querySelector('label[for="settings-assist-url"]') as HTMLLabelElement | null;
+const assistModelLabel = document.querySelector('label[for="settings-assist-model"]') as HTMLLabelElement | null;
+
+// The Claude Code (CLI) assist backend reuses the assist_* fields with different
+// meanings, so relabel them and surface the explainer when it's selected.
+function updateAssistProviderUI() {
+  const isClaudeCode = settingsAssistProvider.value === "claude_code";
+  if (assistClaudeCodeHint) assistClaudeCodeHint.style.display = isClaudeCode ? "block" : "none";
+  if (assistUrlLabel) assistUrlLabel.textContent = isClaudeCode ? "CLI command (optional)" : "Assist API Base URL";
+  if (assistModelLabel) assistModelLabel.textContent = isClaudeCode ? "Model (optional)" : "Assist Model";
+  settingsAssistUrl.placeholder = isClaudeCode ? "claude" : "https://api.anthropic.com/v1";
+  settingsAssistModel.placeholder = isClaudeCode ? "opus" : "claude-opus-4-8";
+  settingsAssistKey.placeholder = isClaudeCode ? "(optional — uses your Claude Code login)" : "Assist API key...";
+}
+settingsAssistProvider.addEventListener("change", updateAssistProviderUI);
 const settingsEmbeddingProvider = document.getElementById("settings-embedding-provider") as HTMLSelectElement;
 const settingsEmbeddingUrl = document.getElementById("settings-embedding-url") as HTMLInputElement;
 const settingsEmbeddingKey = document.getElementById("settings-embedding-key") as HTMLInputElement;
@@ -1355,6 +1371,7 @@ async function openSettingsModal() {
     settingsAssistUrl.value = settings.assist_api_url || "";
     settingsAssistKey.value = settings.assist_api_key || "";
     settingsAssistModel.value = settings.assist_model || "";
+    updateAssistProviderUI();
     settingsEmbeddingProvider.value = settings.embedding_provider || "";
     settingsEmbeddingUrl.value = settings.embedding_api_url || "";
     settingsEmbeddingKey.value = settings.embedding_api_key || "";

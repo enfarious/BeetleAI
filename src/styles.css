@@ -170,24 +170,19 @@ body.resizing-active .resizer {
   color: var(--text-primary);
 }
 
-.brand-icon {
-  width: 24px;
-  height: 24px;
-  background: linear-gradient(135deg, var(--accent-primary), var(--status-review));
+.brand-logo {
+  width: 28px;
+  height: 28px;
   border-radius: 6px;
-  display: inline-block;
-  position: relative;
+  object-fit: cover;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 0 10px rgba(0, 240, 255, 0.2);
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
 }
 
-.brand-icon::after {
-  content: '';
-  position: absolute;
-  top: 6px;
-  left: 6px;
-  width: 12px;
-  height: 12px;
-  background-color: var(--bg-primary);
-  border-radius: 3px;
+.brand-logo:hover {
+  transform: rotate(10deg) scale(1.1);
+  box-shadow: 0 0 15px rgba(0, 240, 255, 0.4);
 }
 
 /* Mode Switcher Tabs */
@@ -1163,6 +1158,26 @@ table.md-table tr:nth-child(even) td {
 .empty-state-icon {
   font-size: 3rem;
   color: var(--text-muted);
+}
+
+.empty-state-logo {
+  width: 64px;
+  height: 64px;
+  border-radius: 16px;
+  object-fit: cover;
+  opacity: 0.25;
+  margin-bottom: 10px;
+  filter: grayscale(40%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 0 20px rgba(0, 240, 255, 0.1);
+  transition: opacity 0.3s ease, filter 0.3s ease, transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.empty-state-logo:hover {
+  opacity: 0.6;
+  filter: grayscale(0%);
+  transform: scale(1.05);
+  box-shadow: 0 0 25px rgba(0, 240, 255, 0.3);
 }
 
 /* ==========================================================================

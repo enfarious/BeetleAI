@@ -186,7 +186,6 @@ pub fn get_worktree_diff<P: AsRef<Path>>(
 }
 
 /// Clean up any orphaned worktrees left behind on app crashes/forced quits
-#[allow(dead_code)]
 pub fn prune_worktrees<P: AsRef<Path>>(repo_path: P) -> Result<(), String> {
     run_git_cmd(repo_path, &["worktree", "prune"])?;
     Ok(())

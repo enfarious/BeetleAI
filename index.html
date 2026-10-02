@@ -14,7 +14,7 @@
       <aside class="panel" id="left-panel">
         <header class="panel-header">
           <div class="brand">
-            <span class="brand-icon"></span>
+            <img src="/src/assets/beetle_logo.png" class="brand-logo" alt="BeetleAI Logo" />
             <span>BeetleAI</span>
           </div>
         </header>
@@ -102,7 +102,7 @@
               <span class="status-dot"></span>
               <span id="run-status-text">queued</span>
             </div>
-            <button class="btn btn-secondary" id="btn-settings-toggle" style="padding: 6px 10px; font-size: 1.1rem; line-height: 1;" title="LLM Service Settings">⚙</button>
+            <button class="btn btn-secondary" id="btn-settings-toggle" style="padding: 6px 10px; font-size: 1.1rem; line-height: 1;" title="LLM Service Settings (Ctrl/Cmd+,)">⚙</button>
           </div>
         </header>
         
@@ -110,7 +110,7 @@
           <!-- Messages -->
           <div id="chat-messages" class="chat-messages" style="flex: 1; padding: 20px;">
             <div class="empty-state">
-              <span class="empty-state-icon">🤖</span>
+              <img src="/src/assets/beetle_logo.png" class="empty-state-logo" alt="BeetleAI" />
               <span>Select a card from the Kanban board and start an autonomous run. The agent loop transcript will display here.</span>
             </div>
           </div>
@@ -135,7 +135,7 @@
               <textarea
                 id="chat-input"
                 class="chat-input"
-                placeholder="Send input to the agent..."
+                placeholder="Send input to the agent…  (Ctrl/Cmd+K to focus, Enter to send)"
                 rows="1"
                 disabled
               ></textarea>
@@ -247,11 +247,13 @@
                 <label for="settings-assist-provider">Assist Provider</label>
                 <select id="settings-assist-provider" class="custom-select">
                   <option value="">(disabled)</option>
+                  <option value="claude_code">Claude Code (CLI)</option>
                   <option value="anthropic">Anthropic</option>
                   <option value="openai">OpenAI-compatible</option>
                   <option value="ollama">Ollama</option>
                   <option value="lmstudio">LM Studio</option>
                 </select>
+                <span class="settings-tab-hint" id="assist-claude-code-hint" style="display:none; margin-top:6px;">Runs <code>claude -p</code> in the run's worktree (read-only) so the friend reads your actual code. Fields below are optional: <b>CLI command</b> defaults to <code>claude</code> on PATH, <b>model</b> to <code>opus</code>, and <b>key</b> falls back to your existing Claude Code login.</span>
               </div>
               <div class="form-group">
                 <label for="settings-assist-url">Assist API Base URL</label>

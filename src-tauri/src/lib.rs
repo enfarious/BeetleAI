@@ -103,14 +103,31 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::AppState::new())
+        .on_window_event(|window, event| {
+            // Safety net for the graceful-close path: kill any dev servers the
+            // agent left running so they don't outlive the app. The per-run
+            // ActiveRunGuard already handles normal run teardown.
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(state) = window.try_state::<commands::AppState>() {
+                    commands::kill_all_background_processes(&state);
+                }
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
             if let Err(e) = commands::init_db(&app_handle) {
                 eprintln!("Failed to initialize database: {}", e);
             } else {
+                // Trim the logs table before it's replayed into memory.
+                if let Err(e) = commands::prune_old_run_logs(&app_handle) {
+                    eprintln!("Failed to prune old run logs: {}", e);
+                }
                 let state = app.state::<commands::AppState>();
                 if let Err(e) = commands::load_state_from_db(&app_handle, &state) {
                     eprintln!("Failed to load state from database: {}", e);
+                } else if let Err(e) = commands::reconcile_runs_on_startup(&app_handle, &state) {
+                    // Reaping orphaned worktrees is best-effort; never block launch.
+                    eprintln!("Failed to reconcile runs on startup: {}", e);
                 }
             }
             Ok(())
